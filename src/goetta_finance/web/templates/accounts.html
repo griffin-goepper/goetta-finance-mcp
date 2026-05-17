@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Accounts — goetta-finance{% endblock %}
+{% block content %}
+  <h2>Accounts</h2>
+  {% if accounts %}
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Institution</th>
+          <th>Account</th>
+          <th class="num">Balance</th>
+          <th class="num">Available</th>
+          <th>As of</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for a in accounts %}
+          <tr>
+            <td>{{ a.org_name or "—" }}</td>
+            <td>{{ a.name }}</td>
+            <td class="num">{{ a.balance }} {{ a.currency }}</td>
+            <td class="num">{{ a.available_balance or "—" }}</td>
+            <td>{{ a.balance_date }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="empty">No accounts yet. Run <code>goetta-finance sync</code>.</p>
+  {% endif %}
+{% endblock %}

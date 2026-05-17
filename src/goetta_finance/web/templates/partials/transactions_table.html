@@ -1,0 +1,13 @@
+{% if rows %}
+  {% for r in rows %}
+    <tr>
+      <td>{{ r.posted }}</td>
+      <td>{{ r.account_id }}</td>
+      <td>{{ r.description }}</td>
+      <td>{{ r.payee or "" }}</td>
+      <td class="num {% if r.amount.startswith('-') %}neg{% else %}pos{% endif %}">{{ r.amount }}</td>
+    </tr>
+  {% endfor %}
+{% else %}
+  <tr><td colspan="5" class="empty">No transactions match.</td></tr>
+{% endif %}

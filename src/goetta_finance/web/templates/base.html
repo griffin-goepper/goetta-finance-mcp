@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}goetta-finance{% endblock %}</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/htmx.min.js" defer></script>
+  <script src="/static/plotly-basic.min.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <h1>goetta-finance</h1>
+    <nav>
+      <a href="/" class="{% if active == 'accounts' %}active{% endif %}">Accounts</a>
+      <a href="/net-worth" class="{% if active == 'net_worth' %}active{% endif %}">Net worth</a>
+      <a href="/spending" class="{% if active == 'spending' %}active{% endif %}">Spending</a>
+      <a href="/transactions" class="{% if active == 'transactions' %}active{% endif %}">Transactions</a>
+      <a href="/sync" class="{% if active == 'sync' %}active{% endif %}">Sync</a>
+    </nav>
+  </aside>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

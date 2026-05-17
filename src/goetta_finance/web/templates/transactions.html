@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Transactions — goetta-finance{% endblock %}
+{% block content %}
+  <h2>Transactions</h2>
+  <form class="filters" hx-get="/transactions/rows" hx-target="#tx-tbody" hx-trigger="input changed delay:300ms, change">
+    <label>Account:
+      <select name="account_id">
+        <option value="">All</option>
+        {% for a in accounts %}
+          <option value="{{ a.id }}" {% if a.id == filters.account_id %}selected{% endif %}>{{ a.org_name }} — {{ a.name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>From:
+      <input type="date" name="start" value="{{ filters.start }}">
+    </label>
+    <label>To:
+      <input type="date" name="end" value="{{ filters.end }}">
+    </label>
+    <label>Search:
+      <input type="search" name="q" value="{{ filters.q }}" placeholder="description or payee">
+    </label>
+  </form>
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Posted</th>
+        <th>Account</th>
+        <th>Description</th>
+        <th>Payee</th>
+        <th class="num">Amount</th>
+      </tr>
+    </thead>
+    <tbody id="tx-tbody">
+      {% include "partials/transactions_table.html" %}
+    </tbody>
+  </table>
+{% endblock %}

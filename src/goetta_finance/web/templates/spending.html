@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Spending — goetta-finance{% endblock %}
+{% block content %}
+  <h2>Income and spending</h2>
+  <form method="get" class="chart-controls">
+    <label>Months:
+      <input type="number" name="months" value="{{ months }}" min="1" max="60">
+    </label>
+    <button type="submit">Update</button>
+  </form>
+  <div id="spending-chart" class="chart"></div>
+  <script>
+    document.addEventListener("DOMContentLoaded", function () {
+      Plotly.newPlot(
+        "spending-chart",
+        {{ figure_data | safe }},
+        {{ figure_layout | safe }},
+        { responsive: true, displaylogo: false }
+      );
+    });
+  </script>
+{% endblock %}

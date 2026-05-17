@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Sync health — goetta-finance{% endblock %}
+{% block content %}
+  <h2>Sync health</h2>
+  {% if last_sync_local %}
+    <p>Last sync: <strong>{{ last_sync_local.strftime("%Y-%m-%d %H:%M:%S %Z") }}</strong></p>
+  {% else %}
+    <p class="empty">No successful syncs yet. Run <code>goetta-finance sync</code>.</p>
+  {% endif %}
+
+  {% if runs %}
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Started</th>
+          <th>Finished</th>
+          <th class="num">Accounts</th>
+          <th class="num">New</th>
+          <th class="num">Updated</th>
+          <th>Warnings / errors</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in runs %}
+          <tr>
+            <td>{{ r.started_at }}</td>
+            <td>{{ r.finished_at or "—" }}</td>
+            <td class="num">{{ r.accounts_touched }}</td>
+            <td class="num">{{ r.transactions_new }}</td>
+            <td class="num">{{ r.transactions_updated }}</td>
+            <td>
+              {% for w in r.warnings_list %}<div class="warn">⚠ {{ w }}</div>{% endfor %}
+              {% for e in r.errors_list %}<div class="err">✗ {{ e }}</div>{% endfor %}
+              {% if not r.warnings_list and not r.errors_list %}<span class="muted">—</span>{% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+{% endblock %}

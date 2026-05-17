@@ -1,0 +1,77 @@
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #fafafa;
+  color: #222;
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  min-height: 100vh;
+}
+.sidebar {
+  background: #1f2937;
+  color: #f3f4f6;
+  padding: 24px 16px;
+}
+.sidebar h1 {
+  font-size: 18px;
+  margin: 0 0 24px 0;
+}
+.sidebar nav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sidebar nav a {
+  color: #d1d5db;
+  padding: 8px 12px;
+  text-decoration: none;
+  border-radius: 6px;
+}
+.sidebar nav a:hover { background: #374151; color: #fff; }
+.sidebar nav a.active { background: #2563eb; color: #fff; }
+main { padding: 32px; }
+h2 { margin-top: 0; }
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+.data-table th, .data-table td {
+  text-align: left;
+  padding: 10px 12px;
+  border-bottom: 1px solid #e5e7eb;
+}
+.data-table th { background: #f3f4f6; font-weight: 600; }
+.data-table tr:nth-child(even) td { background: #fafbfc; }
+.data-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+.data-table .num.neg { color: #b91c1c; }
+.data-table .num.pos { color: #047857; }
+.filters {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+.filters label { display: flex; flex-direction: column; font-size: 13px; gap: 4px; }
+.filters input, .filters select {
+  padding: 6px 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+}
+.chart-controls { margin-bottom: 16px; }
+.chart-controls button {
+  padding: 6px 12px;
+  background: #2563eb;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.chart { width: 100%; height: 500px; background: #fff; padding: 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
+.empty { color: #6b7280; font-style: italic; }
+.warn { color: #b45309; }
+.err { color: #b91c1c; }
+.muted { color: #9ca3af; }
+code { background: #f3f4f6; padding: 1px 6px; border-radius: 3px; font-size: 13px; }

@@ -1,0 +1,73 @@
+{
+  "errors": [],
+  "accounts": [
+    {
+      "org": {
+        "domain": "chase.com",
+        "name": "Chase",
+        "sfin-url": "https://beta-bridge.simplefin.org/simplefin",
+        "url": "https://chase.com"
+      },
+      "id": "ACT-CHK-1",
+      "name": "Checking 1234",
+      "currency": "USD",
+      "balance": "2543.21",
+      "available-balance": "2500.00",
+      "balance-date": 1747929600,
+      "transactions": [
+        {
+          "id": "TX-1",
+          "posted": 1747756800,
+          "transacted_at": 1747751400,
+          "amount": "-42.18",
+          "description": "Starbucks Coffee #4221",
+          "payee": "Starbucks",
+          "memo": "",
+          "pending": false
+        },
+        {
+          "id": "TX-2",
+          "posted": 1747843200,
+          "amount": "-1200.00",
+          "description": "Rent payment",
+          "payee": "Landlord",
+          "pending": false
+        },
+        {
+          "id": "TX-3-PENDING",
+          "posted": 1747929600,
+          "amount": "-15.99",
+          "description": "Pending hold",
+          "pending": true
+        }
+      ],
+      "extra": {}
+    },
+    {
+      "org": {
+        "domain": "vanguard.com",
+        "name": "Vanguard",
+        "sfin-url": "https://beta-bridge.simplefin.org/simplefin",
+        "url": "https://vanguard.com"
+      },
+      "id": "ACT-VG-1",
+      "name": "Brokerage",
+      "currency": "USD",
+      "balance": "84210.50",
+      "available-balance": null,
+      "balance-date": 1747929600,
+      "transactions": [
+        {
+          "id": "TX-VG-1",
+          "posted": 1747497600,
+          "amount": "500.00",
+          "description": "Dividend payment",
+          "payee": "VTSAX",
+          "memo": "Q2 dividend",
+          "pending": false
+        }
+      ],
+      "extra": {"yield": 0.0312}
+    }
+  ]
+}
