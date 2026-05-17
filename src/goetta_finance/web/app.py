@@ -44,6 +44,21 @@ def build_app(
 
     ``lifespan`` is the FastAPI lifespan context manager — daemon mode uses
     it to run the scheduler loop and ensure clean cancellation on shutdown.
+
+    Security posture (audited 2026-05, see ``docs/SECURITY_AUDIT_2026-05.md``):
+
+    - **No CORS middleware by design.** The dashboard is meant to be hit
+      same-origin from the user's own browser at ``http://127.0.0.1:8765``.
+      Permissive CORS headers would expose every read-only endpoint to
+      malicious websites the user happens to visit. If a future contributor
+      adds CORS "for testing", that needs explicit threat-model review.
+    - **DNS rebinding** on the ``/api/mcp`` sub-app is handled by FastMCP's
+      built-in ``transport_security`` middleware, which auto-enables for
+      localhost binds with allowed_hosts/origins restricted to
+      127.0.0.1 / localhost / ::1 (mcp.server.fastmcp.server:178-183).
+    - **CSRF** is not enforced because every dashboard route is a GET; the
+      only POST surface is ``/api/mcp``, which is protected by the
+      transport_security middleware above.
     """
     app = FastAPI(
         title=title,

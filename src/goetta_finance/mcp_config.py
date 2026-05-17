@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
+import subprocess  # nosec B404 - we shell out to `claude mcp add/remove`; see audit 2026-05
 import sys
 from pathlib import Path
 from typing import Any
@@ -175,7 +175,12 @@ def register_with_claude_code(
         return False, f"unsupported transport {transport!r}"
 
     try:
-        result = subprocess.run(args, capture_output=True, text=True, check=False)
+        # ruff S603 / bandit B603: args is a list (no shell), all values
+        # originate from typer-validated CLI flags or hard-coded
+        # constants (SERVER_KEY, scope, transport). Audited 2026-05.
+        result = subprocess.run(  # noqa: S603  # nosec B603
+            args, capture_output=True, text=True, check=False
+        )
     except OSError as exc:
         return False, f"Failed to invoke `claude`: {exc}"
 
@@ -199,7 +204,12 @@ def unregister_with_claude_code(
         return False, "`claude` CLI not on PATH"
     args = [claude, "mcp", "remove", name, "--scope", scope]
     try:
-        result = subprocess.run(args, capture_output=True, text=True, check=False)
+        # ruff S603 / bandit B603: same rationale as
+        # register_with_claude_code — list args, no shell, all values
+        # are typer-validated or constants.
+        result = subprocess.run(  # noqa: S603  # nosec B603
+            args, capture_output=True, text=True, check=False
+        )
     except OSError as exc:
         return False, f"Failed to invoke `claude`: {exc}"
     if result.returncode == 0:

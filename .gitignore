@@ -30,3 +30,15 @@ htmlcov/
 *.duckdb.wal
 config.json
 *.access_url
+
+# Security scanner outputs — narrative summaries get committed to
+# docs/SECURITY_AUDIT_*.md; raw output stays local per the audit-artifact
+# policy (avoids publishing an attack roadmap for users on stale installs).
+*.sarif
+bandit-output.json
+bandit-output.*.json
+pip-audit-output.json
+pip-audit-output.*.json
+gitleaks-report.json
+gitleaks-report.*.json
+.bandit_cache/

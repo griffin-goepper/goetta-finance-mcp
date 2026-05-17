@@ -47,17 +47,18 @@ def monthly_income_spending(
     start = datetime(start_year, start_month, 1, tzinfo=UTC)
 
     rows = store.query_sql(
-        f"""
+        """
         SELECT
             date_trunc('month', posted) AS month,
             SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) AS income,
             SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END) AS spending
         FROM transactions
-        WHERE posted >= TIMESTAMP '{start.strftime("%Y-%m-%d %H:%M:%S")}'
+        WHERE posted >= ?
           AND pending = false
         GROUP BY 1
         ORDER BY 1
-        """
+        """,
+        [start],
     )
 
     by_month: dict[date, MonthlyCashflow] = {}
@@ -99,12 +100,13 @@ def net_worth_series(
     end = (now or datetime.now(tz=UTC)).astimezone(UTC)
     since = end - timedelta(days=days)
     rows = store.query_sql(
-        f"""
+        """
         SELECT account_id, timestamp, balance
         FROM balance_snapshots
-        WHERE timestamp >= TIMESTAMP '{since.strftime("%Y-%m-%d %H:%M:%S")}'
+        WHERE timestamp >= ?
         ORDER BY account_id, timestamp
-        """
+        """,
+        [since],
     )
 
     # latest_balance[account_id] = (last_seen_day, balance)
@@ -130,13 +132,14 @@ def recent_sync_runs(store: FinanceStore, *, limit: int = 10) -> list[dict[str, 
     """Most recent sync_runs rows, newest first. Warnings/errors come back
     as JSON strings from DuckDB; callers can parse them as needed."""
     rows = store.query_sql(
-        f"""
+        """
         SELECT id, started_at, finished_at, accounts_touched,
                transactions_new, transactions_updated, warnings, errors
         FROM sync_runs
         ORDER BY id DESC
-        LIMIT {int(limit)}
-        """
+        LIMIT ?
+        """,
+        [int(limit)],
     )
     return rows
 

@@ -1,5 +1,9 @@
 [build-system]
-requires = ["hatchling"]
+# setuptools is not a runtime dep, but pip pulls it in transitively during
+# editable installs. Pin to >=78.1.1 to clear PYSEC-2022-43012, PYSEC-2025-49,
+# and CVE-2024-6345 in setuptools' package_index / URL-fetching code paths.
+# See docs/SECURITY_AUDIT_2026-05.md.
+requires = ["hatchling", "setuptools>=78.1.1"]
 build-backend = "hatchling.build"
 
 [project]
@@ -28,6 +32,8 @@ dev = [
     "respx>=0.21",
     "ruff>=0.5",
     "mypy>=1.10",
+    "bandit>=1.7",
+    "pip-audit>=2.7",
 ]
 
 [project.scripts]
@@ -44,8 +50,20 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF", "S"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests exercise adversarial inputs by design. Each ignore was audited
+# in docs/SECURITY_AUDIT_2026-05.md before being added — do not append
+# new entries here without writing the rationale into the audit doc.
+#   S101 — `assert` in tests is the entire point of pytest.
+#   S105 — test fixtures intentionally use sentinel "secret"-named strings
+#          to prove the read_csv exfil block in query_sql works.
+#   S608 — test helpers and regression tests construct f-string SQL on
+#          purpose (the goal is to exercise the security boundary, not
+#          to launder user input).
+"tests/**" = ["S101", "S105", "S608"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -59,3 +77,10 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+
+[tool.bandit]
+# Scan only the library source; the test tree intentionally exercises
+# adversarial inputs and would generate noise. Don't add new exclusions
+# here without first reading docs/SECURITY_AUDIT_2026-05.md and treating
+# the underlying finding properly.
+exclude_dirs = ["tests", ".venv"]

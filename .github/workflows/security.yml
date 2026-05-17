@@ -1,0 +1,48 @@
+# Security scanners on every PR + push to main.
+#
+# This is currently the only CI workflow — a test workflow (pytest + ruff +
+# mypy) should follow in its own slice, sharing the `pip install -e ".[dev]"`
+# step via a composite action when it lands.
+#
+# gitleaks needs `fetch-depth: 0` so it can scan the full git history, not
+# just the latest commit.
+
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  scan:
+    name: bandit + pip-audit + gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for gitleaks)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install project + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: bandit
+        run: bandit -r src/ -c pyproject.toml
+
+      - name: pip-audit
+        run: pip-audit
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

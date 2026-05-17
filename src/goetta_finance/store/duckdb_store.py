@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import threading
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from importlib.resources import files
@@ -33,6 +35,26 @@ _READ_ONLY_PREFIXES = ("select", "with", "show", "describe", "desc")
 _STMT_SEP = re.compile(r";\s*")
 _LINE_COMMENT = re.compile(r"--[^\n]*")
 _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+
+_SQL_TIMEOUT_DEFAULT_SECONDS = 30.0
+
+
+def _sql_timeout_seconds() -> float:
+    """Read ``query_sql`` statement-timeout from environment, default 30s.
+
+    DuckDB has no built-in statement_timeout, so we enforce one via a
+    watchdog ``threading.Timer`` in ``query_sql``. Override with
+    ``GOETTA_FINANCE_SQL_TIMEOUT_SECONDS``; non-numeric values fall back
+    to the default and log a warning.
+    """
+    raw = os.environ.get("GOETTA_FINANCE_SQL_TIMEOUT_SECONDS")
+    if raw is None:
+        return _SQL_TIMEOUT_DEFAULT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _SQL_TIMEOUT_DEFAULT_SECONDS
+    return value if value > 0 else _SQL_TIMEOUT_DEFAULT_SECONDS
 
 
 def _strip_comments(sql: str) -> str:
@@ -119,10 +141,22 @@ class DuckDBStore:
             # depth — it blocks ``read_csv``/``read_blob``/``COPY ... TO
             # 'file'``/``httpfs`` at the engine level, including inside
             # otherwise-whitelisted SELECT statements. See CLAUDE.md.
+            # Resource limits bound the agent-callable ``query_sql`` path
+            # against in-database resource exhaustion (huge
+            # ``generate_series``, recursive CTEs, etc.). ``memory_limit``
+            # caps the per-process memory DuckDB will allocate;
+            # ``threads`` caps parallelism so a query can't pin every
+            # core. Statement timeout is enforced separately as a
+            # watchdog around ``query_sql`` (DuckDB has no built-in
+            # statement_timeout). See docs/SECURITY_AUDIT_2026-05.md.
             self._conn = duckdb.connect(
                 self.path,
                 read_only=self.read_only,
-                config={"enable_external_access": "false"},
+                config={
+                    "enable_external_access": "false",
+                    "memory_limit": "512MB",
+                    "threads": "2",
+                },
             )
         return self._conn
 
@@ -212,8 +246,12 @@ class DuckDBStore:
         ids = [t.id for t in txns]
         placeholders = ", ".join(["?"] * len(ids))
         with self._lock:
+            # ruff S608 / bandit B608: ``placeholders`` is ``"?, ?, ?, ..."``
+            # — pure parameter markers, no user data. Real values bind via
+            # ``ids``. Audited 2026-05.
             existing_rows = self.conn.execute(
-                f"SELECT id FROM transactions WHERE id IN ({placeholders})", ids
+                f"SELECT id FROM transactions WHERE id IN ({placeholders})",  # noqa: S608  # nosec B608
+                ids,
             ).fetchall()
             existing = {row[0] for row in existing_rows}
             new_count = 0
@@ -337,6 +375,11 @@ class DuckDBStore:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         limit_clause = f"LIMIT {int(limit)}" if limit is not None else ""
         with self._lock:
+            # ruff S608 / bandit B608: ``clauses`` is a fixed allow-list of
+            # column predicates (``account_id = ?``, ``posted >= ?``,
+            # ``posted <= ?``); values bind via ``params``. ``limit_clause``
+            # is ``LIMIT {int(...)}`` so the only interpolated token is a
+            # plain integer. Audited 2026-05.
             rows = self.conn.execute(
                 f"""
                 SELECT id, account_id, posted, transacted_at, amount, description,
@@ -345,7 +388,7 @@ class DuckDBStore:
                 {where}
                 ORDER BY posted DESC
                 {limit_clause}
-                """,
+                """,  # noqa: S608  # nosec B608
                 params,
             ).fetchall()
         return [self._row_to_transaction(row) for row in rows]
@@ -370,8 +413,18 @@ class DuckDBStore:
             for row in rows
         ]
 
-    def query_sql(self, sql: str) -> list[dict[str, Any]]:
+    def query_sql(
+        self, sql: str, params: Sequence[Any] | None = None
+    ) -> list[dict[str, Any]]:
         """Run a single read-only SQL statement and return rows as dicts.
+
+        ``params`` is optional positional-parameter binding (DuckDB ``?``
+        placeholders). The MCP ``sql_query`` tool calls without params —
+        the model can't bind values anyway — but internal callers
+        (``web/aggregations.py``) use this to keep date/limit values out
+        of the SQL string. Closes the bandit B608 / ruff S608 class of
+        finding at the call sites; the read-only transaction wrapper is
+        the real safety control regardless.
 
         Defense in depth:
 
@@ -411,9 +464,23 @@ class DuckDBStore:
                 raise StoreError(
                     f"query_sql could not start a read-only transaction: {exc}"
                 ) from exc
+            # Statement-timeout watchdog: DuckDB has no built-in
+            # statement_timeout, so we call ``conn.interrupt()`` from a
+            # ``threading.Timer`` if the query runs longer than
+            # GOETTA_FINANCE_SQL_TIMEOUT_SECONDS (default 30s). Always
+            # cancel the timer in ``finally`` so a fast query doesn't leak
+            # a pending interrupt into the next call. See
+            # docs/SECURITY_AUDIT_2026-05.md.
+            timeout_seconds = _sql_timeout_seconds()
+            timer = threading.Timer(timeout_seconds, conn.interrupt)
+            timer.daemon = True
+            timer.start()
             try:
                 try:
-                    cur = conn.execute(statements[0])
+                    if params is None:
+                        cur = conn.execute(statements[0])
+                    else:
+                        cur = conn.execute(statements[0], list(params))
                 except duckdb.Error as exc:
                     raise StoreError(
                         f"query_sql rejected by read-only transaction: {exc}"
@@ -421,6 +488,7 @@ class DuckDBStore:
                 columns = [d[0] for d in cur.description] if cur.description else []
                 rows = [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
             finally:
+                timer.cancel()
                 try:
                     conn.execute("COMMIT")
                 except duckdb.Error:

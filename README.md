@@ -252,6 +252,31 @@ mypy --strict src/goetta_finance
 
 A passing change has all four clean.
 
+### Security tooling
+
+One-time setup:
+
+```bash
+pipx install pre-commit
+pre-commit install
+
+# gitleaks is a Go binary, install via your OS package manager:
+#   macOS:   brew install gitleaks
+#   Windows: winget install gitleaks
+#   Linux:   see https://github.com/gitleaks/gitleaks/releases or your distro's repo
+```
+
+`pre-commit install` wires bandit / ruff / gitleaks into your `git commit` flow automatically. Manual audit run (e.g. before tagging a release):
+
+```bash
+bandit -r src/ -c pyproject.toml
+pip-audit
+gitleaks detect --source . --redact
+ruff check .                       # includes ruff's S (bandit-derived) rules
+```
+
+Raw scanner output is git-ignored on purpose — see [`docs/SECURITY_AUDIT_2026-05.md`](./docs/SECURITY_AUDIT_2026-05.md) for the narrative-summary policy. New findings should be reported there, not in raw JSON.
+
 [`CLAUDE.md`](./CLAUDE.md) documents the operating principles, project layout, and patterns for adding new MCP tools, storage backends, or SimpleFIN fields. Read it before opening a PR.
 
 ## License

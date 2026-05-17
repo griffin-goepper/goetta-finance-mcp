@@ -331,3 +331,65 @@ def test_read_only_store_query_sql_still_works(store: DuckDBStore) -> None:
         assert rows == [{"id": "a1", "balance": Decimal("42.00")}]
     finally:
         ro_store.close()
+
+
+# --- query_sql resource-limit hardening (Security audit 2026-05) ---
+
+
+def test_query_sql_memory_limit_bounds_huge_intermediate(store: DuckDBStore) -> None:
+    """A query that would allocate well past the 512MB connect-time cap
+    must fail with a DuckDB out-of-memory error rather than OOM-killing
+    the daemon. Either ``memory_limit`` or the timeout watchdog catches
+    this — both are acceptable bounded failures vs. an OOM-kill."""
+    with pytest.raises(StoreError) as exc_info:
+        store.query_sql(
+            "SELECT count(*) FROM range(0, 10000000000) t1, range(0, 1000) t2"
+        )
+    msg = str(exc_info.value).lower()
+    assert "memory" in msg or "interrupt" in msg or "cancel" in msg, (
+        f"unexpected error message: {exc_info.value!r}"
+    )
+
+
+def test_query_sql_timeout_interrupts_long_running(
+    store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A query running past the watchdog timeout must be interrupted.
+    Sets a 1s timeout via env var so the test stays fast."""
+    monkeypatch.setenv("GOETTA_FINANCE_SQL_TIMEOUT_SECONDS", "1")
+    with pytest.raises(StoreError) as exc_info:
+        store.query_sql("SELECT count(*) FROM range(0, 100000000000)")
+    msg = str(exc_info.value).lower()
+    assert "interrupt" in msg or "cancel" in msg or "timeout" in msg, (
+        f"timeout did not interrupt cleanly; got: {exc_info.value!r}"
+    )
+
+
+def test_query_sql_normal_query_unaffected_by_resource_limits(
+    store: DuckDBStore,
+) -> None:
+    """Regression: small SELECTs must still work after the memory_limit /
+    threads / timeout hardening lands. If this goes red the limits are
+    set too tight or the watchdog is firing on legitimate queries."""
+    store.upsert_accounts([_account("acc-resource-1", balance="100.00")])
+    rows = store.query_sql(
+        "SELECT id, balance FROM accounts WHERE id = ?", ["acc-resource-1"]
+    )
+    assert rows == [{"id": "acc-resource-1", "balance": Decimal("100.00")}]
+
+
+def test_query_sql_params_binding_for_internal_callers(store: DuckDBStore) -> None:
+    """``query_sql`` accepts optional positional params so internal callers
+    (web/aggregations.py) can bind values instead of interpolating them
+    into the SQL string. Closes the bandit B608 / ruff S608 class of
+    finding at the call sites without weakening the read-only transaction
+    wrapper."""
+    store.upsert_accounts(
+        [_account("a1", balance="10.00"), _account("a2", balance="20.00")]
+    )
+    rows = store.query_sql(
+        "SELECT id, balance FROM accounts WHERE id = ? ORDER BY id",
+        ["a2"],
+    )
+    assert rows == [{"id": "a2", "balance": Decimal("20.00")}]
+
