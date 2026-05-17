@@ -50,6 +50,111 @@ Re-running `init` is safe — each step detects existing state and offers to ski
 | `goetta-finance status` | Show last sync, account list with balances, recent warnings/errors. |
 | `goetta-finance serve` | Start the MCP server over stdio (used by Claude Desktop). |
 | `goetta-finance web` | Start the local web dashboard. `--port 8765` and `--host 127.0.0.1` by default. |
+| `goetta-finance daemon` | Long-lived process: dashboard + MCP HTTP endpoint + daily scheduled sync, from one process. See "Daemon mode" below. |
+
+## Daemon mode
+
+`goetta-finance daemon` runs one long-lived process that hosts:
+
+- The dashboard at `http://127.0.0.1:8765/`
+- The MCP endpoint at `http://127.0.0.1:8765/api/mcp` (streamable-HTTP transport — Claude Code and Claude Desktop both support this)
+- An internal scheduler that runs `collect()` daily at `--sync-at` local time (default `06:00`)
+
+One process means one DuckDB write handle, which is what sidesteps the Windows DuckDB-lock conflict between `serve` and `web`. If the laptop was closed past the daily tick, the scheduler detects "we slept through it" on wake and runs a catch-up sync immediately.
+
+```bash
+goetta-finance daemon                         # defaults: 127.0.0.1:8765, sync at 06:00 local
+goetta-finance daemon --sync-at 03:30         # sync nightly at 3:30am
+goetta-finance daemon --no-schedule           # MCP + dashboard only, no automatic sync
+goetta-finance daemon --no-mcp                # dashboard + scheduler only (e.g. headless server)
+```
+
+To register the daemon's MCP endpoint with Claude Code:
+
+```bash
+claude mcp add goetta-finance --scope user --transport http http://127.0.0.1:8765/api/mcp
+```
+
+(Re-run `goetta-finance init` to pick the daemon path interactively — it will also clear any stale stdio registration first.)
+
+**In v1 the daemon does not auto-start.** Keep it running in a separate terminal, or install one of the scheduling snippets below to start it at login.
+
+## Scheduling
+
+You can run `goetta-finance` two ways: with the daemon (continuous, lazy-sync triggered too), or with an OS scheduler running `goetta-finance sync` periodically. The daemon is the better default when you want the MCP endpoint always available. Use the OS scheduler when you just want fresh data and the dashboard on demand.
+
+### Linux — systemd user units
+
+```ini
+# ~/.config/systemd/user/goetta-finance.service
+[Unit]
+Description=goetta-finance daily sync
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/goetta-finance sync
+```
+
+```ini
+# ~/.config/systemd/user/goetta-finance.timer
+[Unit]
+Description=goetta-finance daily sync at 06:00
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now goetta-finance.timer
+```
+
+Replace `goetta-finance sync` with `goetta-finance daemon` and drop the timer if you want the daemon at login instead.
+
+### macOS — launchd
+
+```xml
+<!-- ~/Library/LaunchAgents/com.user.goetta-finance.plist -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.user.goetta-finance</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/goetta-finance</string>
+    <string>sync</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
+</dict>
+</plist>
+```
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.user.goetta-finance.plist
+```
+
+For daemon-at-login, swap the `ProgramArguments` to `[..., "daemon"]` and replace `StartCalendarInterval` with `<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>`.
+
+### Windows — Task Scheduler
+
+```powershell
+# Daily sync at 06:00
+schtasks /Create /TN "goetta-finance sync" `
+  /TR '"C:\path\to\goetta-finance.exe" sync' `
+  /SC DAILY /ST 06:00
+
+# Or start the daemon at login (foreground in a window)
+schtasks /Create /TN "goetta-finance daemon" `
+  /TR '"C:\path\to\goetta-finance.exe" daemon' `
+  /SC ONLOGON
+```
 
 ## Claude clients
 
@@ -122,7 +227,7 @@ The SimpleFIN access URL is sensitive — it grants read access to your bank dat
 ## Known limitations
 
 - **Microsoft Store install of Claude Desktop**: see the Claude clients table above. Use Claude Code or the direct-download Claude Desktop until `init` learns the MSIX-sandboxed config path.
-- **On Windows, `serve` and `web` cannot run simultaneously.** DuckDB takes an exclusive OS file lock on the database even for a read-only handle. The web CLI detects this at startup and tells you to stop the other process first. macOS/Linux use advisory POSIX locks so concurrent read-only + read-write *may* work, but it isn't relied upon. A daemon mode that hosts both surfaces from one process is on the roadmap.
+- **On Windows, `serve` and `web` cannot run simultaneously as separate processes.** DuckDB takes an exclusive OS file lock on the database even for a read-only handle. Use `goetta-finance daemon` (one process, both surfaces) to avoid the conflict, or stop one before starting the other. macOS/Linux use advisory POSIX locks so concurrent read-only + read-write *may* work, but it isn't relied upon.
 - **Pending transactions are dropped.** Only `posted` transactions are stored in v1. SimpleFIN's pending feed will be supported in a later phase.
 - **Single currency assumption.** Money is stored as `DECIMAL(18,2)` and charts use `USD` labels. Multi-currency support isn't here yet.
 - **No transaction categorization.** Spending charts group by income vs. spending only; per-category breakdowns require manual SQL via `sql_query` (or wait for a later phase).

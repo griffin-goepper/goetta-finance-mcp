@@ -31,12 +31,28 @@ def test_sync_when_unconfigured_exits_nonzero(
 def test_help_lists_commands() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    for cmd in ("init", "sync", "serve", "web", "status"):
+    for cmd in ("init", "sync", "serve", "web", "daemon", "status"):
         assert cmd in result.output
 
 
 def test_web_without_db_exits_with_hint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GOETTA_FINANCE_HOME", str(tmp_path))
     result = runner.invoke(app, ["web", "--port", "0"])
+    assert result.exit_code == 1
+    assert "init" in result.output.lower()
+
+
+def test_daemon_help_exposes_expected_flags() -> None:
+    result = runner.invoke(app, ["daemon", "--help"])
+    assert result.exit_code == 0
+    for flag in ("--host", "--port", "--sync-at", "--no-schedule", "--no-mcp"):
+        assert flag in result.output
+
+
+def test_daemon_without_config_exits_with_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOETTA_FINANCE_HOME", str(tmp_path))
+    result = runner.invoke(app, ["daemon"])
     assert result.exit_code == 1
     assert "init" in result.output.lower()

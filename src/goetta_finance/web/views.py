@@ -12,7 +12,7 @@ from decimal import Decimal
 from typing import Annotated, Any, cast
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from goetta_finance.tools.accounts import serialize_account
 from goetta_finance.tools.transactions import serialize_transaction
@@ -42,6 +42,27 @@ def _parse_iso(value: str | None) -> datetime | None:
 
 
 def register_routes(app: FastAPI) -> None:
+    @app.get("/health", response_class=JSONResponse)
+    async def health(request: Request) -> JSONResponse:
+        """Daemon-readiness probe. Used by the ``init`` wizard to confirm
+        a running daemon before writing the Claude Code HTTP registration,
+        and as a generic liveness check from cron-style monitors.
+        """
+        store = _store(request)
+        last = store.last_sync_time()
+        try:
+            accounts_count = len(store.get_accounts())
+        except Exception:
+            accounts_count = None
+        return JSONResponse(
+            {
+                "ok": True,
+                "last_sync": last.isoformat() if last else None,
+                "accounts": accounts_count,
+                "mcp_enabled": request.app.state.mcp_server is not None,
+            }
+        )
+
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
         store = _store(request)

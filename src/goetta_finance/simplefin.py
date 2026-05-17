@@ -10,7 +10,13 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-from goetta_finance.errors import SetupTokenError, SimpleFinError
+from goetta_finance.errors import (
+    BridgeAuthError,
+    BridgeRateLimitError,
+    BridgeUnavailableError,
+    SetupTokenError,
+    SimpleFinError,
+)
 from goetta_finance.models import Account, Transaction
 
 logger = logging.getLogger(__name__)
@@ -155,6 +161,24 @@ class SimpleFinClient:
             )
         except httpx.HTTPError as exc:
             raise SimpleFinError(f"SimpleFIN request failed: {exc}") from exc
+        if response.status_code in (401, 403):
+            raise BridgeAuthError(
+                f"SimpleFIN Bridge auth failed (HTTP {response.status_code}). "
+                f"The access URL may be revoked; run `goetta-finance init` to "
+                f"reclaim a new setup token."
+            )
+        if response.status_code == 429:
+            retry_after = response.headers.get("retry-after")
+            hint = f" (retry-after: {retry_after}s)" if retry_after else ""
+            raise BridgeRateLimitError(
+                f"SimpleFIN Bridge rate-limited the request{hint}. Back off "
+                f"and try again later."
+            )
+        if 500 <= response.status_code < 600:
+            raise BridgeUnavailableError(
+                f"SimpleFIN Bridge unavailable (HTTP {response.status_code}). "
+                f"This is usually transient; try again in a few minutes."
+            )
         if response.status_code >= 400:
             raise SimpleFinError(f"SimpleFIN /accounts returned HTTP {response.status_code}")
         try:

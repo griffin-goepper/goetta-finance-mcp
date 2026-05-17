@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -16,14 +17,18 @@ from goetta_finance.config import (
     load_config,
     save_config,
 )
+from goetta_finance.daemon import run_daemon
 from goetta_finance.errors import GoettaFinanceError, SetupTokenError
 from goetta_finance.mcp_config import (
     SERVER_KEY,
+    build_http_server_entry,
     build_server_entry,
     claude_code_executable,
     claude_desktop_config_path,
+    merge_into_config,
     register_with_claude_code,
     resolve_command,
+    unregister_with_claude_code,
     write_claude_desktop_config,
 )
 from goetta_finance.server import build_server
@@ -179,6 +184,99 @@ def web(
 
 
 @app.command()
+def daemon(
+    host: Annotated[
+        str, typer.Option("--host", help="Bind address. Default localhost-only.")
+    ] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="HTTP port.")] = 8765,
+    sync_at: Annotated[
+        str,
+        typer.Option(
+            "--sync-at",
+            help="HH:MM (24h) local time of the daily scheduled sync.",
+        ),
+    ] = "06:00",
+    no_schedule: Annotated[
+        bool,
+        typer.Option(
+            "--no-schedule",
+            help="Disable the internal scheduler (manual sync only).",
+        ),
+    ] = False,
+    no_mcp: Annotated[
+        bool,
+        typer.Option(
+            "--no-mcp",
+            help="Disable the MCP HTTP endpoint (dashboard + scheduler only).",
+        ),
+    ] = False,
+) -> None:
+    """Run the long-lived daemon: dashboard + MCP HTTP + scheduled sync.
+
+    One process, one DuckDB write handle. The MCP endpoint is at
+    ``http://<host>:<port>/api/mcp`` (register with
+    ``claude mcp add goetta-finance --scope user --transport http <url>``).
+    The dashboard is at ``http://<host>:<port>/``.
+    """
+    try:
+        config = load_config()
+        if not config.access_url:
+            typer.secho(
+                "No access URL configured. Run `goetta-finance init` first.",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if host != "127.0.0.1" and host != "localhost":
+            typer.secho(
+                f"WARNING: binding to {host}; anyone on this network can read "
+                f"your finances. No auth is enforced.",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+        store = DuckDBStore(db_path(config))
+        try:
+            import duckdb
+
+            try:
+                _ = store.conn  # force-open to fail fast on a locked DB
+            except duckdb.Error as exc:
+                typer.secho(
+                    f"Cannot open {db_path(config)}: {exc}",
+                    fg=typer.colors.RED,
+                    err=True,
+                )
+                typer.secho(
+                    "Another goetta-finance process (serve, web, or daemon) "
+                    "is already running and holds the DB lock. Stop it first.",
+                    fg=typer.colors.YELLOW,
+                    err=True,
+                )
+                raise typer.Exit(code=1) from exc
+            store.init()
+            client = SimpleFinClient(config.access_url)
+            mcp_url = f"http://{host}:{port}/api/mcp" if not no_mcp else "(disabled)"
+            typer.echo(f"goetta-finance daemon: http://{host}:{port}")
+            typer.echo(f"  dashboard: http://{host}:{port}/")
+            typer.echo(f"  MCP:       {mcp_url}")
+            typer.echo(f"  schedule:  {'(disabled)' if no_schedule else sync_at + ' local'}")
+            run_daemon(
+                store,
+                client,
+                host=host,
+                port=port,
+                sync_at=sync_at,
+                schedule_enabled=not no_schedule,
+                mcp_enabled=not no_mcp,
+            )
+        finally:
+            store.close()
+    except GoettaFinanceError as exc:
+        typer.secho(f"Daemon failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@app.command()
 def status() -> None:
     """Show sync health and current balances."""
     try:
@@ -247,16 +345,95 @@ def _run_init() -> None:
     typer.echo("Run `goetta-finance status` any time to check sync health.")
 
 
+_DAEMON_DEFAULT_HOST = "127.0.0.1"
+_DAEMON_DEFAULT_PORT = 8765
+
+
+def _daemon_mcp_url() -> str:
+    return f"http://{_DAEMON_DEFAULT_HOST}:{_DAEMON_DEFAULT_PORT}/api/mcp"
+
+
+def _daemon_health_url() -> str:
+    return f"http://{_DAEMON_DEFAULT_HOST}:{_DAEMON_DEFAULT_PORT}/health"
+
+
+def _poll_daemon_health(timeout_seconds: float = 5.0) -> bool:
+    """Probe ``/health`` to see if a daemon is already running locally."""
+    import time
+
+    import httpx
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            response = httpx.get(_daemon_health_url(), timeout=1.0)
+            if response.status_code == 200:
+                return True
+        except httpx.HTTPError:
+            pass
+        time.sleep(0.25)
+    return False
+
+
+def _prompt_daemon_mode() -> bool:
+    typer.echo("")
+    typer.secho(
+        "  Daemon mode: one long-lived process serves the dashboard AND the",
+        bold=True,
+    )
+    typer.secho(
+        "  MCP endpoint over HTTP. Recommended on Windows (otherwise the",
+        bold=True,
+    )
+    typer.secho("  serve+web DuckDB lock conflict bites you).", bold=True)
+    typer.echo("")
+    typer.secho(
+        "  NOTE: in v1 the daemon does NOT auto-start. You'll need to:",
+        fg=typer.colors.YELLOW,
+    )
+    typer.secho(
+        "    - keep `goetta-finance daemon` running in a separate terminal, OR",
+        fg=typer.colors.YELLOW,
+    )
+    typer.secho(
+        "    - install the systemd / launchd / Task Scheduler snippet from",
+        fg=typer.colors.YELLOW,
+    )
+    typer.secho(
+        '      README.md ("Scheduling") to start it at login.',
+        fg=typer.colors.YELLOW,
+    )
+    typer.echo("")
+    return typer.confirm("  Use daemon mode?", default=False)
+
+
 def _run_init_mcp_step() -> None:
     command = resolve_command()
-    typer.echo(f"  Command to register: {command}")
+    use_daemon = _prompt_daemon_mode()
+    if use_daemon:
+        mcp_url = _daemon_mcp_url()
+        typer.echo(f"  MCP URL: {mcp_url}")
+    else:
+        typer.echo(f"  Command to register: {command}")
     registered_any = False
 
     claude_code = claude_code_executable()
     if claude_code is not None:
         typer.echo(f"  Detected Claude Code: {claude_code}")
         if typer.confirm("  Register goetta-finance with Claude Code (user scope)?", default=True):
-            ok, msg = register_with_claude_code(command)
+            if use_daemon:
+                # Clear any stale stdio registration so we don't end up with
+                # a dual-registration where one points at a stdio subprocess
+                # we no longer expect to be invoked.
+                for scope in ("user", "local"):
+                    cleared, msg = unregister_with_claude_code(scope=scope)
+                    if cleared and msg and "no existing" not in msg.lower():
+                        typer.echo(f"  ✓ Cleared previous {scope}-scope registration.")
+                ok, msg = register_with_claude_code(
+                    command, transport="http", url=_daemon_mcp_url()
+                )
+            else:
+                ok, msg = register_with_claude_code(command)
             if ok:
                 typer.echo(f"  ✓ Registered with Claude Code. {msg}".rstrip())
                 typer.echo(
@@ -276,7 +453,10 @@ def _run_init_mcp_step() -> None:
         typer.echo(f"  Detected Claude Desktop config: {desktop_path}")
         if typer.confirm("  Write goetta-finance into Claude Desktop's config?", default=True):
             try:
-                changed = write_claude_desktop_config(desktop_path, command=command)
+                if use_daemon:
+                    changed = _write_claude_desktop_http_entry(desktop_path, _daemon_mcp_url())
+                else:
+                    changed = write_claude_desktop_config(desktop_path, command=command)
             except GoettaFinanceError as exc:
                 typer.secho(f"  {exc}", fg=typer.colors.RED)
             else:
@@ -295,14 +475,63 @@ def _run_init_mcp_step() -> None:
                 )
 
     if not registered_any:
-        _print_manual_snippet(command)
+        _print_manual_snippet(command, http_url=_daemon_mcp_url() if use_daemon else None)
+
+    if use_daemon:
+        typer.echo("")
+        if _poll_daemon_health(timeout_seconds=2.0):
+            typer.secho("  ✓ Daemon is already running.", fg=typer.colors.GREEN)
+        else:
+            typer.secho(
+                "  Daemon is not running yet. Start it now:",
+                fg=typer.colors.YELLOW,
+            )
+            typer.echo("    goetta-finance daemon")
+            typer.echo("  Then restart Claude.")
 
 
-def _print_manual_snippet(command: str) -> None:
-    snippet = {"mcpServers": {SERVER_KEY: build_server_entry(command)}}
+def _print_manual_snippet(command: str, *, http_url: str | None = None) -> None:
+    entry = build_http_server_entry(http_url) if http_url else build_server_entry(command)
+    snippet = {"mcpServers": {SERVER_KEY: entry}}
     typer.echo("  Add to your Claude Desktop config manually:")
     typer.echo("")
     typer.echo(json.dumps(snippet, indent=2))
+
+
+def _write_claude_desktop_http_entry(path: Path, url: str) -> bool:
+    """Merge the daemon-mode HTTP entry into Claude Desktop's config.
+
+    Mirrors ``write_claude_desktop_config`` but uses the HTTP entry
+    shape. Atomic-replace via tmp-file as in the stdio writer.
+    """
+    import os as _os
+
+    from goetta_finance.errors import ConfigError
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict[str, object] = {}
+    if path.exists():
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                loaded = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConfigError(
+                f"Existing Claude Desktop config at {path} is unreadable: {exc}"
+            ) from exc
+        if not isinstance(loaded, dict):
+            raise ConfigError(f"Existing Claude Desktop config at {path} is not a JSON object.")
+        existing = loaded
+
+    merged, changed = merge_into_config(existing, build_http_server_entry(url))
+    if not changed:
+        return False
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(merged, f, indent=2, sort_keys=True)
+        f.write("\n")
+    _os.replace(tmp, path)
+    return True
 
 
 def _prompt_setup_token_and_claim() -> str:

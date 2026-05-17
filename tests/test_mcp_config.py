@@ -217,3 +217,102 @@ def test_register_with_claude_code_surfaces_failure(monkeypatch: pytest.MonkeyPa
     ok, msg = register_with_claude_code("/path/goetta-finance.exe")
     assert ok is False
     assert "already exists" in msg
+
+
+def test_register_with_claude_code_http_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Daemon-mode registration must use ``--transport http <url>``."""
+    import subprocess
+
+    from goetta_finance.mcp_config import register_with_claude_code
+
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/bin/claude")
+    calls: list[list[str]] = []
+
+    class _Result:
+        returncode = 0
+        stdout = "Added MCP server goetta-finance"
+        stderr = ""
+
+    def fake_run(args: list[str], **kwargs: object) -> _Result:
+        calls.append(args)
+        return _Result()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ok, _msg = register_with_claude_code(
+        "/unused-when-http", transport="http", url="http://127.0.0.1:8765/api/mcp"
+    )
+    assert ok is True
+    assert calls == [
+        [
+            "/usr/bin/claude",
+            "mcp",
+            "add",
+            "--scope",
+            "user",
+            "--transport",
+            "http",
+            SERVER_KEY,
+            "http://127.0.0.1:8765/api/mcp",
+        ]
+    ]
+
+
+def test_register_with_claude_code_http_requires_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from goetta_finance.mcp_config import register_with_claude_code
+
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/bin/claude")
+    ok, msg = register_with_claude_code("ignored", transport="http", url=None)
+    assert ok is False
+    assert "url" in msg.lower()
+
+
+def test_unregister_with_claude_code_treats_not_found_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Daemon-mode init clears stale stdio registrations idempotently."""
+    import subprocess
+
+    from goetta_finance.mcp_config import unregister_with_claude_code
+
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/bin/claude")
+
+    class _Result:
+        returncode = 1
+        stdout = ""
+        stderr = "No MCP server `goetta-finance` found in user config"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _Result())
+    ok, msg = unregister_with_claude_code()
+    assert ok is True
+    assert "no existing" in msg.lower() or "no" in msg.lower()
+
+
+def test_unregister_with_claude_code_surfaces_real_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    from goetta_finance.mcp_config import unregister_with_claude_code
+
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/bin/claude")
+
+    class _Result:
+        returncode = 2
+        stdout = ""
+        stderr = "permission denied"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _Result())
+    ok, msg = unregister_with_claude_code()
+    assert ok is False
+    assert "permission" in msg.lower()
+
+
+def test_build_http_server_entry_shape() -> None:
+    from goetta_finance.mcp_config import build_http_server_entry
+
+    entry = build_http_server_entry("http://127.0.0.1:8765/api/mcp")
+    assert entry == {"type": "http", "url": "http://127.0.0.1:8765/api/mcp"}

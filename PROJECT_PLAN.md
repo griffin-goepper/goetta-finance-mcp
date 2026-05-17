@@ -396,10 +396,10 @@ The dashboard is part of v1 because it's where rich, persistent visualization li
 
 ### Phase 4 — Scheduling & polish (~2 days)
 
-- [ ] `goetta-finance daemon` with internal scheduler (default: daily at 6am local)
-- [ ] Lazy sync: MCP server triggers `collect()` if `last_sync_time` is older than N hours
-- [ ] Documented cron and systemd timer snippets in README
-- [ ] Better error messages on the Bridge's various failure modes
+- [x] `goetta-finance daemon` with internal scheduler (default: daily at 6am local). Hosts dashboard + streamable-HTTP MCP at `/api/mcp` + scheduler in one process — also resolves the Windows DuckDB-lock conflict.
+- [x] Lazy sync: MCP server triggers `collect()` if `last_sync_time` is older than `GOETTA_FINANCE_LAZY_SYNC_HOURS` (default 6h). Uses a daemon thread (not `asyncio.create_task`) so the sync outlives the request. New `sync_status` MCP tool exposes freshness for Claude.
+- [x] Documented systemd / launchd / Windows Task Scheduler snippets in README.
+- [x] Better error messages on the Bridge's various failure modes (`BridgeAuthError`, `BridgeRateLimitError`, `BridgeUnavailableError`).
 
 ### Phase 5 — v2 features (later)
 

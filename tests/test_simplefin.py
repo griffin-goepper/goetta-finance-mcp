@@ -8,7 +8,13 @@ import httpx
 import pytest
 import respx
 
-from goetta_finance.errors import SetupTokenError, SimpleFinError
+from goetta_finance.errors import (
+    BridgeAuthError,
+    BridgeRateLimitError,
+    BridgeUnavailableError,
+    SetupTokenError,
+    SimpleFinError,
+)
 from goetta_finance.simplefin import (
     SimpleFinClient,
     parse_accounts,
@@ -118,6 +124,62 @@ def test_fetch_raises_on_http_error() -> None:
             datetime(2026, 5, 1, tzinfo=UTC),
             datetime(2026, 5, 2, tzinfo=UTC),
         )
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [401, 403])
+def test_fetch_auth_error_raises_bridge_auth_error(status: int) -> None:
+    respx.get("https://bridge.example.invalid/simplefin/accounts").mock(
+        return_value=httpx.Response(status, text="nope")
+    )
+    client = SimpleFinClient("https://user:pass@bridge.example.invalid/simplefin")
+    with pytest.raises(BridgeAuthError) as exc_info:
+        client.fetch(
+            datetime(2026, 5, 1, tzinfo=UTC),
+            datetime(2026, 5, 2, tzinfo=UTC),
+        )
+    assert "reclaim" in str(exc_info.value).lower()
+    assert str(status) in str(exc_info.value)
+
+
+@respx.mock
+def test_fetch_rate_limit_raises_bridge_rate_limit_error_with_retry_after() -> None:
+    respx.get("https://bridge.example.invalid/simplefin/accounts").mock(
+        return_value=httpx.Response(429, headers={"retry-after": "60"}, text="slow down")
+    )
+    client = SimpleFinClient("https://user:pass@bridge.example.invalid/simplefin")
+    with pytest.raises(BridgeRateLimitError) as exc_info:
+        client.fetch(
+            datetime(2026, 5, 1, tzinfo=UTC),
+            datetime(2026, 5, 2, tzinfo=UTC),
+        )
+    assert "60" in str(exc_info.value)
+    assert "rate" in str(exc_info.value).lower()
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_fetch_5xx_raises_bridge_unavailable_error(status: int) -> None:
+    respx.get("https://bridge.example.invalid/simplefin/accounts").mock(
+        return_value=httpx.Response(status, text="oops")
+    )
+    client = SimpleFinClient("https://user:pass@bridge.example.invalid/simplefin")
+    with pytest.raises(BridgeUnavailableError) as exc_info:
+        client.fetch(
+            datetime(2026, 5, 1, tzinfo=UTC),
+            datetime(2026, 5, 2, tzinfo=UTC),
+        )
+    assert "transient" in str(exc_info.value).lower()
+    assert str(status) in str(exc_info.value)
+
+
+def test_bridge_errors_are_subclasses_of_simplefin_error() -> None:
+    """Existing callers catching SimpleFinError must still catch all
+    Bridge-specific subclasses. Pinned because CLI error handling and the
+    `sync_now` MCP tool both catch the base class."""
+    assert issubclass(BridgeAuthError, SimpleFinError)
+    assert issubclass(BridgeRateLimitError, SimpleFinError)
+    assert issubclass(BridgeUnavailableError, SimpleFinError)
 
 
 @respx.mock

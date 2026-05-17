@@ -65,6 +65,15 @@ def build_server_entry(command: str = "goetta-finance") -> dict[str, Any]:
     return {"command": command, "args": ["serve"]}
 
 
+def build_http_server_entry(url: str) -> dict[str, Any]:
+    """HTTP-transport entry shape for Claude Desktop's config.
+
+    Daemon mode publishes MCP over streamable-HTTP, so Claude Desktop
+    needs the ``url``/``type`` shape rather than ``command``/``args``.
+    """
+    return {"type": "http", "url": url}
+
+
 def merge_into_config(
     existing: dict[str, Any], entry: dict[str, Any]
 ) -> tuple[dict[str, Any], bool]:
@@ -118,20 +127,53 @@ def claude_code_executable() -> str | None:
 
 
 def register_with_claude_code(
-    command: str, *, name: str = SERVER_KEY, scope: str = "user"
+    command: str,
+    *,
+    name: str = SERVER_KEY,
+    scope: str = "user",
+    transport: str = "stdio",
+    url: str | None = None,
 ) -> tuple[bool, str]:
     """Register goetta-finance with Claude Code via ``claude mcp add``.
 
+    Two transports:
+
+    - ``transport="stdio"`` (default): registers ``command serve`` as a
+      stdio MCP server. Used when the user runs the bare ``serve``
+      subprocess on demand.
+    - ``transport="http"``: registers ``url`` as a streamable-HTTP MCP
+      endpoint. Used in daemon mode where the daemon owns the DB and
+      exposes MCP at ``http://127.0.0.1:8765/api/mcp``.
+
     Returns ``(success, message)``. On failure, ``message`` contains the
-    captured stderr/stdout so the caller can surface it. Idempotent only in
-    the sense that a duplicate registration surfaces as a clean failure —
-    callers wanting to replace should ``claude mcp remove <name>`` first.
+    captured stderr/stdout so the caller can surface it. Duplicate
+    registrations surface as a clean failure — callers wanting to replace
+    should call ``unregister_with_claude_code`` first.
     """
     claude = claude_code_executable()
     if claude is None:
         return False, "`claude` CLI not on PATH"
 
-    args = [claude, "mcp", "add", name, "--scope", scope, "--", command, "serve"]
+    if transport == "stdio":
+        args = [claude, "mcp", "add", name, "--scope", scope, "--", command, "serve"]
+    elif transport == "http":
+        if not url:
+            return False, "transport=http requires a url"
+        # Documented form: claude mcp add --transport http <name> <url>
+        args = [
+            claude,
+            "mcp",
+            "add",
+            "--scope",
+            scope,
+            "--transport",
+            "http",
+            name,
+            url,
+        ]
+    else:
+        return False, f"unsupported transport {transport!r}"
+
     try:
         result = subprocess.run(args, capture_output=True, text=True, check=False)
     except OSError as exc:
@@ -141,3 +183,28 @@ def register_with_claude_code(
         msg = result.stderr.strip() or result.stdout.strip()
         return False, msg or f"`claude mcp add` exited with code {result.returncode}"
     return True, result.stdout.strip()
+
+
+def unregister_with_claude_code(
+    *, name: str = SERVER_KEY, scope: str = "user"
+) -> tuple[bool, str]:
+    """Run ``claude mcp remove`` for ``name`` in ``scope``.
+
+    Treats "not found" as success — callers want this to be idempotent
+    so they can clear a stale stdio registration before adding the
+    daemon-mode HTTP one.
+    """
+    claude = claude_code_executable()
+    if claude is None:
+        return False, "`claude` CLI not on PATH"
+    args = [claude, "mcp", "remove", name, "--scope", scope]
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        return False, f"Failed to invoke `claude`: {exc}"
+    if result.returncode == 0:
+        return True, result.stdout.strip()
+    msg = (result.stderr.strip() + " " + result.stdout.strip()).strip().lower()
+    if "no" in msg and ("found" in msg or "exists" in msg):
+        return True, "(no existing registration)"
+    return False, result.stderr.strip() or result.stdout.strip()
