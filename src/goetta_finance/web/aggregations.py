@@ -93,23 +93,34 @@ def net_worth_series(
     """Aggregate per-account balance snapshots into daily total net worth.
 
     For each day in the window, find the latest snapshot for each account
-    at or before that day and sum the balances. Days with no snapshot for
-    any account are skipped (the chart's x axis is the union of days that
-    had at least one snapshot).
+    at or before that day and sum the **signed** balances. Days with no
+    snapshot for any account are skipped (the chart's x axis is the union
+    of days that had at least one snapshot).
+
+    Signed-balance formula (matches the user-facing pattern documented in
+    server.SQL_SCHEMA_HINT): a liability contributes ``-ABS(balance)``
+    regardless of how the source signs it. This collapses SimpleFIN's
+    negative-CC convention and the loan-servicer's positive-amount-owed
+    convention to the same correct answer.
     """
     end = (now or datetime.now(tz=UTC)).astimezone(UTC)
     since = end - timedelta(days=days)
     rows = store.query_sql(
         """
-        SELECT account_id, timestamp, balance
-        FROM balance_snapshots
-        WHERE timestamp >= ?
-        ORDER BY account_id, timestamp
+        SELECT bs.account_id,
+               bs.timestamp,
+               CASE WHEN a.is_liability
+                    THEN -ABS(bs.balance)
+                    ELSE bs.balance
+               END AS signed_balance
+        FROM balance_snapshots bs
+        JOIN accounts a ON a.id = bs.account_id
+        WHERE bs.timestamp >= ?
+        ORDER BY bs.account_id, bs.timestamp
         """,
         [since],
     )
 
-    # latest_balance[account_id] = (last_seen_day, balance)
     latest_per_account: dict[str, Decimal] = {}
     days_seen: set[date] = set()
     rows_by_day: dict[date, list[tuple[str, Decimal]]] = {}
@@ -117,7 +128,9 @@ def net_worth_series(
         ts = row["timestamp"]
         day = ts.date() if isinstance(ts, datetime) else ts
         days_seen.add(day)
-        rows_by_day.setdefault(day, []).append((row["account_id"], _as_decimal(row["balance"])))
+        rows_by_day.setdefault(day, []).append(
+            (row["account_id"], _as_decimal(row["signed_balance"]))
+        )
 
     out: list[NetWorthPoint] = []
     for day in sorted(days_seen):

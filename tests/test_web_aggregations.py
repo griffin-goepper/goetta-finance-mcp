@@ -136,6 +136,111 @@ def test_net_worth_series_respects_window(store: DuckDBStore) -> None:
     assert recent.timestamp.date() in days
 
 
+def test_net_worth_series_liability_negative_balance(store: DuckDBStore) -> None:
+    """Liability with NEGATIVE balance (SimpleFIN credit-card convention) contributes
+    exactly ``balance`` to net worth — sign already correct.
+
+    Pins the outcome of the signed-balance formula end-to-end through
+    net_worth_series. A refactor that changes how the formula is expressed
+    but still satisfies the property passes; a refactor that drops the
+    CASE WHEN fails because the math is wrong.
+    """
+    store.upsert_accounts(
+        [
+            Account(
+                id="asset-1",
+                org_name="Chase",
+                name="Checking",
+                balance=Decimal("1000.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.CHECKING,
+            ),
+            Account(
+                id="cc-1",
+                org_name="Amex",
+                name="Gold",
+                balance=Decimal("-500.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.CREDIT,
+                is_liability=True,
+            ),
+        ]
+    )
+    store.record_balance_snapshot(
+        BalanceSnapshot(
+            account_id="asset-1",
+            timestamp=datetime(2026, 5, 1, tzinfo=UTC),
+            balance=Decimal("1000.00"),
+        )
+    )
+    store.record_balance_snapshot(
+        BalanceSnapshot(
+            account_id="cc-1",
+            timestamp=datetime(2026, 5, 1, tzinfo=UTC),
+            balance=Decimal("-500.00"),
+        )
+    )
+    series = net_worth_series(store, days=30, now=datetime(2026, 5, 16, tzinfo=UTC))
+    by_day = {p.day: p.balance for p in series}
+    # 1000 (asset) + -500 (liability, balance already negative) = 500
+    assert by_day[date(2026, 5, 1)] == Decimal("500.00"), (
+        f"expected 500 (1000 asset + -500 negative-balance liability), got {by_day[date(2026, 5, 1)]}"
+    )
+
+
+def test_net_worth_series_liability_positive_balance(store: DuckDBStore) -> None:
+    """Liability with POSITIVE balance (loan-servicer convention) gets sign-flipped
+    to contribute -ABS(balance) to net worth.
+
+    Pins the outcome of the signed-balance formula end-to-end. This is the case
+    that would silently inflate net worth by 2x the loan amount if the
+    CASE WHEN were dropped — making this a load-bearing regression test.
+    """
+    store.upsert_accounts(
+        [
+            Account(
+                id="asset-1",
+                org_name="Chase",
+                name="Checking",
+                balance=Decimal("10000.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.CHECKING,
+            ),
+            Account(
+                id="MANUAL-loan-1",
+                org_name="Dept of Education",
+                name="Federal Student Loans",
+                balance=Decimal("22500.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.LOAN,
+                is_manual=True,
+                is_liability=True,
+            ),
+        ]
+    )
+    store.record_balance_snapshot(
+        BalanceSnapshot(
+            account_id="asset-1",
+            timestamp=datetime(2026, 5, 1, tzinfo=UTC),
+            balance=Decimal("10000.00"),
+        )
+    )
+    store.record_balance_snapshot(
+        BalanceSnapshot(
+            account_id="MANUAL-loan-1",
+            timestamp=datetime(2026, 5, 1, tzinfo=UTC),
+            balance=Decimal("22500.00"),
+        )
+    )
+    series = net_worth_series(store, days=30, now=datetime(2026, 5, 16, tzinfo=UTC))
+    by_day = {p.day: p.balance for p in series}
+    # 10000 (asset) + -22500 (liability with positive stored balance, sign flipped) = -12500
+    assert by_day[date(2026, 5, 1)] == Decimal("-12500.00"), (
+        f"expected -12500 (10000 asset minus 22500 positive-balance liability), "
+        f"got {by_day[date(2026, 5, 1)]} — likely missing the -ABS(balance) flip in net_worth_series SQL"
+    )
+
+
 def test_recent_sync_runs_orders_newest_first(store: DuckDBStore) -> None:
     from goetta_finance.models import SyncRun
 

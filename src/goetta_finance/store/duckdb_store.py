@@ -178,8 +178,7 @@ class DuckDBStore:
                 ")"
             )
             applied = {
-                row[0]
-                for row in self.conn.execute("SELECT name FROM schema_migrations").fetchall()
+                row[0] for row in self.conn.execute("SELECT name FROM schema_migrations").fetchall()
             }
             migrations_dir = files("goetta_finance.store.migrations")
             sql_files = sorted(
@@ -192,9 +191,7 @@ class DuckDBStore:
                 try:
                     self.conn.execute("BEGIN")
                     self.conn.execute(sql_text)
-                    self.conn.execute(
-                        "INSERT INTO schema_migrations (name) VALUES (?)", [name]
-                    )
+                    self.conn.execute("INSERT INTO schema_migrations (name) VALUES (?)", [name])
                     self.conn.execute("COMMIT")
                 except duckdb.Error as exc:
                     self.conn.execute("ROLLBACK")
@@ -215,16 +212,39 @@ class DuckDBStore:
                 _to_naive_utc(a.balance_date),
                 a.type.value if a.type is not None else None,
                 _json_or_none(a.extra),
+                a.is_manual,
+                a.is_liability,
             )
             for a in accounts
         ]
         with self._lock:
+            # Defensive: never let a non-manual upsert clobber an existing
+            # is_manual=TRUE row. SimpleFIN ids start with ``ACT-`` and manual
+            # ids with ``MANUAL-``, so by id-prefix this can't happen today —
+            # but if SimpleFIN ever changes its id format and collides, we
+            # want the sync to fail loudly, not silently overwrite the user's
+            # locally-maintained record. The CLI layer also gates ``add`` so
+            # users can't pick a colliding id.
+            non_manual_ids = [a.id for a in accounts if not a.is_manual]
+            if non_manual_ids:
+                placeholders = ", ".join(["?"] * len(non_manual_ids))
+                # ruff S608 / bandit B608: ``placeholders`` is ``"?, ?, ?, ..."``
+                # — pure parameter markers, no user data. Audited 2026-05.
+                collisions = self.conn.execute(
+                    f"SELECT id FROM accounts WHERE is_manual = TRUE AND id IN ({placeholders})",  # noqa: S608  # nosec B608
+                    non_manual_ids,
+                ).fetchall()
+                if collisions:
+                    collided = ", ".join(row[0] for row in collisions)
+                    raise StoreError(
+                        f"refusing to upsert non-manual data over manual account(s): {collided}"
+                    )
             self.conn.executemany(
                 """
                 INSERT INTO accounts (
                     id, org_id, org_name, name, currency, balance, available_balance,
-                    balance_date, type, extra, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
+                    balance_date, type, extra, is_manual, is_liability, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
                 ON CONFLICT (id) DO UPDATE SET
                     org_id = excluded.org_id,
                     org_name = excluded.org_name,
@@ -235,10 +255,81 @@ class DuckDBStore:
                     balance_date = excluded.balance_date,
                     type = excluded.type,
                     extra = excluded.extra,
+                    is_manual = excluded.is_manual,
+                    is_liability = excluded.is_liability,
                     updated_at = now()
                 """,
                 rows,
             )
+
+    def set_account_liability(self, account_id: str, is_liability: bool) -> None:
+        """Toggle the ``is_liability`` flag on an existing account.
+
+        Works on any account id (SimpleFIN-sourced or manual). Raises
+        ``StoreError`` if the account does not exist. The flag is applied
+        retroactively to all historical balance_snapshots when net-worth
+        aggregations run — see the plan's risk discussion. Caller should
+        warn the user if that's not desired.
+        """
+        with self._lock:
+            row = self.conn.execute("SELECT 1 FROM accounts WHERE id = ?", [account_id]).fetchone()
+            if row is None:
+                raise StoreError(f"account not found: {account_id}")
+            self.conn.execute(
+                "UPDATE accounts SET is_liability = ?, updated_at = now() WHERE id = ?",
+                [is_liability, account_id],
+            )
+
+    def delete_account(self, account_id: str, *, cascade_snapshots: bool = False) -> int:
+        """Delete a manual account. Refuses non-manual accounts.
+
+        Returns the number of balance_snapshots rows removed (0 if none).
+
+        If the account has any ``balance_snapshots`` rows, the caller must
+        pass ``cascade_snapshots=True`` to remove them too. Otherwise this
+        raises ``StoreError`` and leaves the database unchanged. Refuses
+        non-manual accounts unconditionally — SimpleFIN-sourced accounts
+        cannot be deleted through this method.
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT is_manual FROM accounts WHERE id = ?", [account_id]
+            ).fetchone()
+            if row is None:
+                raise StoreError(f"account not found: {account_id}")
+            if not row[0]:
+                raise StoreError(f"refusing to delete non-manual account: {account_id}")
+            count_row = self.conn.execute(
+                "SELECT COUNT(*) FROM balance_snapshots WHERE account_id = ?",
+                [account_id],
+            ).fetchone()
+            snapshot_count = int(count_row[0]) if count_row else 0
+            if snapshot_count > 0 and not cascade_snapshots:
+                raise StoreError(
+                    f"account has {snapshot_count} balance snapshots; "
+                    "pass cascade_snapshots=True to remove them"
+                )
+            # DuckDB enforces FK constraints per-statement, so wrapping
+            # both deletes in BEGIN/COMMIT raises FK violation on the
+            # accounts DELETE even though the snapshots DELETE precedes
+            # it in the same transaction. Letting each statement
+            # autocommit means the snapshots are gone by the time the
+            # accounts DELETE runs. Trade-off: if the accounts DELETE
+            # fails after the snapshots DELETE succeeds, we have an
+            # orphaned account with no history — acceptable for a
+            # single-user local tool since both statements are simple
+            # deletes that don't fail in practice and the user can
+            # re-run the remove. Atomicity is not load-bearing here.
+            try:
+                if snapshot_count > 0:
+                    self.conn.execute(
+                        "DELETE FROM balance_snapshots WHERE account_id = ?",
+                        [account_id],
+                    )
+                self.conn.execute("DELETE FROM accounts WHERE id = ?", [account_id])
+            except duckdb.Error as exc:
+                raise StoreError(f"delete_account failed: {exc}") from exc
+            return snapshot_count
 
     def upsert_transactions(self, txns: list[Transaction]) -> SyncResult:
         if not txns:
@@ -346,7 +437,8 @@ class DuckDBStore:
             rows = self.conn.execute(
                 """
                 SELECT id, org_id, org_name, name, currency, balance,
-                       available_balance, balance_date, type, extra
+                       available_balance, balance_date, type, extra,
+                       is_manual, is_liability
                 FROM accounts
                 ORDER BY org_name, name
                 """
@@ -413,9 +505,7 @@ class DuckDBStore:
             for row in rows
         ]
 
-    def query_sql(
-        self, sql: str, params: Sequence[Any] | None = None
-    ) -> list[dict[str, Any]]:
+    def query_sql(self, sql: str, params: Sequence[Any] | None = None) -> list[dict[str, Any]]:
         """Run a single read-only SQL statement and return rows as dicts.
 
         ``params`` is optional positional-parameter binding (DuckDB ``?``
@@ -482,9 +572,7 @@ class DuckDBStore:
                     else:
                         cur = conn.execute(statements[0], list(params))
                 except duckdb.Error as exc:
-                    raise StoreError(
-                        f"query_sql rejected by read-only transaction: {exc}"
-                    ) from exc
+                    raise StoreError(f"query_sql rejected by read-only transaction: {exc}") from exc
                 columns = [d[0] for d in cur.description] if cur.description else []
                 rows = [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
             finally:
@@ -509,6 +597,8 @@ class DuckDBStore:
             balance_date=_from_naive_utc(row[7]),  # type: ignore[arg-type]
             type=account_type,
             extra=_parse_json(row[9]),
+            is_manual=bool(row[10]),
+            is_liability=bool(row[11]),
         )
 
     def _row_to_transaction(self, row: tuple[Any, ...]) -> Transaction:

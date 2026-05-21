@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import uuid
+from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated
 
@@ -31,9 +34,12 @@ from goetta_finance.mcp_config import (
     unregister_with_claude_code,
     write_claude_desktop_config,
 )
+from goetta_finance.models import Account, AccountType, BalanceSnapshot
 from goetta_finance.server import build_server
 from goetta_finance.simplefin import SimpleFinClient
 from goetta_finance.store.duckdb_store import DuckDBStore
+
+MANUAL_ID_PREFIX = "MANUAL-"
 
 app = typer.Typer(
     help="Local-first MCP server that connects SimpleFIN to Claude.",
@@ -594,6 +600,381 @@ def _print_json_list(label: str, value: object, color: str) -> None:
         return
     for item in items:
         typer.secho(f"  {label}: {item}", fg=color)
+
+
+account_app = typer.Typer(
+    help="Manage manual accounts (assets SimpleFIN can't reach).",
+    no_args_is_help=True,
+)
+app.add_typer(account_app, name="account")
+
+
+def _open_writable_store() -> DuckDBStore:
+    """Open the configured DuckDBStore in write mode for an `account` command."""
+    config = load_config()
+    target = db_path(config)
+    if not target.exists():
+        typer.secho(
+            f"No DuckDB store at {target}. Run `goetta-finance init` first.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    store = DuckDBStore(target)
+    store.init()
+    return store
+
+
+def _parse_decimal(value: str, *, field: str) -> Decimal:
+    try:
+        return Decimal(value.strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise typer.BadParameter(
+            f"{field} must be a number, got {value!r}", param_hint=f"--{field}"
+        ) from exc
+
+
+def _parse_as_of(value: str | None) -> datetime:
+    """Parse --as-of YYYY-MM-DD into a UTC datetime. Default: now(UTC)."""
+    if value is None:
+        return datetime.now(tz=UTC)
+    try:
+        date = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=UTC)
+    except ValueError as exc:
+        raise typer.BadParameter(
+            f"--as-of must be YYYY-MM-DD, got {value!r}", param_hint="--as-of"
+        ) from exc
+    if date > datetime.now(tz=UTC):
+        raise typer.BadParameter("--as-of cannot be in the future", param_hint="--as-of")
+    return date
+
+
+def _parse_account_type(value: str) -> AccountType:
+    try:
+        return AccountType(value.lower())
+    except ValueError as exc:
+        valid = ", ".join(t.value for t in AccountType)
+        raise typer.BadParameter(
+            f"--type must be one of: {valid} (got {value!r})", param_hint="--type"
+        ) from exc
+
+
+@account_app.command("add")
+def account_add(
+    name: Annotated[str | None, typer.Option("--name", help="Account display name.")] = None,
+    org: Annotated[
+        str | None,
+        typer.Option("--org", help="Institution or source label (e.g. 'Apple')."),
+    ] = None,
+    type_: Annotated[
+        str | None,
+        typer.Option(
+            "--type",
+            help="Account type: checking, savings, credit, investment, loan, other.",
+        ),
+    ] = None,
+    balance: Annotated[
+        str | None,
+        typer.Option("--balance", help="Current balance (e.g. 30000 or 30000.50)."),
+    ] = None,
+    as_of: Annotated[
+        str | None,
+        typer.Option(
+            "--as-of",
+            help="Balance observation date (YYYY-MM-DD). Default: today (UTC).",
+        ),
+    ] = None,
+    liability: Annotated[
+        bool,
+        typer.Option(
+            "--liability/--no-liability",
+            help="Mark this account as a liability (debt). Subtracts from net worth.",
+        ),
+    ] = False,
+) -> None:
+    """Add a manual account. Prompts interactively for any missing values."""
+    # Validate provided flag values up-front, before any interactive prompt.
+    # Otherwise a bad --type or future --as-of would only surface after the
+    # user already answered an unrelated prompt — and under non-interactive
+    # invocation (test runners, scripts piping stdin) those prompts read EOF
+    # and abort with a confusing "Aborted." message instead of the real
+    # validation error.
+    if type_ is not None:
+        account_type_from_flag: AccountType | None = _parse_account_type(type_)
+    else:
+        account_type_from_flag = None
+    balance_date = _parse_as_of(as_of)
+    balance_from_flag: Decimal | None = (
+        _parse_decimal(balance, field="balance") if balance is not None else None
+    )
+
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"account add failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        if not name:
+            name = typer.prompt("Account name").strip()
+            if not name:
+                typer.secho("Name cannot be empty.", fg=typer.colors.RED, err=True)
+                raise typer.Exit(code=1)
+        if org is None:
+            org = typer.prompt("Institution / source (optional)", default="").strip() or None
+        if account_type_from_flag is None:
+            type_prompt = typer.prompt(
+                "Type (checking/savings/credit/investment/loan/other)",
+                default="other",
+            ).strip()
+            account_type = _parse_account_type(type_prompt)
+        else:
+            account_type = account_type_from_flag
+        if balance_from_flag is None:
+            balance_value = _parse_decimal(typer.prompt("Initial balance").strip(), field="balance")
+        else:
+            balance_value = balance_from_flag
+
+        account_id = f"{MANUAL_ID_PREFIX}{uuid.uuid4()}"
+        account = Account(
+            id=account_id,
+            org_id=None,
+            org_name=org,
+            name=name,
+            currency="USD",
+            balance=balance_value,
+            available_balance=None,
+            balance_date=balance_date,
+            type=account_type,
+            extra={},
+            is_manual=True,
+            is_liability=liability,
+        )
+        store.upsert_accounts([account])
+        store.record_balance_snapshot(
+            BalanceSnapshot(account_id=account_id, balance=balance_value, timestamp=balance_date)
+        )
+        typer.echo(f"Added {account_id}")
+        tags = " [liability]" if liability else ""
+        typer.echo(
+            f"  {org or '—'} / {name}{tags}: {balance_value:.2f} USD as of "
+            f"{balance_date.astimezone().isoformat(timespec='seconds')}"
+        )
+    except GoettaFinanceError as exc:
+        typer.secho(f"account add failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+@account_app.command("list")
+def account_list() -> None:
+    """List all accounts (SimpleFIN + manual). Manual accounts are marked."""
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"account list failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        accounts = store.get_accounts()
+        if not accounts:
+            typer.echo("No accounts yet.")
+            return
+        for a in accounts:
+            manual_tag = "[manual]" if a.is_manual else "        "
+            liability_tag = " [liability]" if a.is_liability else ""
+            org = a.org_name or "—"
+            typer.echo(
+                f"  {manual_tag} {a.id}  {org} / {a.name}{liability_tag}: "
+                f"{a.balance:.2f} {a.currency}"
+            )
+    finally:
+        store.close()
+
+
+def _parse_bool(value: str, *, field: str) -> bool:
+    """Accept the common true/false spellings; raise BadParameter otherwise."""
+    lowered = value.strip().lower()
+    if lowered in ("true", "t", "yes", "y", "1"):
+        return True
+    if lowered in ("false", "f", "no", "n", "0"):
+        return False
+    raise typer.BadParameter(
+        f"{field} must be true/false (or yes/no), got {value!r}", param_hint=field
+    )
+
+
+@account_app.command("set-liability")
+def account_set_liability(
+    account_id: Annotated[
+        str, typer.Argument(help="Account id (any account, manual or SimpleFIN).")
+    ],
+    value: Annotated[
+        str,
+        typer.Argument(help="true or false (also accepts yes/no/1/0)."),
+    ],
+) -> None:
+    """Mark an account as a liability (or clear the flag).
+
+    Works on any account id — SimpleFIN-sourced credit cards and manual
+    debts both supported. Toggling the flag is retroactive: historical
+    balance_snapshots get re-treated under the new flag value in
+    net-worth-over-time charts. That's almost always what you want; if
+    not, the snapshots aren't editable through this command — flip the
+    flag back.
+    """
+    parsed = _parse_bool(value, field="value")
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"account set-liability failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        store.set_account_liability(account_id, parsed)
+        state = "liability" if parsed else "not a liability"
+        typer.echo(f"{account_id} is now marked as {state}.")
+    except GoettaFinanceError as exc:
+        typer.secho(f"account set-liability failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+@account_app.command("set-balance")
+def account_set_balance(
+    account_id: Annotated[str, typer.Argument(help="Manual account id (MANUAL-<uuid>).")],
+    balance: Annotated[str, typer.Argument(help="New balance.")],
+    as_of: Annotated[
+        str | None,
+        typer.Option(
+            "--as-of",
+            help="Balance observation date (YYYY-MM-DD). Default: today (UTC).",
+        ),
+    ] = None,
+) -> None:
+    """Update the balance on a manual account.
+
+    Writes both ``accounts.balance`` and a new ``balance_snapshots`` row so
+    net-worth-over-time reflects the change. Refuses non-manual accounts.
+    """
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"account set-balance failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        existing = next((a for a in store.get_accounts() if a.id == account_id), None)
+        if existing is None:
+            typer.secho(f"account not found: {account_id}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+        if not existing.is_manual:
+            typer.secho(
+                f"refusing to update non-manual account: {account_id}",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        balance_value = _parse_decimal(balance, field="balance")
+        balance_date = _parse_as_of(as_of)
+        updated = existing.model_copy(
+            update={"balance": balance_value, "balance_date": balance_date}
+        )
+        store.upsert_accounts([updated])
+        store.record_balance_snapshot(
+            BalanceSnapshot(account_id=account_id, balance=balance_value, timestamp=balance_date)
+        )
+        typer.echo(
+            f"Updated {account_id}: {balance_value:.2f} {existing.currency} as of "
+            f"{balance_date.astimezone().isoformat(timespec='seconds')}"
+        )
+    except GoettaFinanceError as exc:
+        typer.secho(f"account set-balance failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+@account_app.command("remove")
+def account_remove(
+    account_id: Annotated[str, typer.Argument(help="Manual account id (MANUAL-<uuid>).")],
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Cascade-delete any balance_snapshots rows for this account.",
+        ),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            help="Skip the typed-name confirmation prompt (for scripts).",
+        ),
+    ] = False,
+) -> None:
+    """Remove a manual account.
+
+    Two-layer safety:
+
+    1. Refuses any account whose id doesn't start with ``MANUAL-``.
+    2. If the account has linked ``balance_snapshots``, requires ``--force``
+       AND prompts for the account name to be typed back (unless ``--yes``).
+    """
+    if not account_id.startswith(MANUAL_ID_PREFIX):
+        typer.secho(
+            f"refusing to delete non-manual account: {account_id}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"account remove failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        existing = next((a for a in store.get_accounts() if a.id == account_id), None)
+        if existing is None:
+            typer.secho(f"account not found: {account_id}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+        if not existing.is_manual:
+            typer.secho(
+                f"refusing to delete non-manual account: {account_id}",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        snapshot_count_row = store.conn.execute(
+            "SELECT COUNT(*) FROM balance_snapshots WHERE account_id = ?",
+            [account_id],
+        ).fetchone()
+        snapshot_count = int(snapshot_count_row[0]) if snapshot_count_row else 0
+        if snapshot_count > 0 and not force:
+            typer.secho(
+                f"account has {snapshot_count} balance snapshot(s). "
+                "Pass --force to remove the account and cascade-delete the snapshots.",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if snapshot_count > 0 and not yes:
+            typer.echo(
+                f"This will delete {existing.name} ({account_id}) "
+                f"and {snapshot_count} balance snapshot(s)."
+            )
+            typed = typer.prompt("Type the account name to confirm").strip()
+            if typed != existing.name:
+                typer.secho("Name did not match. Aborted.", fg=typer.colors.RED, err=True)
+                raise typer.Exit(code=1)
+        deleted = store.delete_account(account_id, cascade_snapshots=snapshot_count > 0)
+        typer.echo(
+            f"Removed {account_id} ({existing.name})"
+            + (f" and {deleted} balance snapshot(s)" if deleted else "")
+        )
+    except GoettaFinanceError as exc:
+        typer.secho(f"account remove failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
 
 
 if __name__ == "__main__":  # pragma: no cover

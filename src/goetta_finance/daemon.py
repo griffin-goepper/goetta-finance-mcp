@@ -70,9 +70,7 @@ def _run_collect_blocking(store: FinanceStore, client: SimpleFinClient) -> None:
         logger.exception("scheduled sync raised")
 
 
-async def _scheduler_loop(
-    store: FinanceStore, client: SimpleFinClient, sync_at: str
-) -> None:
+async def _scheduler_loop(store: FinanceStore, client: SimpleFinClient, sync_at: str) -> None:
     """Run a sync at ``sync_at`` local time every day.
 
     On entry, checks whether the most recent scheduled tick was missed

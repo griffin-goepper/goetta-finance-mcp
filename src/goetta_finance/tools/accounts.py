@@ -18,6 +18,8 @@ def serialize_account(a: Account) -> dict[str, Any]:
         ),
         "balance_date": a.balance_date.isoformat(),
         "type": a.type.value if a.type is not None else None,
+        "is_manual": a.is_manual,
+        "is_liability": a.is_liability,
     }
 
 

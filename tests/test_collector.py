@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import copy
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from goetta_finance.collector import INITIAL_LOOKBACK_DAYS, collect
+from goetta_finance.models import Account, AccountType, BalanceSnapshot
 from goetta_finance.simplefin import SimpleFinClient
 from goetta_finance.store.duckdb_store import DuckDBStore
 
@@ -111,3 +113,55 @@ def test_passes_through_simplefin_warnings(store: DuckDBStore, demo_response: di
     client = StubClient(warning_response)
     run = collect(store, client, now=datetime(2026, 5, 23, tzinfo=UTC))
     assert "Bank XYZ only returned 30 days" in run.warnings
+
+
+def test_collect_does_not_touch_manual_accounts(store: DuckDBStore, demo_response: dict) -> None:
+    """Pin the isolation outcome: a sync leaves manual accounts byte-for-byte unchanged.
+
+    Seeds a manual account with a balance and a snapshot. Runs collect()
+    against demo SimpleFIN data. Asserts the manual account's name, balance,
+    balance_date, and is_manual flag are identical afterward, and that the
+    snapshot count for that account hasn't grown (collect() must not record
+    snapshots on manual accounts since it wasn't the one to observe the
+    balance).
+    """
+    manual = Account(
+        id="MANUAL-isolation-test",
+        org_id=None,
+        org_name="Apple",
+        name="Apple Savings",
+        currency="USD",
+        balance=Decimal("30000.00"),
+        available_balance=None,
+        balance_date=datetime(2026, 5, 17, tzinfo=UTC),
+        type=AccountType.SAVINGS,
+        extra={},
+        is_manual=True,
+    )
+    store.upsert_accounts([manual])
+    store.record_balance_snapshot(
+        BalanceSnapshot(
+            account_id="MANUAL-isolation-test",
+            balance=Decimal("30000.00"),
+            timestamp=datetime(2026, 5, 17, tzinfo=UTC),
+        )
+    )
+
+    client = StubClient(demo_response)
+    collect(store, client, now=datetime(2026, 5, 23, tzinfo=UTC))
+
+    accounts = {a.id: a for a in store.get_accounts()}
+    assert "MANUAL-isolation-test" in accounts
+    survived = accounts["MANUAL-isolation-test"]
+    assert survived.is_manual is True
+    assert survived.balance == Decimal("30000.00")
+    assert survived.name == "Apple Savings"
+    assert survived.balance_date == datetime(2026, 5, 17, tzinfo=UTC)
+
+    snap_count = store.conn.execute(
+        "SELECT COUNT(*) FROM balance_snapshots WHERE account_id = ?",
+        ["MANUAL-isolation-test"],
+    ).fetchone()
+    assert snap_count is not None and snap_count[0] == 1, (
+        "collect() must not record balance_snapshots for manual accounts"
+    )

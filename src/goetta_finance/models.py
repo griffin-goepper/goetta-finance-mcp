@@ -30,6 +30,8 @@ class Account(BaseModel):
     balance_date: datetime
     type: AccountType | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
+    is_manual: bool = False
+    is_liability: bool = False
 
 
 class Transaction(BaseModel):

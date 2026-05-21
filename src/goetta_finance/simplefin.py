@@ -171,8 +171,7 @@ class SimpleFinClient:
             retry_after = response.headers.get("retry-after")
             hint = f" (retry-after: {retry_after}s)" if retry_after else ""
             raise BridgeRateLimitError(
-                f"SimpleFIN Bridge rate-limited the request{hint}. Back off "
-                f"and try again later."
+                f"SimpleFIN Bridge rate-limited the request{hint}. Back off and try again later."
             )
         if 500 <= response.status_code < 600:
             raise BridgeUnavailableError(

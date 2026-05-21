@@ -45,9 +45,7 @@ def _lazy_sync_threshold_hours() -> float:
         return _LAZY_SYNC_THRESHOLD_HOURS_DEFAULT
 
 
-def _maybe_trigger_lazy_sync(
-    store: FinanceStore, client: SimpleFinClient | None
-) -> None:
+def _maybe_trigger_lazy_sync(store: FinanceStore, client: SimpleFinClient | None) -> None:
     """Fire-and-forget background sync if data is stale.
 
     Called from each tool wrapper. Cheap when fresh (one DB query). Does
@@ -65,18 +63,25 @@ def _maybe_trigger_lazy_sync(
             return
     trigger_background_collect(store, client)
 
+
 SQL_SCHEMA_HINT = """\
 Run a read-only SQL query against the local DuckDB store. Only single-statement
 SELECT/WITH/EXPLAIN/SHOW/DESCRIBE queries are accepted.
 
 Schema:
   accounts(id, org_id, org_name, name, currency, balance, available_balance,
-           balance_date, type, extra, updated_at)
+           balance_date, type, extra, is_manual, is_liability, updated_at)
   transactions(id, account_id, posted, transacted_at, amount, description,
                payee, memo, pending, extra, created_at)
   balance_snapshots(account_id, timestamp, balance)
   sync_runs(id, started_at, finished_at, accounts_touched, transactions_new,
             transactions_updated, warnings, errors)
+
+Columns is_manual (account was added via CLI, not synced) and is_liability
+(account represents debt) are both boolean flags on accounts. For net-worth
+math, use CASE WHEN is_liability THEN -ABS(balance) ELSE balance END to get
+the signed contribution per account — a liability always reduces net worth
+regardless of how the source signs the balance.
 
 Money columns are DECIMAL(18,2); timestamps are TIMESTAMP in UTC. Transaction
 `amount` is signed (negative = money out). Results are well-suited to be

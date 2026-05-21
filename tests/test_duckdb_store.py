@@ -53,10 +53,13 @@ def test_init_applies_migrations(store: DuckDBStore) -> None:
 
 
 def test_init_is_idempotent(store: DuckDBStore) -> None:
+    before_row = store.conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()
+    assert before_row is not None
+    before = before_row[0]
     store.init()
     store.init()
-    rows = store.conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()
-    assert rows is not None and rows[0] == 1
+    after_row = store.conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()
+    assert after_row is not None and after_row[0] == before
 
 
 def test_upsert_and_get_accounts_round_trip(store: DuckDBStore) -> None:
@@ -197,6 +200,189 @@ def test_query_sql_allows_select(store: DuckDBStore) -> None:
 def test_query_sql_strips_comments(store: DuckDBStore) -> None:
     rows = store.query_sql("-- comment\nSELECT 1 AS one")
     assert rows == [{"one": 1}]
+
+
+def _manual_account(id: str = "MANUAL-abc123", balance: str = "30000.00") -> Account:
+    return Account(
+        id=id,
+        org_id=None,
+        org_name="Apple",
+        name="Apple Savings",
+        currency="USD",
+        balance=Decimal(balance),
+        available_balance=None,
+        balance_date=_utc(2026, 5, 17),
+        type=AccountType.SAVINGS,
+        extra={},
+        is_manual=True,
+    )
+
+
+def test_migration_0002_backward_compat_default_false(store: DuckDBStore) -> None:
+    """Existing-style upsert (no is_manual specified) defaults to FALSE.
+
+    Proves the 0002 migration applied with the right default and that callers
+    written against the pre-0002 schema (no is_manual in the Account model)
+    are not broken — they continue to write non-manual rows transparently.
+    """
+    rows = store.conn.execute("SELECT name FROM schema_migrations").fetchall()
+    assert ("0002_manual_accounts.sql",) in rows
+    store.upsert_accounts([_account()])
+    fetched = store.get_accounts()
+    assert len(fetched) == 1
+    assert fetched[0].is_manual is False
+
+
+def test_upsert_manual_account_round_trip(store: DuckDBStore) -> None:
+    store.upsert_accounts([_manual_account()])
+    fetched = store.get_accounts()
+    assert len(fetched) == 1
+    got = fetched[0]
+    assert got.id == "MANUAL-abc123"
+    assert got.is_manual is True
+    assert got.balance == Decimal("30000.00")
+    assert got.name == "Apple Savings"
+
+
+def test_upsert_refuses_to_clobber_manual_with_simplefin_data(store: DuckDBStore) -> None:
+    """Pin the data-integrity outcome, not the mechanism.
+
+    Seeds a manual account, attempts to upsert non-manual data with the same
+    id, then asserts both (a) the call raised StoreError AND (b) the stored
+    row's name, balance, and is_manual are unchanged. A future refactor that
+    moves the check to a different layer but preserves data integrity passes;
+    a refactor that drops the check silently fails because the row got
+    clobbered.
+    """
+    manual = _manual_account(id="MANUAL-shared-id", balance="30000.00")
+    store.upsert_accounts([manual])
+
+    simplefin_collision = _account(id="MANUAL-shared-id", balance="0.01")
+    assert simplefin_collision.is_manual is False
+    with pytest.raises(StoreError):
+        store.upsert_accounts([simplefin_collision])
+
+    fetched = store.get_accounts()
+    assert len(fetched) == 1
+    survived = fetched[0]
+    assert survived.is_manual is True, "manual flag was clobbered"
+    assert survived.balance == Decimal("30000.00"), "balance was clobbered"
+    assert survived.name == "Apple Savings", "name was clobbered"
+
+
+def test_delete_account_refuses_non_manual(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account()])
+    with pytest.raises(StoreError, match="non-manual"):
+        store.delete_account("acc-1")
+    assert {a.id for a in store.get_accounts()} == {"acc-1"}
+
+
+def test_delete_account_not_found(store: DuckDBStore) -> None:
+    with pytest.raises(StoreError, match="not found"):
+        store.delete_account("MANUAL-does-not-exist")
+
+
+def test_delete_account_refuses_when_snapshots_exist_without_cascade(
+    store: DuckDBStore,
+) -> None:
+    store.upsert_accounts([_manual_account()])
+    store.record_balance_snapshot(
+        BalanceSnapshot(
+            account_id="MANUAL-abc123",
+            balance=Decimal("30000.00"),
+            timestamp=_utc(2026, 5, 17),
+        )
+    )
+    with pytest.raises(StoreError, match="balance snapshots"):
+        store.delete_account("MANUAL-abc123", cascade_snapshots=False)
+    assert {a.id for a in store.get_accounts()} == {"MANUAL-abc123"}
+
+
+def test_delete_account_cascades_snapshots(store: DuckDBStore) -> None:
+    store.upsert_accounts([_manual_account()])
+    for day in (1, 8, 15):
+        store.record_balance_snapshot(
+            BalanceSnapshot(
+                account_id="MANUAL-abc123",
+                balance=Decimal("30000.00"),
+                timestamp=_utc(2026, 5, day),
+            )
+        )
+    deleted = store.delete_account("MANUAL-abc123", cascade_snapshots=True)
+    assert deleted == 3
+    assert store.get_accounts() == []
+    remaining = store.conn.execute(
+        "SELECT COUNT(*) FROM balance_snapshots WHERE account_id = ?",
+        ["MANUAL-abc123"],
+    ).fetchone()
+    assert remaining is not None and remaining[0] == 0
+
+
+def test_delete_account_returns_zero_when_no_snapshots(store: DuckDBStore) -> None:
+    store.upsert_accounts([_manual_account()])
+    deleted = store.delete_account("MANUAL-abc123")
+    assert deleted == 0
+    assert store.get_accounts() == []
+
+
+def test_migration_0003_backward_compat_default_false(store: DuckDBStore) -> None:
+    """0003 backward-compat — existing-style upsert (no is_liability) defaults to FALSE."""
+    rows = store.conn.execute("SELECT name FROM schema_migrations").fetchall()
+    assert ("0003_liabilities.sql",) in rows
+    store.upsert_accounts([_account()])
+    fetched = store.get_accounts()
+    assert len(fetched) == 1
+    assert fetched[0].is_liability is False
+
+
+def test_upsert_liability_round_trip(store: DuckDBStore) -> None:
+    store.upsert_accounts(
+        [
+            Account(
+                id="MANUAL-loan-1",
+                org_name="Dept of Education",
+                name="Federal Student Loans",
+                balance=Decimal("22500.00"),
+                balance_date=_utc(2026, 5, 1),
+                type=AccountType.LOAN,
+                is_manual=True,
+                is_liability=True,
+            )
+        ]
+    )
+    fetched = store.get_accounts()
+    assert len(fetched) == 1
+    assert fetched[0].is_liability is True
+    assert fetched[0].is_manual is True
+
+
+def test_set_account_liability_flips_flag_on_manual(store: DuckDBStore) -> None:
+    store.upsert_accounts([_manual_account()])
+    assert store.get_accounts()[0].is_liability is False
+    store.set_account_liability("MANUAL-abc123", True)
+    assert store.get_accounts()[0].is_liability is True
+    store.set_account_liability("MANUAL-abc123", False)
+    assert store.get_accounts()[0].is_liability is False
+
+
+def test_set_account_liability_works_on_simplefin_account(store: DuckDBStore) -> None:
+    """is_liability is settable on any account id, not just manual ones.
+
+    Real motivation: SimpleFIN credit cards that the user wants explicitly
+    flagged as liabilities even though their balance is already negative
+    (so the math doesn't strictly require the flag — but the dashboard
+    badge and any future asset/liability split do).
+    """
+    store.upsert_accounts([_account(id="ACT-real-cc")])
+    store.set_account_liability("ACT-real-cc", True)
+    fetched = store.get_accounts()
+    assert fetched[0].id == "ACT-real-cc"
+    assert fetched[0].is_liability is True
+
+
+def test_set_account_liability_raises_on_unknown_id(store: DuckDBStore) -> None:
+    with pytest.raises(StoreError, match="not found"):
+        store.set_account_liability("MANUAL-does-not-exist", True)
 
 
 # --- Regression: whitelist-bypassing payloads must still be refused. ---
@@ -342,9 +528,7 @@ def test_query_sql_memory_limit_bounds_huge_intermediate(store: DuckDBStore) -> 
     the daemon. Either ``memory_limit`` or the timeout watchdog catches
     this — both are acceptable bounded failures vs. an OOM-kill."""
     with pytest.raises(StoreError) as exc_info:
-        store.query_sql(
-            "SELECT count(*) FROM range(0, 10000000000) t1, range(0, 1000) t2"
-        )
+        store.query_sql("SELECT count(*) FROM range(0, 10000000000) t1, range(0, 1000) t2")
     msg = str(exc_info.value).lower()
     assert "memory" in msg or "interrupt" in msg or "cancel" in msg, (
         f"unexpected error message: {exc_info.value!r}"
@@ -372,9 +556,7 @@ def test_query_sql_normal_query_unaffected_by_resource_limits(
     threads / timeout hardening lands. If this goes red the limits are
     set too tight or the watchdog is firing on legitimate queries."""
     store.upsert_accounts([_account("acc-resource-1", balance="100.00")])
-    rows = store.query_sql(
-        "SELECT id, balance FROM accounts WHERE id = ?", ["acc-resource-1"]
-    )
+    rows = store.query_sql("SELECT id, balance FROM accounts WHERE id = ?", ["acc-resource-1"])
     assert rows == [{"id": "acc-resource-1", "balance": Decimal("100.00")}]
 
 
@@ -384,12 +566,9 @@ def test_query_sql_params_binding_for_internal_callers(store: DuckDBStore) -> No
     into the SQL string. Closes the bandit B608 / ruff S608 class of
     finding at the call sites without weakening the read-only transaction
     wrapper."""
-    store.upsert_accounts(
-        [_account("a1", balance="10.00"), _account("a2", balance="20.00")]
-    )
+    store.upsert_accounts([_account("a1", balance="10.00"), _account("a2", balance="20.00")])
     rows = store.query_sql(
         "SELECT id, balance FROM accounts WHERE id = ? ORDER BY id",
         ["a2"],
     )
     assert rows == [{"id": "a2", "balance": Decimal("20.00")}]
-

@@ -51,6 +51,61 @@ Re-running `init` is safe — each step detects existing state and offers to ski
 | `goetta-finance serve` | Start the MCP server over stdio (used by Claude Desktop). |
 | `goetta-finance web` | Start the local web dashboard. `--port 8765` and `--host 127.0.0.1` by default. |
 | `goetta-finance daemon` | Long-lived process: dashboard + MCP HTTP endpoint + daily scheduled sync, from one process. See "Daemon mode" below. |
+| `goetta-finance account add\|list\|set-balance\|set-liability\|remove` | Manage manual accounts and liability flags. See "Manual accounts and liabilities" below. |
+
+## Manual accounts and liabilities
+
+SimpleFIN can't reach every account — 401(k) providers, HSAs, brokerages outside its bank list, and student-loan servicers all sit outside. `goetta-finance account` lets you track those by hand so they show up in MCP queries and the dashboard alongside synced accounts.
+
+### The four subcommands
+
+```bash
+# Create a manual account. Prompts interactively for any missing flags.
+goetta-finance account add \
+  --name "Apple Savings" \
+  --org "Apple" \
+  --type savings \
+  --balance 30000 \
+  [--as-of 2026-05-17]     # observation date, defaults to today (UTC)
+
+# Mark an account as a liability (or clear the flag). Works on any account id.
+goetta-finance account add ... --liability      # at creation time
+goetta-finance account set-liability MANUAL-<uuid> true     # after the fact
+goetta-finance account set-liability ACT-<simplefin-id> true   # SimpleFIN accounts too
+
+# Update the balance on a manual account (also writes a balance_snapshot).
+goetta-finance account set-balance MANUAL-<uuid> 32500 [--as-of 2026-05-17]
+
+# List all accounts. Manual + liability rows are tagged in the output.
+goetta-finance account list
+
+# Remove a manual account. Two layers of safety: cascade-delete its snapshots
+# (--force) AND type the account name to confirm (skip with --yes for scripts).
+goetta-finance account remove MANUAL-<uuid> --force
+```
+
+### Sign convention for liabilities
+
+A liability **always reduces net worth, regardless of how the source signs the balance.** The signed-balance formula is:
+
+```sql
+CASE WHEN is_liability THEN -ABS(balance) ELSE balance END
+```
+
+So you can enter a student loan either way and the math comes out right:
+
+- `account add --type loan --balance 22500 --liability` (positive amount owed)
+- A SimpleFIN credit card showing `balance = -500` and you've flipped it to `is_liability=true`
+
+Both contribute `-500` and `-22500` respectively to net worth — collapsing the loan-servicer convention and the SimpleFIN convention to one answer. The dashboard's net-worth chart and the accounts page footer respect the formula. When writing `sql_query` SELECTs against the `accounts` table, reach for the same `CASE WHEN` expression to compute totals correctly.
+
+`is_liability` is independent of `type` on purpose — `type` describes what kind of account it is (`loan`, `credit`, `investment`), while `is_liability` controls how net-worth math treats it. A margin account is `type=investment` but functionally a liability; you can flip the flag without changing the type.
+
+### Heads-up
+
+- **Retroactive flag.** Toggling `is_liability` re-treats all historical `balance_snapshots` for that account under the new value in net-worth-over-time charts. This is almost always what you want; if it isn't, flip the flag back.
+- **CC-credit edge case.** A credit card with `is_liability=true` and a *positive* balance (you overpaid and now have a credit) computes as `-balance` instead of `+balance`. Rare; `set-liability false` while the credit exists, then re-enable, is the workaround.
+- **Balance is authoritative.** Payments to a manual loan don't auto-decrement the balance — re-run `set-balance` from your servicer's monthly statement.
 
 ## Daemon mode
 

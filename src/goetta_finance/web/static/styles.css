@@ -75,3 +75,16 @@ h2 { margin-top: 0; }
 .err { color: #b91c1c; }
 .muted { color: #9ca3af; }
 code { background: #f3f4f6; padding: 1px 6px; border-radius: 3px; font-size: 13px; }
+.badge {
+  display: inline-block;
+  padding: 1px 6px;
+  margin-left: 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.badge-manual { background: #fef3c7; color: #92400e; }
+.badge-liability { background: #fee2e2; color: #991b1b; }
+.data-table tfoot .net-worth-row td { background: #f3f4f6; border-top: 2px solid #d1d5db; }

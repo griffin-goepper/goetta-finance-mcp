@@ -17,13 +17,25 @@
         {% for a in accounts %}
           <tr>
             <td>{{ a.org_name or "—" }}</td>
-            <td>{{ a.name }}</td>
+            <td>
+              {{ a.name }}
+              {% if a.is_manual %}<span class="badge badge-manual">manual</span>{% endif %}
+              {% if a.is_liability %}<span class="badge badge-liability">liability</span>{% endif %}
+            </td>
             <td class="num">{{ a.balance }} {{ a.currency }}</td>
             <td class="num">{{ a.available_balance or "—" }}</td>
             <td>{{ a.balance_date }}</td>
           </tr>
         {% endfor %}
       </tbody>
+      <tfoot>
+        <tr class="net-worth-row">
+          <td colspan="2"><strong>Net worth</strong> <span class="muted">(liabilities subtracted)</span></td>
+          <td class="num"><strong>{{ net_worth }} USD</strong></td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+      </tfoot>
     </table>
   {% else %}
     <p class="empty">No accounts yet. Run <code>goetta-finance sync</code>.</p>

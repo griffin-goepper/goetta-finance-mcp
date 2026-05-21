@@ -66,11 +66,23 @@ def register_routes(app: FastAPI) -> None:
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
         store = _store(request)
-        accounts = [serialize_account(a) for a in store.get_accounts()]
+        raw_accounts = store.get_accounts()
+        accounts = [serialize_account(a) for a in raw_accounts]
+        # Signed net worth: a liability contributes -ABS(balance) regardless
+        # of how the source signs it. Matches the formula documented in
+        # server.SQL_SCHEMA_HINT so user-issued SQL and the dashboard agree.
+        net_worth = sum(
+            (-abs(a.balance) if a.is_liability else a.balance for a in raw_accounts),
+            Decimal("0"),
+        )
         return _render(
             request,
             "accounts.html",
-            {"accounts": accounts, "active": "accounts"},
+            {
+                "accounts": accounts,
+                "net_worth": f"{net_worth:,.2f}",
+                "active": "accounts",
+            },
         )
 
     @app.get("/net-worth", response_class=HTMLResponse)

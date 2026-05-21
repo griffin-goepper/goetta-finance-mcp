@@ -190,9 +190,7 @@ def register_with_claude_code(
     return True, result.stdout.strip()
 
 
-def unregister_with_claude_code(
-    *, name: str = SERVER_KEY, scope: str = "user"
-) -> tuple[bool, str]:
+def unregister_with_claude_code(*, name: str = SERVER_KEY, scope: str = "user") -> tuple[bool, str]:
     """Run ``claude mcp remove`` for ``name`` in ``scope``.
 
     Treats "not found" as success — callers want this to be idempotent
