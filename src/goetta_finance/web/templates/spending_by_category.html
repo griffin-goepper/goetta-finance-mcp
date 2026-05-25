@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Spending by category — goetta-finance{% endblock %}
+{% block content %}
+  <h2>Spending by category</h2>
+  <p class="muted">Last {{ days }} days. Income is excluded; see the
+    Spending page for income vs. spending totals.</p>
+  {% if has_data %}
+    <div id="spending-by-category-chart" class="chart"></div>
+    <script>
+      document.addEventListener("DOMContentLoaded", function () {
+        Plotly.newPlot(
+          "spending-by-category-chart",
+          {{ figure_data | safe }},
+          {{ figure_layout | safe }},
+          { responsive: true, displaylogo: false }
+        );
+      });
+    </script>
+  {% else %}
+    <p class="empty">No spending in the last {{ days }} days.</p>
+  {% endif %}
+{% endblock %}

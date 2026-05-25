@@ -5,9 +5,14 @@
       <td>{{ r.account_id }}</td>
       <td>{{ r.description }}</td>
       <td>{{ r.payee or "" }}</td>
+      <td>
+        <span class="badge badge-category"
+              {% if r.category_color %}style="background-color: {{ r.category_color }}"{% endif %}
+              title="goetta-finance transaction categorize {{ r.id }} &lt;new_category&gt;">{{ r.category }}</span>
+      </td>
       <td class="num {% if r.amount.startswith('-') %}neg{% else %}pos{% endif %}">{{ r.amount }}</td>
     </tr>
   {% endfor %}
 {% else %}
-  <tr><td colspan="5" class="empty">No transactions match.</td></tr>
+  <tr><td colspan="6" class="empty">No transactions match.</td></tr>
 {% endif %}

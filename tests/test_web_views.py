@@ -150,6 +150,100 @@ def test_unconfigured_store_renders_empty_state(store: DuckDBStore) -> None:
     """An empty store still serves all pages without error."""
     app = build_app(store)
     with TestClient(app) as c:
-        for path in ("/", "/net-worth", "/spending", "/transactions", "/sync"):
+        for path in (
+            "/",
+            "/net-worth",
+            "/spending",
+            "/spending-by-category",
+            "/transactions",
+            "/sync",
+        ):
             r = c.get(path)
             assert r.status_code == 200, f"{path} returned {r.status_code}"
+
+
+# --- Sub-seam 4: dashboard categorization surface --------------------------
+
+
+def test_spending_by_category_page_renders(client: TestClient) -> None:
+    """The seeded Spotify spending resolves to Subscriptions via the
+    default rule; the page renders the chart and includes the category."""
+    resp = client.get("/spending-by-category")
+    assert resp.status_code == 200
+    body = resp.text
+    assert "Plotly.newPlot" in body
+    assert "spending-by-category-chart" in body
+    # Spotify → Subscriptions per the 0004 default rule seed.
+    assert "Subscriptions" in body
+
+
+def test_spending_by_category_page_renders_empty_state(store: DuckDBStore) -> None:
+    """No transactions = empty state, not a broken page."""
+    app = build_app(store)
+    with TestClient(app) as c:
+        resp = c.get("/spending-by-category")
+    assert resp.status_code == 200
+    assert "No spending" in resp.text
+
+
+def test_transactions_page_renders_category_badge(client: TestClient) -> None:
+    """Per-row category badge with the category text."""
+    resp = client.get("/transactions")
+    assert resp.status_code == 200
+    body = resp.text
+    # Spotify → Subscriptions (default rule); a badge element carries the text.
+    assert "badge-category" in body
+    assert "Subscriptions" in body
+
+
+def test_transactions_page_badge_tooltip_has_cli_command_with_txn_id(
+    client: TestClient,
+) -> None:
+    """The tooltip on the badge contains the pre-filled CLI command for
+    that specific transaction id. Pin the literal — this is the
+    affordance that the inline-edit-deferral relies on."""
+    resp = client.get("/transactions")
+    body = resp.text
+    expected = 'title="goetta-finance transaction categorize tx-spotify &lt;new_category&gt;'
+    assert expected in body, "badge tooltip must carry the pre-filled CLI command"
+
+
+def test_transactions_page_supports_category_filter_param(
+    client: TestClient,
+) -> None:
+    """`?category=Subscriptions` narrows results server-side via the view."""
+    resp = client.get("/transactions?category=Subscriptions")
+    assert resp.status_code == 200
+    body = resp.text
+    assert "Spotify Premium" in body
+    # Paycheck has no rule match → resolves to 'Uncategorized', excluded by filter.
+    assert "Paycheck" not in body
+
+
+def test_transactions_rows_partial_supports_category_filter(
+    client: TestClient,
+) -> None:
+    """HTMX partial endpoint honors the same category filter."""
+    resp = client.get("/transactions/rows?category=Subscriptions")
+    assert resp.status_code == 200
+    body = resp.text
+    assert "<html" not in body.lower()
+    assert "Spotify Premium" in body
+    assert "Paycheck" not in body
+
+
+def test_transactions_page_has_category_filter_dropdown(client: TestClient) -> None:
+    """The page renders a category <select> populated from store.get_categories()."""
+    resp = client.get("/transactions")
+    body = resp.text
+    assert 'name="category"' in body
+    # Default seeded category names appear as options.
+    assert '<option value="Dining"' in body
+    assert '<option value="Groceries"' in body
+
+
+def test_base_template_has_spending_by_category_nav_link(client: TestClient) -> None:
+    """Nav link to the new page appears on every page (lives in base.html)."""
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert 'href="/spending-by-category"' in resp.text

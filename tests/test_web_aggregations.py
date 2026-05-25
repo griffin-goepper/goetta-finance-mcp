@@ -9,6 +9,7 @@ from goetta_finance.web.aggregations import (
     monthly_income_spending,
     net_worth_series,
     recent_sync_runs,
+    spending_by_category_last_n_days,
 )
 
 
@@ -258,3 +259,84 @@ def test_recent_sync_runs_orders_newest_first(store: DuckDBStore) -> None:
     assert len(rows) == 2
     assert rows[0]["accounts_touched"] == 3  # newest
     assert rows[1]["accounts_touched"] == 2
+
+
+# --- spending_by_category_last_n_days --------------------------------------
+
+
+def test_spending_by_category_last_n_days_excludes_outside_window(
+    store: DuckDBStore,
+) -> None:
+    """Seed transactions inside and outside the 30-day window;
+    aggregation includes only the ones inside."""
+    store.upsert_accounts(
+        [
+            Account(
+                id="cat-a1",
+                org_name="Test",
+                name="Checking",
+                balance=Decimal("100.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.CHECKING,
+            )
+        ]
+    )
+    fixed_now = datetime(2026, 5, 31, tzinfo=UTC)
+    store.upsert_transactions(
+        [
+            # Inside the 30-day window — counts.
+            Transaction(
+                id="cat-inside",
+                account_id="cat-a1",
+                posted=fixed_now - timedelta(days=10),
+                amount=Decimal("-25.00"),
+                description="STARBUCKS STORE #1",
+            ),
+            # Outside the window — excluded.
+            Transaction(
+                id="cat-outside",
+                account_id="cat-a1",
+                posted=fixed_now - timedelta(days=60),
+                amount=Decimal("-99.00"),
+                description="STARBUCKS STORE #1",
+            ),
+        ]
+    )
+    series = spending_by_category_last_n_days(store, days=30, now=fixed_now)
+    by_cat = {p.category: p for p in series}
+    assert "Dining" in by_cat
+    assert by_cat["Dining"].total == Decimal("25.00")
+    assert by_cat["Dining"].transaction_count == 1
+
+
+def test_spending_by_category_last_n_days_excludes_income(
+    store: DuckDBStore,
+) -> None:
+    """Default behavior: Income is excluded (dashboard intent = spending only)."""
+    store.upsert_accounts(
+        [
+            Account(
+                id="inc-a1",
+                org_name="Test",
+                name="Checking",
+                balance=Decimal("100.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.CHECKING,
+            )
+        ]
+    )
+    fixed_now = datetime(2026, 5, 31, tzinfo=UTC)
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="paycheck",
+                account_id="inc-a1",
+                posted=fixed_now - timedelta(days=5),
+                amount=Decimal("3000.00"),
+                description="ACME PAYROLL",
+            ),
+        ]
+    )
+    store.set_transaction_override("paycheck", "Income")
+    series = spending_by_category_last_n_days(store, days=30, now=fixed_now)
+    assert "Income" not in {p.category for p in series}

@@ -13,7 +13,11 @@ from typing import Any, cast
 import plotly.graph_objects as go
 
 from goetta_finance.store import FinanceStore
-from goetta_finance.web.aggregations import monthly_income_spending, net_worth_series
+from goetta_finance.web.aggregations import (
+    monthly_income_spending,
+    net_worth_series,
+    spending_by_category_last_n_days,
+)
 
 
 def net_worth_figure(
@@ -35,6 +39,36 @@ def net_worth_figure(
             xaxis={"title": "Date"},
             yaxis={"title": "Balance (USD)", "tickformat": ",.0f"},
             margin={"l": 60, "r": 20, "t": 50, "b": 50},
+        ),
+    )
+    return cast(dict[str, Any], figure.to_dict())
+
+
+def spending_by_category_figure(
+    store: FinanceStore, *, days: int = 30, now: datetime | None = None
+) -> dict[str, Any]:
+    """Pie chart of spending by category over the last ``days`` days.
+
+    Uses Plotly's ``Pie`` trace which is bundled in ``plotly-basic.min.js``
+    (verified in sub-seam 4 of the categorization slice). If the result is
+    empty (no spending in the window) the figure still renders — Plotly
+    handles empty pies gracefully — but the template shows a fallback
+    message ahead of the chart for clarity.
+    """
+    rows = spending_by_category_last_n_days(store, days=days, now=now)
+    figure = go.Figure(
+        data=[
+            go.Pie(
+                labels=[r.category for r in rows],
+                values=[float(r.total) for r in rows],
+                hovertemplate="%{label}<br>$%{value:,.2f} (%{percent})<extra></extra>",
+                textinfo="label+percent",
+                sort=False,  # preserve descending-by-total order from SQL
+            )
+        ],
+        layout=go.Layout(
+            title=f"Spending by category — last {days} days",
+            margin={"l": 20, "r": 20, "t": 50, "b": 20},
         ),
     )
     return cast(dict[str, Any], figure.to_dict())

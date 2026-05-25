@@ -26,6 +26,47 @@ def _serialize_value(value: Any) -> Any:
     return value
 
 
+def query_spending_by_category(
+    store: FinanceStore,
+    start: datetime,
+    end: datetime,
+    *,
+    include_income: bool = False,
+) -> list[dict[str, Any]]:
+    """Shared SQL helper — raw store rows, Decimal totals.
+
+    Public callers:
+      - ``spending_by_category`` (this module) — wraps with JSON-friendly
+        serialization for the MCP tool surface.
+      - ``web/aggregations.py:spending_by_category_last_n_days`` — keeps
+        Decimals so the dashboard's pie chart downcasts to float in one
+        place (the chart builder), matching the existing pattern in
+        ``net_worth_series`` / ``monthly_income_spending``.
+
+    Factored when the second caller (dashboard) arrived in sub-seam 4 —
+    rule of three's predecessor. If a third caller emerges and the
+    parameter shape gets awkward, this is the right place to widen.
+
+    Semantics: see ``spending_by_category`` docstring below.
+    """
+    base_where = "posted >= ? AND posted <= ?"
+    if include_income:
+        where = f"{base_where} AND (amount < 0 OR category = 'Income')"
+    else:
+        where = f"{base_where} AND amount < 0 AND category <> 'Income'"
+    # ruff S608 / bandit B608: ``where`` is composed entirely of string
+    # literals plus ``?`` placeholders that bind via the params list. No
+    # user input is interpolated. Audited 2026-05.
+    sql = f"""
+        SELECT category, SUM(-amount) AS total, COUNT(*) AS transaction_count
+        FROM transactions_with_category
+        WHERE {where}
+        GROUP BY category
+        ORDER BY total DESC
+    """  # noqa: S608  # nosec B608
+    return store.query_sql(sql, [start, end])
+
+
 def spending_by_category(
     store: FinanceStore,
     start: datetime,
@@ -54,20 +95,5 @@ def spending_by_category(
     the tool description. If dogfooding shows this matters for net-of-
     refunds analyses, a future ``include_refunds`` flag can be added.
     """
-    base_where = "posted >= ? AND posted <= ?"
-    if include_income:
-        where = f"{base_where} AND (amount < 0 OR category = 'Income')"
-    else:
-        where = f"{base_where} AND amount < 0 AND category <> 'Income'"
-    # ruff S608 / bandit B608: ``where`` is composed entirely of string
-    # literals plus ``?`` placeholders that bind via the params list. No
-    # user input is interpolated. Audited 2026-05.
-    sql = f"""
-        SELECT category, SUM(-amount) AS total, COUNT(*) AS transaction_count
-        FROM transactions_with_category
-        WHERE {where}
-        GROUP BY category
-        ORDER BY total DESC
-    """  # noqa: S608  # nosec B608
-    rows = store.query_sql(sql, [start, end])
+    rows = query_spending_by_category(store, start, end, include_income=include_income)
     return [{k: _serialize_value(v) for k, v in row.items()} for row in rows]

@@ -15,9 +15,12 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from goetta_finance.tools.accounts import serialize_account
-from goetta_finance.tools.transactions import serialize_transaction
 from goetta_finance.web.aggregations import recent_sync_runs
-from goetta_finance.web.charts import net_worth_figure, spending_figure
+from goetta_finance.web.charts import (
+    net_worth_figure,
+    spending_by_category_figure,
+    spending_figure,
+)
 
 
 def _store(request: Request) -> Any:
@@ -115,28 +118,57 @@ def register_routes(app: FastAPI) -> None:
             },
         )
 
+    @app.get("/spending-by-category", response_class=HTMLResponse)
+    async def spending_by_category(request: Request) -> HTMLResponse:
+        """Pie chart of spending by category over the last 30 days.
+
+        Date-range selector is intentionally not exposed in v1 — keeps
+        the page simple. If dogfooding shows the 30-day window is
+        wrong for common questions, expose a dropdown then.
+        """
+        store = _store(request)
+        days = 30
+        figure = spending_by_category_figure(store, days=days)
+        # Pie chart has exactly one trace; check its values list for emptiness.
+        has_data = bool(figure["data"] and figure["data"][0].get("values"))
+        return _render(
+            request,
+            "spending_by_category.html",
+            {
+                "figure_data": json.dumps(figure["data"], default=_json_default),
+                "figure_layout": json.dumps(figure["layout"], default=_json_default),
+                "days": days,
+                "has_data": has_data,
+                "active": "spending_by_category",
+            },
+        )
+
     @app.get("/transactions", response_class=HTMLResponse)
     async def transactions(
         request: Request,
         account_id: Annotated[str | None, Query()] = None,
         start: Annotated[str | None, Query()] = None,
         end: Annotated[str | None, Query()] = None,
+        category: Annotated[str | None, Query()] = None,
         q: Annotated[str | None, Query()] = None,
         limit: int = 200,
     ) -> HTMLResponse:
         store = _store(request)
         accounts = [serialize_account(a) for a in store.get_accounts()]
-        rows = _query_transactions(store, account_id, start, end, q, limit)
+        categories = [c.name for c in store.get_categories()]
+        rows = _query_transactions(store, account_id, start, end, category, q, limit)
         return _render(
             request,
             "transactions.html",
             {
                 "accounts": accounts,
+                "categories": categories,
                 "rows": rows,
                 "filters": {
                     "account_id": account_id or "",
                     "start": start or "",
                     "end": end or "",
+                    "category": category or "",
                     "q": q or "",
                 },
                 "active": "transactions",
@@ -149,11 +181,12 @@ def register_routes(app: FastAPI) -> None:
         account_id: Annotated[str | None, Query()] = None,
         start: Annotated[str | None, Query()] = None,
         end: Annotated[str | None, Query()] = None,
+        category: Annotated[str | None, Query()] = None,
         q: Annotated[str | None, Query()] = None,
         limit: int = 200,
     ) -> HTMLResponse:
         store = _store(request)
-        rows = _query_transactions(store, account_id, start, end, q, limit)
+        rows = _query_transactions(store, account_id, start, end, category, q, limit)
         return _render(request, "partials/transactions_table.html", {"rows": rows})
 
     @app.get("/sync", response_class=HTMLResponse)
@@ -180,24 +213,45 @@ def _query_transactions(
     account_id: str | None,
     start: str | None,
     end: str | None,
+    category: str | None,
     q: str | None,
     limit: int,
 ) -> list[dict[str, Any]]:
-    txns = store.get_transactions(
+    """Read transactions through the view so each row carries its
+    resolved category (badge rendering + CLI-command tooltip).
+
+    Search/text filter still runs in Python after the DB call — same
+    as before, just on dict keys instead of Transaction attributes."""
+    rows = store.get_transactions_with_category(
         account_id=account_id or None,
         start=_parse_iso(start),
         end=_parse_iso(end),
+        category=category or None,
         limit=max(1, min(limit, 1000)),
     )
     if q:
         needle = q.lower()
-        txns = [
-            t
-            for t in txns
-            if needle in t.description.lower()
-            or (t.payee is not None and needle in t.payee.lower())
+        rows = [
+            r
+            for r in rows
+            if needle in r["description"].lower()
+            or (r.get("payee") is not None and needle in r["payee"].lower())
         ]
-    return [serialize_transaction(t) for t in txns]
+    return [
+        {
+            "id": r["id"],
+            "account_id": r["account_id"],
+            "posted": r["posted"].isoformat()
+            if isinstance(r["posted"], datetime)
+            else str(r["posted"]),
+            "description": r["description"],
+            "payee": r.get("payee"),
+            "amount": str(r["amount"]),
+            "category": r["category"],
+            "category_color": r.get("category_color"),
+        }
+        for r in rows
+    ]
 
 
 def _maybe_json_list(value: Any) -> list[str]:

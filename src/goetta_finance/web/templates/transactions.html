@@ -11,6 +11,14 @@
         {% endfor %}
       </select>
     </label>
+    <label>Category:
+      <select name="category">
+        <option value="">All</option>
+        {% for c in categories %}
+          <option value="{{ c }}" {% if c == filters.category %}selected{% endif %}>{{ c }}</option>
+        {% endfor %}
+      </select>
+    </label>
     <label>From:
       <input type="date" name="start" value="{{ filters.start }}">
     </label>
@@ -28,6 +36,7 @@
         <th>Account</th>
         <th>Description</th>
         <th>Payee</th>
+        <th>Category</th>
         <th class="num">Amount</th>
       </tr>
     </thead>

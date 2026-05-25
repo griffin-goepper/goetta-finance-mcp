@@ -13,6 +13,7 @@ from decimal import Decimal
 from typing import NamedTuple
 
 from goetta_finance.store import FinanceStore
+from goetta_finance.tools.spending_by_category import query_spending_by_category
 
 
 class MonthlyCashflow(NamedTuple):
@@ -24,6 +25,12 @@ class MonthlyCashflow(NamedTuple):
 class NetWorthPoint(NamedTuple):
     day: date
     balance: Decimal
+
+
+class CategoryTotal(NamedTuple):
+    category: str
+    total: Decimal
+    transaction_count: int
 
 
 def monthly_income_spending(
@@ -141,6 +148,33 @@ def net_worth_series(
     return out
 
 
+def spending_by_category_last_n_days(
+    store: FinanceStore, *, days: int = 30, now: datetime | None = None
+) -> list[CategoryTotal]:
+    """Spending per category over the last ``days`` calendar days.
+
+    Calls the shared ``query_spending_by_category`` helper in
+    ``tools/spending_by_category.py`` so the dashboard and the MCP
+    tool always agree on the SQL contract. Income is excluded by
+    default — matches the dashboard's intent ("what did I spend").
+
+    Keeps Decimal precision through to the chart builder; the chart
+    builder downcasts to float for Plotly (same pattern as
+    ``net_worth_series`` / ``monthly_income_spending``).
+    """
+    end = (now or datetime.now(tz=UTC)).astimezone(UTC)
+    start = end - timedelta(days=days)
+    rows = query_spending_by_category(store, start, end, include_income=False)
+    return [
+        CategoryTotal(
+            category=str(row["category"]),
+            total=_as_decimal(row["total"]),
+            transaction_count=int(row["transaction_count"]),
+        )
+        for row in rows
+    ]
+
+
 def recent_sync_runs(store: FinanceStore, *, limit: int = 10) -> list[dict[str, object]]:
     """Most recent sync_runs rows, newest first. Warnings/errors come back
     as JSON strings from DuckDB; callers can parse them as needed."""
@@ -166,9 +200,11 @@ def _as_decimal(value: object) -> Decimal:
 
 
 __all__: Sequence[str] = (
+    "CategoryTotal",
     "MonthlyCashflow",
     "NetWorthPoint",
     "monthly_income_spending",
     "net_worth_series",
     "recent_sync_runs",
+    "spending_by_category_last_n_days",
 )
