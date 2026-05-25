@@ -52,6 +52,8 @@ Re-running `init` is safe — each step detects existing state and offers to ski
 | `goetta-finance web` | Start the local web dashboard. `--port 8765` and `--host 127.0.0.1` by default. |
 | `goetta-finance daemon` | Long-lived process: dashboard + MCP HTTP endpoint + daily scheduled sync, from one process. See "Daemon mode" below. |
 | `goetta-finance account add\|list\|set-balance\|set-liability\|remove` | Manage manual accounts and liability flags. See "Manual accounts and liabilities" below. |
+| `goetta-finance category list\|add\|set-rule\|remove-rule\|default-rules` | Manage categories and the rules that map descriptions to them. See "Transaction categorization" below. |
+| `goetta-finance transaction categorize\|uncategorize` | Manual per-transaction category overrides. See "Transaction categorization" below. |
 
 ## Manual accounts and liabilities
 
@@ -106,6 +108,74 @@ Both contribute `-500` and `-22500` respectively to net worth — collapsing the
 - **Retroactive flag.** Toggling `is_liability` re-treats all historical `balance_snapshots` for that account under the new value in net-worth-over-time charts. This is almost always what you want; if it isn't, flip the flag back.
 - **CC-credit edge case.** A credit card with `is_liability=true` and a *positive* balance (you overpaid and now have a credit) computes as `-balance` instead of `+balance`. Rare; `set-liability false` while the credit exists, then re-enable, is the workaround.
 - **Balance is authoritative.** Payments to a manual loan don't auto-decrement the balance — re-run `set-balance` from your servicer's monthly statement.
+
+## Transaction categorization
+
+Every transaction resolves to a category at *read time* through a SQL view (`transactions_with_category`). Three layers, outermost wins:
+
+1. **Manual override** — a row in `transaction_overrides` for that transaction id.
+2. **Rule match** — the lowest-priority rule in `category_rules` whose pattern matches the transaction's description.
+3. **`Uncategorized`** — the fallback when nothing else matches.
+
+Read-time resolution is the feature, not an optimization: adding or editing a rule applies retroactively to every existing transaction with zero data migration. A `category_id` column on `transactions` would silently break that.
+
+Migration 0004 ships **14 default categories** (`Groceries`, `Dining`, `Transportation`, `Gas`, `Utilities`, `Subscriptions`, `Rent/Mortgage`, `Healthcare`, `Entertainment`, `Shopping`, `Travel`, `Transfers`, `Income`, `Uncategorized`) and **38 default rules** for common US merchants (Kroger/Trader Joe's → Groceries, Starbucks/DoorDash → Dining, Shell/Exxon → Gas, Spotify/Netflix → Subscriptions, etc.). The seeds aim for "good enough on day one" — your bank's exact descriptions probably differ, so expect to add a handful of rules.
+
+### CLI
+
+```bash
+# Inspect what was seeded vs. what you've added.
+goetta-finance category list                 # all categories with txn + rule counts
+goetta-finance category default-rules        # the is_default=TRUE rule set
+
+# Add a rule. Pattern matches case-insensitively against transaction description.
+goetta-finance category set-rule Dining --match contains --pattern 'CHIPOTLE'
+goetta-finance category set-rule Dining --match regex --pattern '(?i)venmo.*lunch'
+
+# Remove a rule. Defaults require --force AND a typed-pattern confirmation;
+# user-added rules just need the id.
+goetta-finance category remove-rule 42
+goetta-finance category remove-rule 7 --force        # default rule, prompts for the pattern
+
+# Add a custom category.
+goetta-finance category add --name "Gardening" --color "#4ade80"
+
+# Recategorize a single transaction (manual override beats any rule).
+goetta-finance transaction categorize <txn-id> Groceries
+goetta-finance transaction uncategorize <txn-id>     # back to rule resolution
+
+# Category names are case-insensitive ("dining" → "Dining") and typos get
+# a "Did you mean?" suggestion via difflib.
+```
+
+### From Claude
+
+The `spending_by_category(start, end)` MCP tool aggregates per-category totals over a date range. By default it returns spending only (amount < 0, Income excluded) as positive dollar magnitudes sorted descending. Pass `include_income=True` to add the Income category as a row whose `total` is *negative* — sign conveys direction (cash in).
+
+`get_transactions(category="Dining", ...)` filters server-side through the view. Every transaction Claude sees carries a resolved `category` field — falling back to `"Uncategorized"`, never `None`.
+
+For anything custom, query the view directly via `sql_query`:
+
+```sql
+SELECT category, COUNT(*), SUM(-amount) AS total
+FROM transactions_with_category
+WHERE posted >= '2026-01-01' AND amount < 0
+GROUP BY category ORDER BY total DESC;
+```
+
+### Dashboard
+
+- **By category** page: pie chart of the last 30 days' spending, Income excluded.
+- **Transactions** page: per-row colored category badge + a category-filter dropdown that narrows via HTMX without a page reload. The badge tooltip pre-fills the CLI command to recategorize that specific transaction id — copy-paste-ready.
+
+Inline categorize-from-dashboard (HTMX dropdown + write endpoint) is deliberately *not* in v1; use the CLI. The reason: the standalone `goetta-finance web` opens the DuckDB store read-only, so a write endpoint would only work in daemon mode and forking dashboard behavior on writability isn't worth it until dogfooding shows frequent re-categorization friction.
+
+### Heads-up
+
+- **Rule patterns are MCP-reachable.** A transaction memo can carry text that tricks Claude into running `category set-rule ... --pattern <evil-regex>`. The CLI validator does best-effort filtering (refuses uncompilable regexes, nested quantifiers like `(X+)+`, large counted repetitions like `(.*a){25}`) but CPython's `re` engine doesn't release the GIL so a runtime regex timeout isn't possible. The load-bearing runtime defense is the existing `query_sql` statement-timeout watchdog (`GOETTA_FINANCE_SQL_TIMEOUT_SECONDS`, default 30s). See [`CLAUDE.md`](./CLAUDE.md) for the threat model.
+- **Default rules are USA-biased.** Rename a default rule by removing it (`--force`) and adding your own, or just add a higher-priority rule that wins (lower number = higher precedence).
+- **One category per transaction.** Costco-style mixed purchases get one label. No splits in v1.
+- **Default rules don't re-seed if you delete them.** Migrations run once per database; the slate stays where you leave it. To add new defaults later, add a new migration file (`0005_default_rules_expansion.sql`, etc.) — never edit `0004_categorization.sql`.
 
 ## Daemon mode
 
@@ -231,26 +301,30 @@ Once registered, restart your Claude client and try things like:
 - *"What's my checking balance?"* → `list_accounts`
 - *"Show me everything I spent at Starbucks last month"* → `get_transactions(search="Starbucks", ...)`
 - *"Chart my net worth over the last 90 days"* → `account_balance_history` + Claude renders an inline chart artifact
-- *"How much did I spend on dining in February?"* → `sql_query` against the DuckDB store
+- *"How much did I spend on dining last month?"* → `spending_by_category` returns categorized totals (Income excluded by default)
+- *"Is the data current?"* → `sync_status` reports last sync + freshness
 
-The MCP server exposes five tools:
+The MCP server exposes seven tools:
 
 - **`list_accounts`** — all accounts with current balances
-- **`get_transactions`** — filter by account, date range, text search; up to 1000 rows
+- **`get_transactions`** — filter by account, date range, category, text search; up to 1000 rows. Every row carries a resolved `category` field.
 - **`account_balance_history`** — per-account balance snapshots over time
-- **`sql_query`** — read-only SQL against the local DuckDB store (see security notes below)
+- **`spending_by_category`** — categorized spending totals between two dates. Income excluded by default; opt in via `include_income=True`.
+- **`sql_query`** — read-only SQL against the local DuckDB store (see security notes below). Prefer `transactions_with_category` over the bare `transactions` table when you want category info.
+- **`sync_status`** — report when the SimpleFIN data was last synced and whether it's stale
 - **`sync_now`** — trigger a fresh pull from SimpleFIN
 
-`sql_query` is the workhorse: most natural-language questions collapse to a SQL query plus a Claude-rendered artifact. The MCP server intentionally has no `chart` tool — Claude renders inline charts as artifacts from the data tools return.
+`sql_query` is the workhorse for anything the other tools don't cover: most natural-language questions collapse to a SQL query plus a Claude-rendered artifact. The MCP server intentionally has no `chart` tool — Claude renders inline charts as artifacts from the data tools return.
 
 ## The web dashboard
 
-`goetta-finance web` serves five views at `http://127.0.0.1:8765`:
+`goetta-finance web` serves six views at `http://127.0.0.1:8765`:
 
 - **Accounts** — current balances and as-of timestamps
 - **Net worth** — Plotly line chart from balance snapshots
 - **Spending** — monthly income (up) and spending (down) stacked bars
-- **Transactions** — sortable, searchable table; filters update via HTMX without full page reloads
+- **By category** — pie chart of the last 30 days' spending (Income excluded)
+- **Transactions** — sortable, searchable table with a category filter and a colored category badge per row. Filters update via HTMX without full page reloads. The badge tooltip carries the pre-filled CLI command to recategorize that specific transaction.
 - **Sync** — last sync time and recent warnings/errors
 
 The dashboard binds to `127.0.0.1` only by default. If you pass a non-loopback `--host`, the CLI prints a warning — **there is no auth**. Don't expose this to a network you don't fully trust.
@@ -285,7 +359,8 @@ The SimpleFIN access URL is sensitive — it grants read access to your bank dat
 - **On Windows, `serve` and `web` cannot run simultaneously as separate processes.** DuckDB takes an exclusive OS file lock on the database even for a read-only handle. Use `goetta-finance daemon` (one process, both surfaces) to avoid the conflict, or stop one before starting the other. macOS/Linux use advisory POSIX locks so concurrent read-only + read-write *may* work, but it isn't relied upon.
 - **Pending transactions are dropped.** Only `posted` transactions are stored in v1. SimpleFIN's pending feed will be supported in a later phase.
 - **Single currency assumption.** Money is stored as `DECIMAL(18,2)` and charts use `USD` labels. Multi-currency support isn't here yet.
-- **No transaction categorization.** Spending charts group by income vs. spending only; per-category breakdowns require manual SQL via `sql_query` (or wait for a later phase).
+- **Categorization is flat and rule-based.** No hierarchy, no transaction splits, no LLM auto-categorization, no transfer dedup (transfers between your own accounts show up in both balances). The default rules are USA-merchant biased; you'll add your own — see "Transaction categorization" above.
+- **No inline category editing in the dashboard.** Recategorize via the `goetta-finance transaction categorize` CLI; the transactions page surfaces the exact command in each badge's tooltip.
 
 ## Development
 
