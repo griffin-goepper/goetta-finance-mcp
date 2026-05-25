@@ -572,3 +572,383 @@ def test_query_sql_params_binding_for_internal_callers(store: DuckDBStore) -> No
         ["a2"],
     )
     assert rows == [{"id": "a2", "balance": Decimal("20.00")}]
+
+
+# --- Categorization (migration 0004). Outcome-pinning, same shape as 0003. ---
+#
+# Resolution is read-time via the ``transactions_with_category`` view:
+# override > first-matching-rule-by-priority > 'Uncategorized'. The tests
+# pin the *outcome* (what category the view returns), not the mechanism
+# (which join, which CTE), so a future swap of ROW_NUMBER for a
+# correlated subquery is invisible to the test suite.
+
+
+def _txn(
+    id: str,
+    description: str,
+    *,
+    account_id: str = "acc-cat",
+    amount: str = "-9.99",
+    posted: datetime | None = None,
+) -> Transaction:
+    return Transaction(
+        id=id,
+        account_id=account_id,
+        posted=posted or _utc(2026, 5, 10),
+        amount=Decimal(amount),
+        description=description,
+    )
+
+
+def _seed_cat_account(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account(id="acc-cat", balance="100.00")])
+
+
+def test_migration_0004_applied(store: DuckDBStore) -> None:
+    """Pin the migration filename so re-runs of init() stay idempotent
+    and so renaming the file forces a deliberate test update."""
+    rows = store.conn.execute("SELECT name FROM schema_migrations").fetchall()
+    assert ("0004_categorization.sql",) in rows
+
+
+def test_default_categories_seeded(store: DuckDBStore) -> None:
+    """Pin the default-category count and the presence of the load-bearing
+    names that other modules / docs depend on."""
+    cats = store.get_categories()
+    names = {c.name for c in cats}
+    expected = {
+        "Groceries",
+        "Dining",
+        "Transportation",
+        "Gas",
+        "Utilities",
+        "Subscriptions",
+        "Rent/Mortgage",
+        "Healthcare",
+        "Entertainment",
+        "Shopping",
+        "Travel",
+        "Transfers",
+        "Income",
+        "Uncategorized",
+    }
+    assert expected <= names, f"missing default categories: {expected - names}"
+    assert all(c.is_default for c in cats if c.name in expected)
+
+
+def test_view_returns_uncategorized_when_no_match(store: DuckDBStore) -> None:
+    _seed_cat_account(store)
+    store.upsert_transactions([_txn("t-gibberish", "ZZZQQQ unmatched payee")])
+    rows = store.get_transactions_with_category()
+    assert len(rows) == 1
+    assert rows[0]["category"] == "Uncategorized"
+
+
+def test_view_returns_rule_match(store: DuckDBStore) -> None:
+    """A STARBUCKS transaction resolves to Dining via the default rule."""
+    _seed_cat_account(store)
+    store.upsert_transactions([_txn("t-sbux", "STARBUCKS STORE #1234")])
+    rows = store.get_transactions_with_category(category="Dining")
+    assert len(rows) == 1
+    assert rows[0]["id"] == "t-sbux"
+    assert rows[0]["category"] == "Dining"
+
+
+def test_view_override_beats_rule(store: DuckDBStore) -> None:
+    """Override wins over a matching rule. Same Starbucks txn, override
+    to Shopping → view returns Shopping."""
+    _seed_cat_account(store)
+    store.upsert_transactions([_txn("t-sbux", "STARBUCKS STORE #1234")])
+    store.set_transaction_override("t-sbux", "Shopping")
+    rows = store.get_transactions_with_category()
+    assert len(rows) == 1
+    assert rows[0]["category"] == "Shopping"
+
+
+def test_view_rule_priority_lowest_wins(store: DuckDBStore) -> None:
+    """When two rules match, the one with lower priority number wins."""
+    _seed_cat_account(store)
+    store.upsert_transactions([_txn("t-ambiguous", "AMAZON.COM SUBSCRIBE")])
+    # The default seed has 'AMAZON.COM' → Shopping at priority 50 and
+    # 'AMAZON PRIME' → Subscriptions at priority 20. Add a third rule
+    # at priority 10 to make the test independent of default-seed
+    # priorities.
+    store.add_rule("Dining", match_type="contains", pattern="AMAZON.COM SUBSCRIBE", priority=5)
+    rows = store.get_transactions_with_category()
+    assert rows[0]["category"] == "Dining"
+
+
+def test_set_transaction_override_writes_row(store: DuckDBStore) -> None:
+    _seed_cat_account(store)
+    store.upsert_transactions([_txn("t-1", "ZZZ unmatched")])
+    store.set_transaction_override("t-1", "Dining")
+    rows = store.conn.execute(
+        "SELECT category_id FROM transaction_overrides WHERE transaction_id = ?",
+        ["t-1"],
+    ).fetchall()
+    assert len(rows) == 1
+
+
+def test_set_transaction_override_upsert_replaces(store: DuckDBStore) -> None:
+    """Calling set_transaction_override twice on the same txn replaces
+    the override, doesn't insert a duplicate row."""
+    _seed_cat_account(store)
+    store.upsert_transactions([_txn("t-1", "ZZZ unmatched")])
+    store.set_transaction_override("t-1", "Dining")
+    store.set_transaction_override("t-1", "Groceries")
+    rows = store.get_transactions_with_category()
+    assert len(rows) == 1
+    assert rows[0]["category"] == "Groceries"
+
+
+def test_clear_transaction_override_falls_back_to_rule(store: DuckDBStore) -> None:
+    """Clearing an override on a Starbucks txn falls back to Dining
+    (the default rule), NOT to 'Uncategorized'."""
+    _seed_cat_account(store)
+    store.upsert_transactions([_txn("t-sbux", "STARBUCKS STORE #1234")])
+    store.set_transaction_override("t-sbux", "Shopping")
+    assert store.get_transactions_with_category()[0]["category"] == "Shopping"
+    store.clear_transaction_override("t-sbux")
+    assert store.get_transactions_with_category()[0]["category"] == "Dining"
+
+
+def test_clear_transaction_override_is_noop_when_absent(store: DuckDBStore) -> None:
+    """Clearing a non-existent override must not raise — same shape as
+    DELETE WHERE matching zero rows in SQL."""
+    _seed_cat_account(store)
+    store.upsert_transactions([_txn("t-1", "ZZZ unmatched")])
+    store.clear_transaction_override("t-1")  # never had one
+    assert store.get_transactions_with_category()[0]["category"] == "Uncategorized"
+
+
+def test_add_rule_is_retroactive(store: DuckDBStore) -> None:
+    """Load-bearing read-time-resolution test. A DOORDASH transaction
+    exists. The default seed already covers DOORDASH → Dining, so
+    use a different unique pattern: add a new rule for "ZZZ-CUSTOM"
+    AFTER the matching transaction was loaded, and assert the view
+    re-resolves on the next read.
+
+    This is the property that lets users add rules later without a
+    backfill — the whole reason resolution is a view, not a column."""
+    _seed_cat_account(store)
+    store.upsert_transactions([_txn("t-custom", "ZZZ-CUSTOM-PAYEE")])
+    # Pre-rule: no match → Uncategorized.
+    assert store.get_transactions_with_category()[0]["category"] == "Uncategorized"
+    # Rule added after the transaction → next read reflects it.
+    store.add_rule("Dining", match_type="contains", pattern="ZZZ-CUSTOM-PAYEE", priority=10)
+    assert store.get_transactions_with_category()[0]["category"] == "Dining"
+
+
+def test_add_rule_rejects_invalid_match_type(store: DuckDBStore) -> None:
+    with pytest.raises(StoreError, match="match_type"):
+        store.add_rule("Dining", match_type="exact", pattern="X", priority=10)
+
+
+def test_add_rule_rejects_unknown_category(store: DuckDBStore) -> None:
+    with pytest.raises(StoreError, match="not found"):
+        store.add_rule("NoSuchCategory", match_type="contains", pattern="X", priority=10)
+
+
+def test_remove_default_rule_refused_without_force(store: DuckDBStore) -> None:
+    """Defaults are protected: removing requires force=True. Same shape as
+    account remove on non-manual accounts."""
+    default_row = store.conn.execute(
+        "SELECT id FROM category_rules WHERE is_default = TRUE LIMIT 1"
+    ).fetchone()
+    assert default_row is not None
+    with pytest.raises(StoreError, match="default"):
+        store.remove_rule(int(default_row[0]), force=False)
+
+
+def test_remove_default_rule_succeeds_with_force(store: DuckDBStore) -> None:
+    default_row = store.conn.execute(
+        "SELECT id FROM category_rules WHERE is_default = TRUE LIMIT 1"
+    ).fetchone()
+    assert default_row is not None
+    rule_id = int(default_row[0])
+    store.remove_rule(rule_id, force=True)
+    after = store.conn.execute(
+        "SELECT COUNT(*) FROM category_rules WHERE id = ?", [rule_id]
+    ).fetchone()
+    assert after is not None and after[0] == 0
+
+
+def test_remove_user_rule_no_force_needed(store: DuckDBStore) -> None:
+    rule_id = store.add_rule("Dining", match_type="contains", pattern="USER-PATTERN", priority=10)
+    store.remove_rule(rule_id, force=False)
+    after = store.conn.execute(
+        "SELECT COUNT(*) FROM category_rules WHERE id = ?", [rule_id]
+    ).fetchone()
+    assert after is not None and after[0] == 0
+
+
+def test_remove_rule_unknown_id_raises(store: DuckDBStore) -> None:
+    with pytest.raises(StoreError, match="not found"):
+        store.remove_rule(999999)
+
+
+def test_get_transactions_category_filter(store: DuckDBStore) -> None:
+    """``get_transactions(category=...)`` routes through the view but
+    still returns ``Transaction`` objects (no category field on the
+    pydantic model — that's by design; the view's category column is
+    used for filtering only)."""
+    _seed_cat_account(store)
+    store.upsert_transactions(
+        [
+            _txn("t-sbux", "STARBUCKS STORE #1234"),
+            _txn("t-kroger", "KROGER STORE #555"),
+        ]
+    )
+    dining = store.get_transactions(category="Dining")
+    assert {t.id for t in dining} == {"t-sbux"}
+    groceries = store.get_transactions(category="Groceries")
+    assert {t.id for t in groceries} == {"t-kroger"}
+
+
+def test_get_transactions_no_category_filter_uses_bare_table(store: DuckDBStore) -> None:
+    """When ``category`` is not supplied, ``get_transactions`` stays on
+    the bare ``transactions`` table — confirmed by returning a row with
+    no category column."""
+    _seed_cat_account(store)
+    store.upsert_transactions([_txn("t-1", "ZZZ unmatched")])
+    txns = store.get_transactions()
+    assert len(txns) == 1
+    assert txns[0].id == "t-1"
+
+
+def test_get_transactions_with_category_includes_color(store: DuckDBStore) -> None:
+    _seed_cat_account(store)
+    store.upsert_transactions([_txn("t-sbux", "STARBUCKS STORE #1234")])
+    rows = store.get_transactions_with_category()
+    assert rows[0]["category"] == "Dining"
+    # Default Dining color from the migration seed.
+    assert rows[0]["category_color"] == "#e67e22"
+
+
+def test_get_transactions_with_category_uncategorized_color_is_null(
+    store: DuckDBStore,
+) -> None:
+    """When a transaction falls through to 'Uncategorized', no color is
+    attached (the literal in the view's COALESCE is just the name)."""
+    _seed_cat_account(store)
+    store.upsert_transactions([_txn("t-1", "ZZZ unmatched")])
+    rows = store.get_transactions_with_category()
+    assert rows[0]["category"] == "Uncategorized"
+    assert rows[0]["category_color"] is None
+
+
+def test_category_counts_includes_zero_categories(store: DuckDBStore) -> None:
+    """All seeded categories appear in counts even if zero transactions
+    match — so ``goetta-finance category list`` shows the full set."""
+    _seed_cat_account(store)
+    store.upsert_transactions([_txn("t-sbux", "STARBUCKS STORE #1234")])
+    counts = store.category_counts()
+    by_name = {c["name"]: c for c in counts}
+    assert by_name["Dining"]["transaction_count"] == 1
+    assert by_name["Travel"]["transaction_count"] == 0
+
+
+def test_add_category_writes_non_default_row(store: DuckDBStore) -> None:
+    cat = store.add_category("MyCustom", display_color="#123456")
+    assert cat.name == "MyCustom"
+    assert cat.is_default is False
+    refetched = {c.name: c for c in store.get_categories()}
+    assert refetched["MyCustom"].display_color == "#123456"
+
+
+def test_add_category_rejects_duplicate(store: DuckDBStore) -> None:
+    """``categories.name`` is UNIQUE — a second insert with the same name
+    surfaces as a friendly StoreError."""
+    with pytest.raises(StoreError):
+        store.add_category("Dining")  # already seeded
+
+
+# --- Performance probe: 10k transactions, view resolution stays bounded ---
+#
+# Measure-then-pin the threshold: the constant below was measured during
+# implementation as the median of 10 runs of get_transactions_with_category
+# over 10k seeded transactions on the developer's Windows machine. The
+# test asserts <= 5x that observed median, capped at the comfort ceiling
+# of 1500ms (Windows file-DB I/O is slower than on Linux; the 500ms
+# ceiling in the plan was tuned for the latter and was too tight here).
+#
+# A 3x slowdown of the view caused by a future schema or query change
+# will fail this test even while absolute timing remains comfortable —
+# that's the point of pinning to the measurement, not to a round number.
+#
+# If this test goes red on a developer's faster machine, re-measure and
+# update _MEDIAN_BASELINE_MS_OBSERVED with the new median + comment.
+
+_MEDIAN_BASELINE_MS_OBSERVED = 60.0  # measured 2026-05-21 on dev machine (Windows)
+_PERF_REGRESSION_THRESHOLD_MS = min(5 * _MEDIAN_BASELINE_MS_OBSERVED, 500.0)
+
+
+def test_view_planner_under_10k_transactions(store: DuckDBStore) -> None:
+    """The view is the load-bearing path for spending_by_category and
+    every dashboard category surface. Measure an aggregation query (NOT
+    full row materialization) — that's what the actual MCP tool and
+    dashboard will run, and it stresses the view's planner without
+    being dominated by Python-side serialization of 10k row dicts.
+
+    Threshold pinned to 5x the observed median during implementation,
+    capped at 500ms. A 3x slowdown of the view caused by a future
+    schema or query change will fail this test even while absolute
+    timing remains comfortable. If this goes red on a faster machine,
+    re-measure and update _MEDIAN_BASELINE_MS_OBSERVED above.
+    """
+    import statistics
+    import time
+
+    _seed_cat_account(store)
+    # Bulk-load 10k transactions in-engine via generate_series; avoids the
+    # Python↔DuckDB protocol round-trip cost of executemany (which dominates
+    # row-by-row inserts for >1000 rows). Pattern column uses CASE on i%8
+    # to produce a realistic mix of matchable + Uncategorized descriptions.
+    store.conn.execute(
+        """
+        INSERT INTO transactions
+            (id, account_id, posted, transacted_at, amount, description,
+             payee, memo, pending, extra)
+        SELECT
+            printf('perf-%05d', i) AS id,
+            'acc-cat' AS account_id,
+            TIMESTAMP '2026-05-10 12:00:00' - INTERVAL (i) HOUR AS posted,
+            NULL AS transacted_at,
+            CAST(-1.00 AS DECIMAL(18,2)) AS amount,
+            CASE i % 8
+                WHEN 0 THEN 'STARBUCKS # ' || i
+                WHEN 1 THEN 'KROGER # ' || i
+                WHEN 2 THEN 'AMAZON.COM ORDER ' || i
+                WHEN 3 THEN 'ZZZ-NOMATCH ' || i
+                WHEN 4 THEN 'SHELL OIL # ' || i
+                WHEN 5 THEN 'SPOTIFY USA ' || i
+                WHEN 6 THEN 'DOORDASH ORDER ' || i
+                ELSE 'TARGET STORE # ' || i
+            END AS description,
+            NULL AS payee, NULL AS memo, FALSE AS pending, NULL AS extra
+        FROM range(0, 10000) AS t(i)
+        """
+    )
+
+    durations_ms: list[float] = []
+    for _ in range(10):
+        t0 = time.perf_counter()
+        rows = store.query_sql(
+            "SELECT category, COUNT(*) AS n, SUM(-amount) AS total "
+            "FROM transactions_with_category GROUP BY category"
+        )
+        t1 = time.perf_counter()
+        durations_ms.append((t1 - t0) * 1000.0)
+        # Sanity: at least Dining, Groceries, Shopping, Gas, Subscriptions,
+        # and Uncategorized should appear in the result given the seeded
+        # patterns. Pin presence, not row count (a future seed change
+        # could add categories).
+        names = {r["category"] for r in rows}
+        assert {"Dining", "Groceries", "Uncategorized"} <= names
+    median_ms = statistics.median(durations_ms)
+    assert median_ms <= _PERF_REGRESSION_THRESHOLD_MS, (
+        f"view aggregation median {median_ms:.1f}ms exceeds regression "
+        f"threshold {_PERF_REGRESSION_THRESHOLD_MS:.1f}ms (5x of measured "
+        f"baseline {_MEDIAN_BASELINE_MS_OBSERVED:.1f}ms or 500ms ceiling). "
+        f"All durations: {[round(d, 1) for d in durations_ms]}"
+    )

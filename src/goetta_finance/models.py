@@ -57,6 +57,15 @@ class BalanceSnapshot(BaseModel):
     timestamp: datetime
 
 
+class Category(BaseModel):
+    model_config = ConfigDict(frozen=False, extra="forbid")
+
+    id: int
+    name: str
+    display_color: str | None = None
+    is_default: bool = False
+
+
 class SyncRun(BaseModel):
     model_config = ConfigDict(frozen=False, extra="forbid")
 

@@ -19,6 +19,7 @@ from goetta_finance.models import (
     Account,
     AccountType,
     BalanceSnapshot,
+    Category,
     SyncResult,
     SyncRun,
     Transaction,
@@ -451,6 +452,7 @@ class DuckDBStore:
         account_id: str | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
+        category: str | None = None,
         limit: int | None = None,
     ) -> list[Transaction]:
         clauses: list[str] = []
@@ -464,19 +466,29 @@ class DuckDBStore:
         if end is not None:
             clauses.append("posted <= ?")
             params.append(_to_naive_utc(end))
+        # When category is requested, route through the view so resolution
+        # (override > rule > 'Uncategorized') is applied at read time.
+        # Otherwise stay on the bare table — the view's CTEs would force
+        # evaluation of the rule-matching join on every call, which is
+        # wasted work when the caller doesn't care about category.
+        source = "transactions_with_category" if category is not None else "transactions"
+        if category is not None:
+            clauses.append("category = ?")
+            params.append(category)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         limit_clause = f"LIMIT {int(limit)}" if limit is not None else ""
         with self._lock:
             # ruff S608 / bandit B608: ``clauses`` is a fixed allow-list of
             # column predicates (``account_id = ?``, ``posted >= ?``,
-            # ``posted <= ?``); values bind via ``params``. ``limit_clause``
-            # is ``LIMIT {int(...)}`` so the only interpolated token is a
-            # plain integer. Audited 2026-05.
+            # ``posted <= ?``, ``category = ?``); values bind via ``params``.
+            # ``source`` is one of two hard-coded identifiers.
+            # ``limit_clause`` is ``LIMIT {int(...)}`` so the only
+            # interpolated token is a plain integer. Audited 2026-05.
             rows = self.conn.execute(
                 f"""
                 SELECT id, account_id, posted, transacted_at, amount, description,
                        payee, memo, pending, extra
-                FROM transactions
+                FROM {source}
                 {where}
                 ORDER BY posted DESC
                 {limit_clause}
@@ -484,6 +496,67 @@ class DuckDBStore:
                 params,
             ).fetchall()
         return [self._row_to_transaction(row) for row in rows]
+
+    def get_transactions_with_category(
+        self,
+        *,
+        account_id: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        category: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return transactions joined to their resolved category through
+        the ``transactions_with_category`` view. Each row is a dict
+        carrying every column of the view (transaction columns plus
+        ``category`` and ``category_color``).
+
+        Deliberately a separate method from ``get_transactions``: that one
+        returns ``list[Transaction]`` (no category — the pydantic model
+        does not carry one, by design), while this one returns dicts
+        carrying the resolved category for callers that want both shapes
+        at once (the dashboard, the ``get_transactions`` MCP tool).
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if account_id is not None:
+            clauses.append("account_id = ?")
+            params.append(account_id)
+        if start is not None:
+            clauses.append("posted >= ?")
+            params.append(_to_naive_utc(start))
+        if end is not None:
+            clauses.append("posted <= ?")
+            params.append(_to_naive_utc(end))
+        if category is not None:
+            clauses.append("category = ?")
+            params.append(category)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit_clause = f"LIMIT {int(limit)}" if limit is not None else ""
+        with self._lock:
+            # ruff S608 / bandit B608: see ``get_transactions``.
+            cur = self.conn.execute(
+                f"""
+                SELECT id, account_id, posted, transacted_at, amount, description,
+                       payee, memo, pending, extra, category, category_color
+                FROM transactions_with_category
+                {where}
+                ORDER BY posted DESC
+                {limit_clause}
+                """,  # noqa: S608  # nosec B608
+                params,
+            )
+            columns = [d[0] for d in cur.description] if cur.description else []
+            rows = cur.fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            d = dict(zip(columns, row, strict=True))
+            d["posted"] = _from_naive_utc(d["posted"])
+            d["transacted_at"] = _from_naive_utc(d["transacted_at"])
+            d["amount"] = Decimal(d["amount"])
+            d["extra"] = _parse_json(d["extra"])
+            out.append(d)
+        return out
 
     def get_balance_history(self, account_id: str, since: datetime) -> list[BalanceSnapshot]:
         with self._lock:
@@ -504,6 +577,148 @@ class DuckDBStore:
             )
             for row in rows
         ]
+
+    def get_categories(self) -> list[Category]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id, name, display_color, is_default FROM categories ORDER BY name"
+            ).fetchall()
+        return [
+            Category(id=int(r[0]), name=r[1], display_color=r[2], is_default=bool(r[3]))
+            for r in rows
+        ]
+
+    def category_counts(self) -> list[dict[str, Any]]:
+        """Per-category transaction counts resolved through the view.
+        Used by ``goetta-finance category list`` to surface "rough counts"
+        without an extra round-trip per category. Returns all categories
+        (including those with zero matches today) so the user can see the
+        full default set.
+        """
+        with self._lock:
+            cur = self.conn.execute(
+                """
+                SELECT c.name,
+                       COUNT(twc.id) AS transaction_count,
+                       c.is_default,
+                       c.display_color
+                FROM categories c
+                LEFT JOIN transactions_with_category twc ON twc.category = c.name
+                GROUP BY c.name, c.is_default, c.display_color
+                ORDER BY transaction_count DESC, c.name ASC
+                """
+            )
+            columns = [d[0] for d in cur.description] if cur.description else []
+            rows = cur.fetchall()
+        return [dict(zip(columns, row, strict=True)) for row in rows]
+
+    def add_category(self, name: str, display_color: str | None = None) -> Category:
+        name = name.strip()
+        if not name:
+            raise StoreError("category name cannot be empty")
+        with self._lock:
+            try:
+                row = self.conn.execute(
+                    """
+                    INSERT INTO categories (name, display_color, is_default)
+                    VALUES (?, ?, FALSE)
+                    RETURNING id, name, display_color, is_default
+                    """,
+                    [name, display_color],
+                ).fetchone()
+            except duckdb.Error as exc:
+                raise StoreError(f"add_category failed: {exc}") from exc
+        if row is None:
+            raise StoreError("add_category did not return a row")
+        return Category(id=int(row[0]), name=row[1], display_color=row[2], is_default=bool(row[3]))
+
+    def add_rule(
+        self,
+        category_name: str,
+        *,
+        match_type: str,
+        pattern: str,
+        priority: int = 100,
+    ) -> int:
+        """Insert a categorization rule. Returns the new rule's id.
+
+        ``match_type`` must be ``'contains'`` or ``'regex'`` (enforced
+        by the table's CHECK constraint). ``pattern`` is stored as-is;
+        the CLI layer is expected to have run the timeout-bounded
+        ``re.compile`` validation before calling — this method does NOT
+        re-validate. See CLAUDE.md for the security rationale.
+        """
+        if match_type not in ("contains", "regex"):
+            raise StoreError(f"match_type must be 'contains' or 'regex', got {match_type!r}")
+        with self._lock:
+            cat_row = self.conn.execute(
+                "SELECT id FROM categories WHERE name = ?", [category_name]
+            ).fetchone()
+            if cat_row is None:
+                raise StoreError(f"category not found: {category_name}")
+            try:
+                row = self.conn.execute(
+                    """
+                    INSERT INTO category_rules
+                        (category_id, match_type, pattern, priority, is_default)
+                    VALUES (?, ?, ?, ?, FALSE)
+                    RETURNING id
+                    """,
+                    [int(cat_row[0]), match_type, pattern, int(priority)],
+                ).fetchone()
+            except duckdb.Error as exc:
+                raise StoreError(f"add_rule failed: {exc}") from exc
+        if row is None:
+            raise StoreError("add_rule did not return a row")
+        return int(row[0])
+
+    def remove_rule(self, rule_id: int, *, force: bool = False) -> None:
+        """Remove a categorization rule. Refuses defaults without ``force``.
+
+        Same shape as ``account remove`` on non-manual accounts: a default
+        rule (``is_default = TRUE``) requires explicit ``force=True`` to
+        delete. The CLI layer wraps this with a typed-name confirmation
+        prompt for additional safety.
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT is_default FROM category_rules WHERE id = ?", [int(rule_id)]
+            ).fetchone()
+            if row is None:
+                raise StoreError(f"rule not found: {rule_id}")
+            if bool(row[0]) and not force:
+                raise StoreError(f"refusing to remove default rule {rule_id} without force=True")
+            self.conn.execute("DELETE FROM category_rules WHERE id = ?", [int(rule_id)])
+
+    def set_transaction_override(self, transaction_id: str, category_name: str) -> None:
+        with self._lock:
+            cat_row = self.conn.execute(
+                "SELECT id FROM categories WHERE name = ?", [category_name]
+            ).fetchone()
+            if cat_row is None:
+                raise StoreError(f"category not found: {category_name}")
+            txn_row = self.conn.execute(
+                "SELECT 1 FROM transactions WHERE id = ?", [transaction_id]
+            ).fetchone()
+            if txn_row is None:
+                raise StoreError(f"transaction not found: {transaction_id}")
+            self.conn.execute(
+                """
+                INSERT INTO transaction_overrides (transaction_id, category_id, created_at)
+                VALUES (?, ?, now())
+                ON CONFLICT (transaction_id) DO UPDATE SET
+                    category_id = excluded.category_id,
+                    created_at = excluded.created_at
+                """,
+                [transaction_id, int(cat_row[0])],
+            )
+
+    def clear_transaction_override(self, transaction_id: str) -> None:
+        with self._lock:
+            self.conn.execute(
+                "DELETE FROM transaction_overrides WHERE transaction_id = ?",
+                [transaction_id],
+            )
 
     def query_sql(self, sql: str, params: Sequence[Any] | None = None) -> list[dict[str, Any]]:
         """Run a single read-only SQL statement and return rows as dicts.

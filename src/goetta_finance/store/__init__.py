@@ -7,6 +7,7 @@ from typing import Any, Protocol
 from goetta_finance.models import (
     Account,
     BalanceSnapshot,
+    Category,
     SyncResult,
     SyncRun,
     Transaction,
@@ -34,8 +35,19 @@ class FinanceStore(Protocol):
         account_id: str | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
+        category: str | None = None,
         limit: int | None = None,
     ) -> list[Transaction]: ...
+
+    def get_transactions_with_category(
+        self,
+        *,
+        account_id: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        category: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]: ...
 
     def get_balance_history(self, account_id: str, since: datetime) -> list[BalanceSnapshot]: ...
 
@@ -44,3 +56,25 @@ class FinanceStore(Protocol):
     def delete_account(self, account_id: str, *, cascade_snapshots: bool = False) -> int: ...
 
     def set_account_liability(self, account_id: str, is_liability: bool) -> None: ...
+
+    # Categorization (migration 0004).
+    def get_categories(self) -> list[Category]: ...
+
+    def category_counts(self) -> list[dict[str, Any]]: ...
+
+    def add_category(self, name: str, display_color: str | None = None) -> Category: ...
+
+    def add_rule(
+        self,
+        category_name: str,
+        *,
+        match_type: str,
+        pattern: str,
+        priority: int = 100,
+    ) -> int: ...
+
+    def remove_rule(self, rule_id: int, *, force: bool = False) -> None: ...
+
+    def set_transaction_override(self, transaction_id: str, category_name: str) -> None: ...
+
+    def clear_transaction_override(self, transaction_id: str) -> None: ...
