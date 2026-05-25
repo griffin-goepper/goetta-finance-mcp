@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import difflib
 import json
 import logging
+import re
 import sys
 import uuid
 from datetime import UTC, datetime
@@ -972,6 +974,364 @@ def account_remove(
         )
     except GoettaFinanceError as exc:
         typer.secho(f"account remove failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+category_app = typer.Typer(
+    help="Manage transaction categories and the rules that map descriptions to them.",
+    no_args_is_help=True,
+)
+app.add_typer(category_app, name="category")
+
+transaction_app = typer.Typer(
+    help="Manual per-transaction category overrides.",
+    no_args_is_help=True,
+)
+app.add_typer(transaction_app, name="transaction")
+
+_HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+_PATTERN_MAX_LEN = 500
+
+# Heuristic detectors for ReDoS-prone shapes. Caught at write time so the user
+# gets a friendly error; the real runtime defense remains the query_sql
+# statement-timeout watchdog (GOETTA_FINANCE_SQL_TIMEOUT_SECONDS, default 30s)
+# which bounds any pattern that slips past these heuristics.
+#
+# Why heuristics, not a runtime timeout: CPython's ``re`` engine does NOT
+# release the GIL during matching, so spawning a daemon thread to evaluate
+# the pattern with a ``threading.Event.wait(timeout=1.0)`` does not actually
+# bound execution — the main thread can't preempt the worker until the
+# regex completes. Measured locally with ``(a+)+$`` against a 30-a sentinel:
+# the daemon thread held the GIL for ~49 seconds while ``wait(1.0)`` was
+# blocked the whole time. (See CLAUDE.md "Don'ts" → pattern surface.)
+#
+# Patterns the heuristics catch:
+#   ``(X+)+``, ``(X*)*``, ``(X+)*``, ``(X*)+`` — nested quantifiers (the
+#   classic backtracking shape)
+#   ``{N,}`` / ``{N}`` with N > 10 — counted repetitions with overlap
+#     potential
+# Patterns they miss (by design, to keep false positives low):
+#   ``(a|aa)+`` — alternation-overlap ReDoS; relies on runtime timeout
+_NESTED_QUANTIFIER_RE = re.compile(r"\([^()]*[+*][^()]*\)[+*]")
+_LARGE_REPETITION_RE = re.compile(r"\{\s*([0-9]+)\s*,?\s*[0-9]*\s*\}")
+_LARGE_REPETITION_THRESHOLD = 10
+
+
+def _parse_match_type(value: str) -> str:
+    lowered = value.strip().lower()
+    if lowered not in ("contains", "regex"):
+        raise typer.BadParameter(
+            f"--match must be 'contains' or 'regex', got {value!r}", param_hint="--match"
+        )
+    return lowered
+
+
+def _validate_rule_pattern(pattern: str, match_type: str) -> None:
+    """Refuse syntactically invalid or heuristically ReDoS-prone patterns.
+
+    Best-effort check at write time. The load-bearing runtime defense is
+    the existing ``query_sql`` statement-timeout watchdog
+    (GOETTA_FINANCE_SQL_TIMEOUT_SECONDS, default 30s), which bounds any
+    pattern that slips past these heuristics. See CLAUDE.md "Don'ts" →
+    rule-pattern surface for the threat model.
+
+    Three layers, fastest first:
+      1. Non-empty + length cap.
+      2. For ``regex``: ``re.compile()`` — catches syntax errors.
+      3. For ``regex``: heuristic shape detector — refuses obviously
+         ReDoS-prone constructs (nested quantifiers; large counted
+         repetitions). False-positive rate is low; the heuristic is
+         conservative on purpose since legitimate finance-merchant
+         patterns are short.
+    """
+    if not pattern.strip():
+        raise typer.BadParameter("pattern cannot be empty", param_hint="--pattern")
+    if len(pattern) > _PATTERN_MAX_LEN:
+        raise typer.BadParameter(
+            f"pattern is too long (>{_PATTERN_MAX_LEN} chars)", param_hint="--pattern"
+        )
+    if match_type == "contains":
+        return
+    if match_type != "regex":
+        raise typer.BadParameter(
+            f"--match must be 'contains' or 'regex', got {match_type!r}",
+            param_hint="--match",
+        )
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise typer.BadParameter(f"regex did not compile: {exc}", param_hint="--pattern") from exc
+
+    if _NESTED_QUANTIFIER_RE.search(pattern):
+        raise typer.BadParameter(
+            "pattern contains a nested quantifier (e.g. (X+)+ or (X*)*); "
+            "this is the canonical ReDoS shape and is refused. Rewrite "
+            "without the outer quantifier or use 'contains' instead.",
+            param_hint="--pattern",
+        )
+    for match in _LARGE_REPETITION_RE.finditer(pattern):
+        try:
+            n = int(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if n > _LARGE_REPETITION_THRESHOLD:
+            raise typer.BadParameter(
+                f"pattern uses a counted repetition with N={n} "
+                f"(>{_LARGE_REPETITION_THRESHOLD}); refused as ReDoS-prone.",
+                param_hint="--pattern",
+            )
+
+
+def _suggest_category(store: DuckDBStore, user_input: str) -> str:
+    """Return a ' Did you mean "X"?' or list-command fallback string.
+
+    Used to enrich the friendly error wording when the store raises
+    ``category not found``. Uses stdlib ``difflib`` for typo distance.
+    """
+    names = [c.name for c in store.get_categories()]
+    matches = difflib.get_close_matches(user_input, names, n=1, cutoff=0.6)
+    if matches:
+        return f' Did you mean "{matches[0]}"?'
+    return " Run `goetta-finance category list` to see available categories."
+
+
+def _is_category_not_found(exc: GoettaFinanceError) -> bool:
+    return "category not found" in str(exc).lower()
+
+
+@category_app.command("list")
+def category_list() -> None:
+    """List every category (defaults + user-added) with transaction + rule counts."""
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"category list failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        counts = store.category_counts()
+        rule_rows = store.conn.execute(
+            "SELECT c.name, COUNT(r.id) FROM categories c "
+            "LEFT JOIN category_rules r ON r.category_id = c.id "
+            "GROUP BY c.name"
+        ).fetchall()
+        rule_counts = {row[0]: int(row[1]) for row in rule_rows}
+        if not counts:
+            typer.echo("No categories yet.")
+            return
+        typer.echo(f"{'Category':<18} {'Default':<8} {'Txns':>6} {'Rules':>6}")
+        for c in counts:
+            default = "yes" if c["is_default"] else "no"
+            txns = int(c["transaction_count"])
+            rules = rule_counts.get(c["name"], 0)
+            typer.echo(f"{c['name']:<18} {default:<8} {txns:>6} {rules:>6}")
+    finally:
+        store.close()
+
+
+@category_app.command("add")
+def category_add(
+    name: Annotated[str, typer.Option("--name", help="Category display name.")],
+    color: Annotated[
+        str | None,
+        typer.Option("--color", help="Optional hex color like #27ae60."),
+    ] = None,
+) -> None:
+    """Add a new (non-default) category."""
+    if color is not None and not _HEX_COLOR_RE.match(color):
+        raise typer.BadParameter(
+            f"--color must be #RRGGBB (e.g. #27ae60), got {color!r}", param_hint="--color"
+        )
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"category add failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        cat = store.add_category(name, color)
+        typer.echo(f"Added category {cat.name} (id {cat.id}).")
+    except GoettaFinanceError as exc:
+        typer.secho(f"category add failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+@category_app.command("set-rule")
+def category_set_rule(
+    category_name: Annotated[
+        str, typer.Argument(help="Existing category name (case-insensitive).")
+    ],
+    match: Annotated[
+        str,
+        typer.Option("--match", help="Match type: 'contains' or 'regex'."),
+    ] = "contains",
+    pattern: Annotated[
+        str,
+        typer.Option("--pattern", help="Pattern to match against transaction description."),
+    ] = "",
+    priority: Annotated[
+        int,
+        typer.Option(
+            "--priority",
+            help="Lower number = higher precedence when multiple rules match (default 100).",
+        ),
+    ] = 100,
+) -> None:
+    """Add a categorization rule. Patterns are validated against a 1s ReDoS smoke test."""
+    match_type = _parse_match_type(match)
+    _validate_rule_pattern(pattern, match_type)
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"category set-rule failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        rule_id = store.add_rule(
+            category_name, match_type=match_type, pattern=pattern, priority=priority
+        )
+        typer.echo(
+            f"Added rule {rule_id}: {category_name} {match_type} {pattern!r} (priority {priority})."
+        )
+    except GoettaFinanceError as exc:
+        suffix = _suggest_category(store, category_name) if _is_category_not_found(exc) else ""
+        typer.secho(f"category set-rule failed: {exc}.{suffix}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+@category_app.command("remove-rule")
+def category_remove_rule(
+    rule_id: Annotated[int, typer.Argument(help="Rule id (see `category default-rules`).")],
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Required to remove a default (is_default=TRUE) rule."),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", help="Skip the typed-pattern confirmation prompt (for scripts)."),
+    ] = False,
+) -> None:
+    """Remove a rule. Defaults require ``--force`` and a typed-pattern confirmation."""
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"category remove-rule failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        row = store.conn.execute(
+            "SELECT r.is_default, r.pattern, r.match_type, c.name "
+            "FROM category_rules r JOIN categories c ON c.id = r.category_id "
+            "WHERE r.id = ?",
+            [rule_id],
+        ).fetchone()
+        if row is None:
+            typer.secho(f"rule not found: {rule_id}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+        is_default, pattern, match_type, cat_name = (
+            bool(row[0]),
+            str(row[1]),
+            str(row[2]),
+            str(row[3]),
+        )
+        if is_default and not force:
+            typer.secho(
+                f"refusing to remove default rule {rule_id} "
+                f"({cat_name} {match_type} {pattern!r}) without --force.",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if is_default and not yes:
+            typer.echo(
+                f"This will remove default rule {rule_id}: {cat_name} {match_type} {pattern!r}."
+            )
+            typed = typer.prompt("Type the pattern to confirm").strip()
+            if typed != pattern:
+                typer.secho("Pattern did not match. Aborted.", fg=typer.colors.RED, err=True)
+                raise typer.Exit(code=1)
+        store.remove_rule(rule_id, force=force)
+        typer.echo(f"Removed rule {rule_id} ({cat_name} {match_type} {pattern!r}).")
+    except GoettaFinanceError as exc:
+        typer.secho(f"category remove-rule failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+@category_app.command("default-rules")
+def category_default_rules() -> None:
+    """List the seeded default rules (is_default = TRUE), grouped by category."""
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"category default-rules failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        rows = store.conn.execute(
+            "SELECT c.name, r.id, r.match_type, r.pattern, r.priority "
+            "FROM category_rules r JOIN categories c ON c.id = r.category_id "
+            "WHERE r.is_default = TRUE "
+            "ORDER BY c.name, r.priority, r.pattern"
+        ).fetchall()
+        if not rows:
+            typer.echo("No default rules found (was the 0004 migration applied?).")
+            return
+        current_cat: str | None = None
+        for cat_name, rid, mtype, pattern, priority in rows:
+            if cat_name != current_cat:
+                if current_cat is not None:
+                    typer.echo("")
+                typer.secho(f"{cat_name} (priority {priority}, {mtype}):", bold=True)
+                current_cat = cat_name
+            typer.echo(f"  [rule {rid}]  {pattern}")
+    finally:
+        store.close()
+
+
+@transaction_app.command("categorize")
+def transaction_categorize(
+    transaction_id: Annotated[str, typer.Argument(help="Transaction id (from get_transactions).")],
+    category_name: Annotated[str, typer.Argument(help="Category name (case-insensitive).")],
+) -> None:
+    """Set a manual category override for one transaction. Beats any rule match."""
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"transaction categorize failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        store.set_transaction_override(transaction_id, category_name)
+        typer.echo(f"Categorized {transaction_id} as {category_name}.")
+    except GoettaFinanceError as exc:
+        suffix = _suggest_category(store, category_name) if _is_category_not_found(exc) else ""
+        typer.secho(
+            f"transaction categorize failed: {exc}.{suffix}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+@transaction_app.command("uncategorize")
+def transaction_uncategorize(
+    transaction_id: Annotated[str, typer.Argument(help="Transaction id to clear the override on.")],
+) -> None:
+    """Clear a manual category override. Idempotent — no-op if none was set."""
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"transaction uncategorize failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        store.clear_transaction_override(transaction_id)
+        typer.echo(f"Cleared override for {transaction_id}.")
+    except GoettaFinanceError as exc:
+        typer.secho(f"transaction uncategorize failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
     finally:
         store.close()

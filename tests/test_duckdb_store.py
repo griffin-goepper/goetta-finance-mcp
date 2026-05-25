@@ -787,6 +787,33 @@ def test_remove_rule_unknown_id_raises(store: DuckDBStore) -> None:
         store.remove_rule(999999)
 
 
+def test_add_rule_case_insensitive_category_name(store: DuckDBStore) -> None:
+    """User-supplied category names resolve case-insensitively to the
+    canonical row. The FK on the new rule still points at the canonical
+    'Dining' id, so the view + counts + listings all see it correctly."""
+    rule_id = store.add_rule("dining", match_type="contains", pattern="ZZZ-CASE", priority=10)
+    # Canonical 'Dining' row id.
+    dining = next(c for c in store.get_categories() if c.name == "Dining")
+    rule_row = store.conn.execute(
+        "SELECT category_id FROM category_rules WHERE id = ?", [rule_id]
+    ).fetchone()
+    assert rule_row is not None
+    assert int(rule_row[0]) == dining.id
+
+
+def test_set_transaction_override_case_insensitive_category_name(
+    store: DuckDBStore,
+) -> None:
+    """Same case-insensitivity applies to override-setting; the view
+    returns the canonical category name regardless of input case."""
+    _seed_cat_account(store)
+    store.upsert_transactions([_txn("t-cs", "ZZZ unmatched")])
+    store.set_transaction_override("t-cs", "groceries")
+    rows = store.get_transactions_with_category()
+    assert len(rows) == 1
+    assert rows[0]["category"] == "Groceries"
+
+
 def test_get_transactions_category_filter(store: DuckDBStore) -> None:
     """``get_transactions(category=...)`` routes through the view but
     still returns ``Transaction`` objects (no category field on the

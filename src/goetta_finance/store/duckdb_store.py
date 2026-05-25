@@ -652,7 +652,7 @@ class DuckDBStore:
             raise StoreError(f"match_type must be 'contains' or 'regex', got {match_type!r}")
         with self._lock:
             cat_row = self.conn.execute(
-                "SELECT id FROM categories WHERE name = ?", [category_name]
+                "SELECT id FROM categories WHERE lower(name) = lower(?)", [category_name]
             ).fetchone()
             if cat_row is None:
                 raise StoreError(f"category not found: {category_name}")
@@ -693,7 +693,7 @@ class DuckDBStore:
     def set_transaction_override(self, transaction_id: str, category_name: str) -> None:
         with self._lock:
             cat_row = self.conn.execute(
-                "SELECT id FROM categories WHERE name = ?", [category_name]
+                "SELECT id FROM categories WHERE lower(name) = lower(?)", [category_name]
             ).fetchone()
             if cat_row is None:
                 raise StoreError(f"category not found: {category_name}")
