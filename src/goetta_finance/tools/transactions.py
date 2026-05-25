@@ -8,6 +8,10 @@ from goetta_finance.store import FinanceStore
 
 
 def serialize_transaction(t: Transaction) -> dict[str, Any]:
+    """Pydantic Transaction → JSON-friendly dict. Used by callers that
+    still consume ``store.get_transactions`` directly (the web dashboard).
+    The MCP ``get_transactions`` tool uses ``_serialize_row_with_category``
+    instead so the resolved category is always present."""
     return {
         "id": t.id,
         "account_id": t.account_id,
@@ -20,22 +24,54 @@ def serialize_transaction(t: Transaction) -> dict[str, Any]:
     }
 
 
+def _serialize_row_with_category(row: dict[str, Any]) -> dict[str, Any]:
+    """Row from ``store.get_transactions_with_category`` → MCP-tool dict.
+
+    Same key set as ``serialize_transaction`` PLUS ``category`` and
+    ``category_color``. Category is never ``None`` — the view falls back
+    to literal ``"Uncategorized"`` so Claude always gets a string.
+    """
+    posted = row["posted"]
+    transacted_at = row.get("transacted_at")
+    return {
+        "id": row["id"],
+        "account_id": row["account_id"],
+        "posted": posted.isoformat() if isinstance(posted, datetime) else str(posted),
+        "transacted_at": (
+            transacted_at.isoformat() if isinstance(transacted_at, datetime) else None
+        ),
+        "amount": str(row["amount"]),
+        "description": row["description"],
+        "payee": row.get("payee"),
+        "memo": row.get("memo"),
+        "category": row["category"],
+        "category_color": row.get("category_color"),
+    }
+
+
 def get_transactions(
     store: FinanceStore,
     *,
     account_id: str | None = None,
     start: datetime | None = None,
     end: datetime | None = None,
+    category: str | None = None,
     search: str | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
-    txns = store.get_transactions(account_id=account_id, start=start, end=end, limit=limit)
+    """MCP-tool wrapper. Always routes through the
+    ``transactions_with_category`` view so every returned dict carries a
+    resolved ``category`` field. The view JOIN cost is bounded
+    (test_get_transactions_view_route_perf_under_10k pins it)."""
+    rows = store.get_transactions_with_category(
+        account_id=account_id, start=start, end=end, category=category, limit=limit
+    )
     if search:
         needle = search.lower()
-        txns = [
-            t
-            for t in txns
-            if needle in t.description.lower()
-            or (t.payee is not None and needle in t.payee.lower())
+        rows = [
+            r
+            for r in rows
+            if needle in r["description"].lower()
+            or (r.get("payee") is not None and needle in r["payee"].lower())
         ]
-    return [serialize_transaction(t) for t in txns]
+    return [_serialize_row_with_category(r) for r in rows]

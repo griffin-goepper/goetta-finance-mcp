@@ -70,7 +70,101 @@ async def test_server_lists_expected_tools(store: DuckDBStore) -> None:
             "sql_query",
             "sync_now",
             "sync_status",
+            "spending_by_category",
         }
+
+
+@pytest.mark.anyio
+async def test_server_spending_by_category_e2e(store: DuckDBStore) -> None:
+    """Full MCP round-trip: seed transactions, call the tool through the
+    client session, decode the structured result, assert shape + sort."""
+    store.upsert_accounts(
+        [
+            Account(
+                id="e2e-a1",
+                org_name="Test",
+                name="Checking",
+                balance=Decimal("100.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.CHECKING,
+            )
+        ]
+    )
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="e2e-sbux",
+                account_id="e2e-a1",
+                posted=datetime(2026, 5, 5, tzinfo=UTC),
+                amount=Decimal("-12.50"),
+                description="STARBUCKS STORE #1",
+            ),
+            Transaction(
+                id="e2e-kroger",
+                account_id="e2e-a1",
+                posted=datetime(2026, 5, 10, tzinfo=UTC),
+                amount=Decimal("-87.45"),
+                description="KROGER #999",
+            ),
+        ]
+    )
+    mcp = build_server(store)
+    async with create_connected_server_and_client_session(mcp) as session:
+        await session.initialize()
+        result = await session.call_tool(
+            "spending_by_category",
+            {
+                "start": "2026-05-01T00:00:00Z",
+                "end": "2026-05-31T23:59:59Z",
+            },
+        )
+    payload = _decode(result)
+    assert isinstance(payload, list)
+    cats = [r["category"] for r in payload]
+    assert "Dining" in cats
+    assert "Groceries" in cats
+    # Sorted descending by total: Groceries (87.45) > Dining (12.50).
+    by_cat = {r["category"]: r for r in payload}
+    assert Decimal(by_cat["Groceries"]["total"]) > Decimal(by_cat["Dining"]["total"])
+
+
+def test_schema_hint_mentions_categorization_tables() -> None:
+    """Floor: identifier markers present. If a future schema slice
+    adds a table or flag, this test fails until the hint is updated."""
+    from goetta_finance.server import SQL_SCHEMA_HINT
+
+    for marker in (
+        "is_manual",
+        "is_liability",
+        "categories",
+        "category_rules",
+        "transaction_overrides",
+        "transactions_with_category",
+    ):
+        assert marker in SQL_SCHEMA_HINT, f"SQL_SCHEMA_HINT missing {marker!r}"
+
+
+def test_schema_hint_communicates_categorization_semantics() -> None:
+    """Ceiling: load-bearing phrases present. The identifier-only test
+    above catches a missing table name, but it doesn't catch a rewrite
+    that keeps the names while losing the *meaning* (e.g. drops the
+    retroactivity property, or fails to point Claude at
+    spending_by_category over ad-hoc SQL). These phrases are what the
+    hint is actually supposed to communicate."""
+    from goetta_finance.server import SQL_SCHEMA_HINT
+
+    expected_phrases = [
+        "read time",  # retroactivity property
+        "transaction_overrides",  # override-beats-rule resolution
+        "Uncategorized",  # fallback default
+        "spending_by_category",  # tool-preference guidance
+    ]
+    for phrase in expected_phrases:
+        assert phrase in SQL_SCHEMA_HINT, (
+            f"SQL_SCHEMA_HINT missing semantic phrase: {phrase!r}. The "
+            "identifier names alone don't tell Claude how to use the "
+            "view; please re-check the categorization paragraph."
+        )
 
 
 @pytest.mark.anyio
@@ -148,9 +242,7 @@ class _FakeClient:
     def release(self) -> None:
         self.proceed.set()
 
-    def fetch_chunked(
-        self, start: datetime, end: datetime, chunk_days: int = 60
-    ) -> Any:
+    def fetch_chunked(self, start: datetime, end: datetime, chunk_days: int = 60) -> Any:
         self.fetch_count += 1
         self.fetch_started.set()
         if not self.proceed.wait(timeout=5):
@@ -264,9 +356,7 @@ async def test_lazy_sync_lock_prevents_double_trigger(
         await session.call_tool("list_accounts", {})
     client.release()
     assert client.fetch_finished.wait(timeout=3)
-    assert client.fetch_count == 1, (
-        f"expected one bg sync under the lock, got {client.fetch_count}"
-    )
+    assert client.fetch_count == 1, f"expected one bg sync under the lock, got {client.fetch_count}"
 
 
 @pytest.fixture

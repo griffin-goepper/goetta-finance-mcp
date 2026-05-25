@@ -15,6 +15,9 @@ from goetta_finance.tools.accounts import list_accounts as _list_accounts
 from goetta_finance.tools.balance_history import (
     account_balance_history as _account_balance_history,
 )
+from goetta_finance.tools.spending_by_category import (
+    spending_by_category as _spending_by_category,
+)
 from goetta_finance.tools.sql_query import sql_query as _sql_query
 from goetta_finance.tools.sync_now import sync_now as _sync_now
 from goetta_finance.tools.transactions import get_transactions as _get_transactions
@@ -83,6 +86,29 @@ math, use CASE WHEN is_liability THEN -ABS(balance) ELSE balance END to get
 the signed contribution per account — a liability always reduces net worth
 regardless of how the source signs the balance.
 
+Categorization tables (migration 0004):
+  categories(id, name, display_color, is_default)
+  category_rules(id, category_id, match_type, pattern, priority, is_default)
+  transaction_overrides(transaction_id, category_id, created_at)
+
+Per-transaction category resolves at read time through the
+transactions_with_category view, which exposes every transactions column
+plus `category` and `category_color`. Resolution order: if a row in
+transaction_overrides exists for the transaction, that override wins;
+otherwise the lowest-priority matching rule in category_rules wins
+(match_type 'contains' is a case-insensitive substring on description,
+match_type 'regex' is a DuckDB regexp_matches call); otherwise the
+fallback literal 'Uncategorized' is returned. Rule and override changes
+apply retroactively to every existing transaction without backfill —
+this is the whole point of read-time resolution; do not write a
+category_id column on transactions.
+
+For category-aware queries prefer transactions_with_category over the
+bare transactions table. For "what did I spend on X" questions prefer
+the spending_by_category tool over ad-hoc SQL; it already enforces the
+Income-default-excluded semantics (spending = negative amounts only,
+returned as positive dollar values) and the include_income opt-in.
+
 Money columns are DECIMAL(18,2); timestamps are TIMESTAMP in UTC. Transaction
 `amount` is signed (negative = money out). Results are well-suited to be
 visualized as an inline chart artifact when the user asks for a visualization.
@@ -112,8 +138,10 @@ def build_server(
     @mcp.tool(
         description=(
             "Get transactions, optionally filtered by account, date range, "
-            "or text search across description/payee. For aggregations like "
-            "'spending by category' prefer sql_query."
+            "category, or text search across description/payee. Every row "
+            "returned carries a resolved `category` field (falling back to "
+            "'Uncategorized'). For aggregations like 'spending by category' "
+            "prefer the spending_by_category tool."
         )
     )
     def get_transactions(
@@ -123,6 +151,16 @@ def build_server(
         ] = None,
         end: Annotated[
             datetime | None, Field(description="Inclusive UTC end of posted date.")
+        ] = None,
+        category: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Filter to transactions resolving to this category "
+                    "(case-sensitive; see list_accounts-equivalent "
+                    "categories table for canonical names)."
+                )
+            ),
         ] = None,
         search: Annotated[
             str | None,
@@ -136,9 +174,34 @@ def build_server(
             account_id=account_id,
             start=start,
             end=end,
+            category=category,
             search=search,
             limit=limit,
         )
+
+    @mcp.tool(
+        description=(
+            "Returns categorized spending totals (negative amounts only, "
+            "returned as positive dollar values). Income is excluded by "
+            "default; pass include_income=True to include it as a row "
+            "with negative magnitude indicating cash in."
+        )
+    )
+    def spending_by_category(
+        start: Annotated[datetime, Field(description="Inclusive UTC start of posted date.")],
+        end: Annotated[datetime, Field(description="Inclusive UTC end of posted date.")],
+        include_income: Annotated[
+            bool,
+            Field(
+                description=(
+                    "When True, include the Income category as a row whose "
+                    "`total` is negative (cash in)."
+                )
+            ),
+        ] = False,
+    ) -> list[dict[str, Any]]:
+        _maybe_trigger_lazy_sync(store, client)
+        return _spending_by_category(store, start, end, include_income=include_income)
 
     @mcp.tool(
         description=(
