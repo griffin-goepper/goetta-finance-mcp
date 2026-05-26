@@ -206,28 +206,68 @@ def test_spending_by_category_aggregation(store: DuckDBStore) -> None:
     assert [r["category"] for r in rows][:2] == ["Groceries", "Dining"]
 
 
-def test_spending_by_category_excludes_income_by_default(store: DuckDBStore) -> None:
+def test_spending_by_category_excludes_non_spending_by_default(
+    store: DuckDBStore,
+) -> None:
+    """Categories with is_spending=FALSE (Transfers, Income, any user-
+    flagged ones) don't appear in the default result. Migration 0006
+    seeded Transfers and Income as non-spending."""
     _seed_cat(store)
+    # Seed a Transfers transaction in addition to the Income one from _seed_cat.
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="t-xfer",
+                account_id="cat-a1",
+                posted=datetime(2026, 5, 20, tzinfo=UTC),
+                amount=Decimal("-500.00"),
+                description="ZZZ-XFER-DESC",
+            )
+        ]
+    )
+    store.set_transaction_override("t-xfer", "Transfers")
+
     rows = spending_by_category(
         store, datetime(2026, 5, 1, tzinfo=UTC), datetime(2026, 5, 31, tzinfo=UTC)
     )
-    assert "Income" not in {r["category"] for r in rows}
+    cats = {r["category"] for r in rows}
+    assert "Income" not in cats
+    assert "Transfers" not in cats
 
 
-def test_spending_by_category_includes_income_with_opt_in_negative_total(
+def test_spending_by_category_includes_non_spending_with_opt_in(
     store: DuckDBStore,
 ) -> None:
-    """The Income row's total is negative because SUM(-amount) over a
-    positive-amount paycheck = negative magnitude (cash in)."""
+    """include_non_spending=True surfaces both Income (negative total —
+    cash in) and Transfers (positive total — outflow on the source
+    account). Income's sign conveys direction."""
     _seed_cat(store)
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="t-xfer-2",
+                account_id="cat-a1",
+                posted=datetime(2026, 5, 20, tzinfo=UTC),
+                amount=Decimal("-500.00"),
+                description="ZZZ-XFER-DESC2",
+            )
+        ]
+    )
+    store.set_transaction_override("t-xfer-2", "Transfers")
+
     rows = spending_by_category(
         store,
         datetime(2026, 5, 1, tzinfo=UTC),
         datetime(2026, 5, 31, tzinfo=UTC),
-        include_income=True,
+        include_non_spending=True,
     )
-    income = next(r for r in rows if r["category"] == "Income")
+    by_cat = {r["category"]: r for r in rows}
+    income = by_cat["Income"]
+    transfers = by_cat["Transfers"]
+    # Income: positive-amount paycheck → SUM(-amount) is negative.
     assert Decimal(income["total"]) == Decimal("-3000.00")
+    # Transfers: negative-amount outflow → SUM(-amount) is positive.
+    assert Decimal(transfers["total"]) == Decimal("500.00")
 
 
 def test_spending_by_category_excludes_rule_resolved_refund_in_default(

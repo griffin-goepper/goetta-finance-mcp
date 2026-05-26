@@ -137,6 +137,7 @@ def test_schema_hint_mentions_categorization_tables() -> None:
         "is_manual",
         "is_liability",
         "is_hidden",
+        "is_spending",
         "categories",
         "category_rules",
         "transaction_overrides",
@@ -161,6 +162,7 @@ def test_schema_hint_communicates_categorization_semantics() -> None:
         "Uncategorized",  # fallback default
         "spending_by_category",  # tool-preference guidance
         "preserved across",  # user-owned flag preservation guarantee (0005)
+        "non-spending",  # is_spending semantic guarantee (0006)
     ]
     for phrase in expected_phrases:
         assert phrase in SQL_SCHEMA_HINT, (

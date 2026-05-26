@@ -660,10 +660,17 @@ class DuckDBStore:
     def get_categories(self) -> list[Category]:
         with self._lock:
             rows = self.conn.execute(
-                "SELECT id, name, display_color, is_default FROM categories ORDER BY name"
+                "SELECT id, name, display_color, is_default, is_spending "
+                "FROM categories ORDER BY name"
             ).fetchall()
         return [
-            Category(id=int(r[0]), name=r[1], display_color=r[2], is_default=bool(r[3]))
+            Category(
+                id=int(r[0]),
+                name=r[1],
+                display_color=r[2],
+                is_default=bool(r[3]),
+                is_spending=bool(r[4]),
+            )
             for r in rows
         ]
 
@@ -691,7 +698,17 @@ class DuckDBStore:
             rows = cur.fetchall()
         return [dict(zip(columns, row, strict=True)) for row in rows]
 
-    def add_category(self, name: str, display_color: str | None = None) -> Category:
+    def add_category(
+        self,
+        name: str,
+        display_color: str | None = None,
+        *,
+        is_spending: bool = True,
+    ) -> Category:
+        """Insert a new category. Defaults to is_spending=True. Pass
+        ``is_spending=False`` for categories that shouldn't show up in
+        the dashboard's "By category" pie or `spending_by_category`
+        results (Transfers, Income, payroll deductions, etc.)."""
         name = name.strip()
         if not name:
             raise StoreError("category name cannot be empty")
@@ -699,17 +716,43 @@ class DuckDBStore:
             try:
                 row = self.conn.execute(
                     """
-                    INSERT INTO categories (name, display_color, is_default)
-                    VALUES (?, ?, FALSE)
-                    RETURNING id, name, display_color, is_default
+                    INSERT INTO categories (name, display_color, is_default, is_spending)
+                    VALUES (?, ?, FALSE, ?)
+                    RETURNING id, name, display_color, is_default, is_spending
                     """,
-                    [name, display_color],
+                    [name, display_color, is_spending],
                 ).fetchone()
             except duckdb.Error as exc:
                 raise StoreError(f"add_category failed: {exc}") from exc
         if row is None:
             raise StoreError("add_category did not return a row")
-        return Category(id=int(row[0]), name=row[1], display_color=row[2], is_default=bool(row[3]))
+        return Category(
+            id=int(row[0]),
+            name=row[1],
+            display_color=row[2],
+            is_default=bool(row[3]),
+            is_spending=bool(row[4]),
+        )
+
+    def set_category_spending(self, name: str, is_spending: bool) -> None:
+        """Toggle the ``is_spending`` flag on an existing category.
+
+        Categories where ``is_spending=FALSE`` are excluded by default
+        from ``spending_by_category`` results and the dashboard's
+        "Spending by category" pie. ``Transfers`` and ``Income`` are
+        non-spending by default (set by migration 0006); the user can
+        flip the flag on any other category via this method.
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM categories WHERE lower(name) = lower(?)", [name]
+            ).fetchone()
+            if row is None:
+                raise StoreError(f"category not found: {name}")
+            self.conn.execute(
+                "UPDATE categories SET is_spending = ? WHERE lower(name) = lower(?)",
+                [is_spending, name],
+            )
 
     def add_rule(
         self,

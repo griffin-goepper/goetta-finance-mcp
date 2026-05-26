@@ -141,6 +141,20 @@ A passing PR-equivalent change has: `ruff check` clean, `mypy --strict` clean, a
 
 Users who deleted or edited a default rule must not see it silently re-seeded; the migration-stamp convention is the safeguard.
 
+### Adding a boolean flag (the `is_X` pattern)
+
+There are now five `is_X BOOLEAN DEFAULT` columns across two tables, following one consistent shape: `is_manual` (0002), `is_liability` (0003), `is_hidden` (0005) on `accounts`; `is_default` (0004), `is_spending` (0006) on `categories`. When you need another, follow the template:
+
+1. New migration file `000N_<short_name>.sql`. `ALTER TABLE <table> ADD COLUMN is_X BOOLEAN DEFAULT <FALSE|TRUE>;` plus an `UPDATE ... SET is_X = ... WHERE ...` if specific existing rows should flip (e.g., 0006 flips `Transfers` and `Income` to FALSE). DuckDB ALTER TABLE doesn't support inline NOT NULL, so always use DEFAULT; the Python layer reads NULL as False.
+2. Add the field to the pydantic model (`Account` or `Category`) with the same default as the SQL DEFAULT.
+3. Extend the corresponding `_row_to_<model>` mapper in `duckdb_store.py` to read the new column.
+4. If the flag is **account-user-owned** (like `is_liability` / `is_hidden`), add the column name to `_USER_OWNED_COLUMNS` so the upsert preserves it across syncs. Forgetting this is the silent-clobber bug from the hide-accounts slice — pinned by `test_user_owned_flags_survive_sync`.
+5. Add a setter method (`set_<table>_<flag>`) mirroring `set_account_liability` / `set_category_spending`. Use the case-insensitive lookup pattern for category names (`WHERE lower(name) = lower(?)`).
+6. Update `FinanceStore` Protocol in `store/__init__.py`.
+7. Add a CLI subcommand to flip the flag — mirror the `set-liability` / `set-spending` shape (typed `_parse_bool`, friendly errors via `_suggest_category` if relevant).
+8. Update `SQL_SCHEMA_HINT` with a paragraph naming the flag, what it means, what filters on it by default, and what the opt-in is. Extend `test_schema_hint_mentions_categorization_tables` and `test_schema_hint_communicates_categorization_semantics` markers as needed.
+9. Tests: migration-applied marker, default round-trip, set-flag round-trip, set-flag-raises-on-unknown, default read paths filter it (or include it) as designed.
+
 ## Things to avoid
 
 - **Don't write your own JSON parser for SimpleFIN responses.** Use pydantic.

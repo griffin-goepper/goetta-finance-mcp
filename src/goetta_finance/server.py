@@ -122,8 +122,19 @@ category_id column on transactions.
 For category-aware queries prefer transactions_with_category over the
 bare transactions table. For "what did I spend on X" questions prefer
 the spending_by_category tool over ad-hoc SQL; it already enforces the
-Income-default-excluded semantics (spending = negative amounts only,
-returned as positive dollar values) and the include_income opt-in.
+non-spending-categories-excluded semantic (spending = negative amounts
+only, returned as positive dollar values; non-spending categories like
+Transfers and Income are excluded by default) and the
+include_non_spending opt-in.
+
+The categories table carries an is_spending boolean (default TRUE) for
+each category. Transfers and Income are seeded with is_spending=FALSE
+by migration 0006 because money moving to your own accounts (Transfers)
+or income (Income) isn't spending. Users can add their own non-spending
+categories via `goetta-finance category add --no-spending` or toggle
+existing ones with `category set-spending <name> <bool>`. The
+spending_by_category tool joins categories on the resolved name and
+filters WHERE c.is_spending = TRUE by default.
 
 Money columns are DECIMAL(18,2); timestamps are TIMESTAMP in UTC. Transaction
 `amount` is signed (negative = money out). Results are well-suited to be
@@ -222,26 +233,30 @@ def build_server(
     @mcp.tool(
         description=(
             "Returns categorized spending totals (negative amounts only, "
-            "returned as positive dollar values). Income is excluded by "
-            "default; pass include_income=True to include it as a row "
-            "with negative magnitude indicating cash in."
+            "returned as positive dollar values). Non-spending categories "
+            "(Transfers, Income, and any category with is_spending=FALSE) "
+            "are excluded by default; pass include_non_spending=True to "
+            "include them. Income rows come back with a negative total "
+            "(cash in); Transfers rows come back positive (cash leaving "
+            "the source account, but moving to one of your own accounts)."
         )
     )
     def spending_by_category(
         start: Annotated[datetime, Field(description="Inclusive UTC start of posted date.")],
         end: Annotated[datetime, Field(description="Inclusive UTC end of posted date.")],
-        include_income: Annotated[
+        include_non_spending: Annotated[
             bool,
             Field(
                 description=(
-                    "When True, include the Income category as a row whose "
-                    "`total` is negative (cash in)."
+                    "When True, include categories with is_spending=FALSE "
+                    "(Transfers, Income, etc.). Default False — matches the "
+                    "dashboard's Spending by category pie."
                 )
             ),
         ] = False,
     ) -> list[dict[str, Any]]:
         _maybe_trigger_lazy_sync(store, client)
-        return _spending_by_category(store, start, end, include_income=include_income)
+        return _spending_by_category(store, start, end, include_non_spending=include_non_spending)
 
     @mcp.tool(
         description=(

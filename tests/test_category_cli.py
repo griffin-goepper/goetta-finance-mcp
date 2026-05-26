@@ -152,6 +152,66 @@ def test_category_add_writes_non_default_row(fresh_home: Path) -> None:
     assert bool(row[1]) is False
 
 
+def test_category_add_no_spending_flag(fresh_home: Path) -> None:
+    """`category add --no-spending` writes a non-spending row."""
+    result = runner.invoke(app, ["category", "add", "--name", "MyNonSpend", "--no-spending"])
+    assert result.exit_code == 0, result.output
+    assert "[non-spending]" in result.output
+    store = DuckDBStore(fresh_home / "data.duckdb")
+    try:
+        cat = next(c for c in store.get_categories() if c.name == "MyNonSpend")
+        assert cat.is_spending is False
+    finally:
+        store.close()
+
+
+def test_category_set_spending_toggle(fresh_home: Path) -> None:
+    """set-spending flips the flag; list shows [non-spending] tag."""
+    result = runner.invoke(app, ["category", "set-spending", "Dining", "false"])
+    assert result.exit_code == 0, result.output
+    listed = runner.invoke(app, ["category", "list"])
+    assert listed.exit_code == 0
+    # Find the Dining row in the output
+    dining_line = next(ln for ln in listed.output.splitlines() if ln.startswith("Dining"))
+    assert "[non-spending]" in dining_line
+    # Flip back.
+    runner.invoke(app, ["category", "set-spending", "Dining", "true"])
+    listed = runner.invoke(app, ["category", "list"])
+    dining_line = next(ln for ln in listed.output.splitlines() if ln.startswith("Dining"))
+    assert "[non-spending]" not in dining_line
+
+
+def test_category_set_spending_case_insensitive(fresh_home: Path) -> None:
+    result = runner.invoke(app, ["category", "set-spending", "dining", "false"])
+    assert result.exit_code == 0, result.output
+    store = DuckDBStore(fresh_home / "data.duckdb")
+    try:
+        cats = {c.name: c for c in store.get_categories()}
+        assert cats["Dining"].is_spending is False
+    finally:
+        store.close()
+
+
+def test_category_set_spending_unknown_category_suggests(fresh_home: Path) -> None:
+    result = runner.invoke(app, ["category", "set-spending", "Dinning", "false"])
+    assert result.exit_code != 0
+    assert 'Did you mean "Dining"' in result.output
+
+
+def test_category_list_shows_non_spending_tag_for_defaults(fresh_home: Path) -> None:
+    """Transfers and Income are seeded as non-spending; the [non-spending]
+    tag must show in `category list`."""
+    result = runner.invoke(app, ["category", "list"])
+    assert result.exit_code == 0, result.output
+    transfers_line = next(ln for ln in result.output.splitlines() if ln.startswith("Transfers"))
+    income_line = next(ln for ln in result.output.splitlines() if ln.startswith("Income"))
+    assert "[non-spending]" in transfers_line
+    assert "[non-spending]" in income_line
+    # Dining is spending — no tag.
+    dining_line = next(ln for ln in result.output.splitlines() if ln.startswith("Dining"))
+    assert "[non-spending]" not in dining_line
+
+
 def test_category_add_rejects_bad_color(fresh_home: Path) -> None:
     result = runner.invoke(app, ["category", "add", "--name", "BadColor", "--color", "not-a-color"])
     assert result.exit_code != 0

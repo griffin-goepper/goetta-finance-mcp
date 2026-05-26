@@ -1163,15 +1163,17 @@ def category_list() -> None:
             "GROUP BY c.name"
         ).fetchall()
         rule_counts = {row[0]: int(row[1]) for row in rule_rows}
+        spending_flags = {c.name: c.is_spending for c in store.get_categories()}
         if not counts:
             typer.echo("No categories yet.")
             return
-        typer.echo(f"{'Category':<18} {'Default':<8} {'Txns':>6} {'Rules':>6}")
+        typer.echo(f"{'Category':<30} {'Default':<8} {'Txns':>6} {'Rules':>6}")
         for c in counts:
             default = "yes" if c["is_default"] else "no"
             txns = int(c["transaction_count"])
             rules = rule_counts.get(c["name"], 0)
-            typer.echo(f"{c['name']:<18} {default:<8} {txns:>6} {rules:>6}")
+            tag = "" if spending_flags.get(c["name"], True) else " [non-spending]"
+            typer.echo(f"{c['name'] + tag:<30} {default:<8} {txns:>6} {rules:>6}")
     finally:
         store.close()
 
@@ -1183,6 +1185,19 @@ def category_add(
         str | None,
         typer.Option("--color", help="Optional hex color like #27ae60."),
     ] = None,
+    spending: Annotated[
+        bool,
+        typer.Option(
+            "--spending/--no-spending",
+            help=(
+                "Whether this category counts as spending (default: yes). "
+                "Pass --no-spending for categories like inter-account "
+                "transfers, employer-side payroll deductions, or any "
+                "other category that shouldn't appear in the dashboard's "
+                "Spending by category pie or spending_by_category totals."
+            ),
+        ),
+    ] = True,
 ) -> None:
     """Add a new (non-default) category."""
     if color is not None and not _HEX_COLOR_RE.match(color):
@@ -1195,10 +1210,52 @@ def category_add(
         typer.secho(f"category add failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
     try:
-        cat = store.add_category(name, color)
-        typer.echo(f"Added category {cat.name} (id {cat.id}).")
+        cat = store.add_category(name, color, is_spending=spending)
+        tag = "" if cat.is_spending else " [non-spending]"
+        typer.echo(f"Added category {cat.name} (id {cat.id}){tag}.")
     except GoettaFinanceError as exc:
         typer.secho(f"category add failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+@category_app.command("set-spending")
+def category_set_spending(
+    name: Annotated[str, typer.Argument(help="Existing category name (case-insensitive).")],
+    value: Annotated[
+        str,
+        typer.Argument(help="true or false (also accepts yes/no/1/0)."),
+    ],
+) -> None:
+    """Toggle whether a category counts as spending.
+
+    Categories with is_spending=FALSE are excluded by default from the
+    dashboard's Spending by category pie and the spending_by_category
+    MCP tool. ``Transfers`` and ``Income`` ship as non-spending
+    (migration 0006). Use this command to add additional non-spending
+    categories — e.g. if you category-tag employer-side 401(k)
+    contributions and don't want them in your spending pie.
+    """
+    parsed = _parse_bool(value, field="value")
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"category set-spending failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        store.set_category_spending(name, parsed)
+        state = (
+            "is now counted as spending" if parsed else "is now non-spending (excluded by default)"
+        )
+        typer.echo(f"{name} {state}.")
+    except GoettaFinanceError as exc:
+        suffix = _suggest_category(store, name) if _is_category_not_found(exc) else ""
+        typer.secho(
+            f"category set-spending failed: {exc}.{suffix}",
+            fg=typer.colors.RED,
+            err=True,
+        )
         raise typer.Exit(code=1) from exc
     finally:
         store.close()

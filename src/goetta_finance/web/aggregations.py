@@ -165,7 +165,7 @@ def spending_by_category_last_n_days(
     """
     end = (now or datetime.now(tz=UTC)).astimezone(UTC)
     start = end - timedelta(days=days)
-    rows = query_spending_by_category(store, start, end, include_income=False)
+    rows = query_spending_by_category(store, start, end, include_non_spending=False)
     return [
         CategoryTotal(
             category=str(row["category"]),

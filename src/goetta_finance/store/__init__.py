@@ -66,7 +66,15 @@ class FinanceStore(Protocol):
 
     def category_counts(self) -> list[dict[str, Any]]: ...
 
-    def add_category(self, name: str, display_color: str | None = None) -> Category: ...
+    def add_category(
+        self,
+        name: str,
+        display_color: str | None = None,
+        *,
+        is_spending: bool = True,
+    ) -> Category: ...
+
+    def set_category_spending(self, name: str, is_spending: bool) -> None: ...
 
     def add_rule(
         self,

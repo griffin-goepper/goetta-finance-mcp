@@ -774,6 +774,59 @@ def _seed_cat_account(store: DuckDBStore) -> None:
     store.upsert_accounts([_account(id="acc-cat", balance="100.00")])
 
 
+def test_migration_0006_applied(store: DuckDBStore) -> None:
+    """Pin migration 0006 (is_spending flag on categories)."""
+    rows = store.conn.execute("SELECT name FROM schema_migrations").fetchall()
+    assert ("0006_spending_flag.sql",) in rows
+
+
+def test_default_non_spending_categories_seeded(store: DuckDBStore) -> None:
+    """Transfers and Income default to is_spending=FALSE; all others
+    default to TRUE. Migration 0006's UPDATE clause is the contract."""
+    cats = {c.name: c for c in store.get_categories()}
+    assert cats["Transfers"].is_spending is False
+    assert cats["Income"].is_spending is False
+    assert cats["Dining"].is_spending is True
+    assert cats["Groceries"].is_spending is True
+    assert cats["Uncategorized"].is_spending is True
+
+
+def test_add_category_honors_is_spending_flag(store: DuckDBStore) -> None:
+    """add_category(is_spending=False) writes a non-spending row."""
+    cat = store.add_category("PayrollDeduction", is_spending=False)
+    assert cat.is_spending is False
+    refetched = {c.name: c for c in store.get_categories()}
+    assert refetched["PayrollDeduction"].is_spending is False
+
+
+def test_add_category_defaults_to_spending(store: DuckDBStore) -> None:
+    cat = store.add_category("MyNewCat")
+    assert cat.is_spending is True
+
+
+def test_set_category_spending_toggle(store: DuckDBStore) -> None:
+    """Round-trip: flip Dining to non-spending and back."""
+    store.set_category_spending("Dining", False)
+    cats = {c.name: c for c in store.get_categories()}
+    assert cats["Dining"].is_spending is False
+    store.set_category_spending("Dining", True)
+    cats = {c.name: c for c in store.get_categories()}
+    assert cats["Dining"].is_spending is True
+
+
+def test_set_category_spending_case_insensitive(store: DuckDBStore) -> None:
+    """Matches the case-insensitive resolution pattern used elsewhere
+    for category lookups (add_rule, set_transaction_override)."""
+    store.set_category_spending("dining", False)
+    cats = {c.name: c for c in store.get_categories()}
+    assert cats["Dining"].is_spending is False
+
+
+def test_set_category_spending_raises_on_unknown_name(store: DuckDBStore) -> None:
+    with pytest.raises(StoreError, match="not found"):
+        store.set_category_spending("NoSuchCategory", False)
+
+
 def test_migration_0004_applied(store: DuckDBStore) -> None:
     """Pin the migration filename so re-runs of init() stay idempotent
     and so renaming the file forces a deliberate test update."""

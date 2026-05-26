@@ -31,7 +31,7 @@ def query_spending_by_category(
     start: datetime,
     end: datetime,
     *,
-    include_income: bool = False,
+    include_non_spending: bool = False,
 ) -> list[dict[str, Any]]:
     """Shared SQL helper — raw store rows, Decimal totals.
 
@@ -47,27 +47,31 @@ def query_spending_by_category(
     rule of three's predecessor. If a third caller emerges and the
     parameter shape gets awkward, this is the right place to widen.
 
-    Semantics: see ``spending_by_category`` docstring below.
+    Semantics: see ``spending_by_category`` docstring below. Default
+    behavior filters non-spending categories (Transfers, Income, any
+    category with ``is_spending=FALSE``) via a JOIN to the categories
+    table on the resolved category name.
     """
-    # Always filter transactions from hidden accounts. The MCP tool / web
-    # surface don't expose an include_hidden flag — hiding is a user
-    # statement that "this account doesn't count," and bleeding its
-    # transactions into category totals would defeat the point. Users who
-    # really want raw numbers reach for sql_query against the view
-    # directly.
-    base_where = "posted >= ? AND posted <= ? AND COALESCE(account_is_hidden, FALSE) = FALSE"
-    if include_income:
-        where = f"{base_where} AND (amount < 0 OR category = 'Income')"
+    # Filter transactions from hidden accounts always — hiding is a user
+    # statement that "this account doesn't count." Filter non-spending
+    # categories by default — driven by the categories.is_spending flag
+    # introduced in migration 0006, which replaced the hardcoded
+    # ``category <> 'Income'`` filter (Transfers, etc. needed similar
+    # treatment and a schema flag is the principled answer).
+    base_where = "t.posted >= ? AND t.posted <= ? AND COALESCE(t.account_is_hidden, FALSE) = FALSE"
+    if include_non_spending:
+        where = f"{base_where} AND (t.amount < 0 OR COALESCE(c.is_spending, TRUE) = FALSE)"
     else:
-        where = f"{base_where} AND amount < 0 AND category <> 'Income'"
+        where = f"{base_where} AND t.amount < 0 AND COALESCE(c.is_spending, TRUE) = TRUE"
     # ruff S608 / bandit B608: ``where`` is composed entirely of string
     # literals plus ``?`` placeholders that bind via the params list. No
     # user input is interpolated. Audited 2026-05.
     sql = f"""
-        SELECT category, SUM(-amount) AS total, COUNT(*) AS transaction_count
-        FROM transactions_with_category
+        SELECT t.category, SUM(-t.amount) AS total, COUNT(*) AS transaction_count
+        FROM transactions_with_category t
+        LEFT JOIN categories c ON c.name = t.category
         WHERE {where}
-        GROUP BY category
+        GROUP BY t.category
         ORDER BY total DESC
     """  # noqa: S608  # nosec B608
     return store.query_sql(sql, [start, end])
@@ -78,28 +82,34 @@ def spending_by_category(
     start: datetime,
     end: datetime,
     *,
-    include_income: bool = False,
+    include_non_spending: bool = False,
 ) -> list[dict[str, Any]]:
     """Aggregate spending totals per category between ``start`` and ``end``.
 
-    Default mode (``include_income=False``):
+    Default mode (``include_non_spending=False``):
         Sums ``SUM(-amount)`` over rows with ``amount < 0`` AND
-        ``category <> 'Income'``. Spending categories come back with
-        positive totals.
+        ``c.is_spending = TRUE`` (joining ``categories`` on the resolved
+        category name). Non-spending categories (Transfers, Income, any
+        user-added category with ``is_spending=FALSE``) are excluded.
+        Spending categories come back with positive totals.
 
-    ``include_income=True``:
-        Widens the filter to ``amount < 0 OR category = 'Income'``.
-        The Income category's source transactions are positive amounts,
-        so ``SUM(-amount)`` returns a negative total — sign conveys
-        direction (cash in). Spending categories are unchanged.
+    ``include_non_spending=True``:
+        Widens the filter to ``amount < 0 OR is_spending = FALSE``.
+        Non-spending categories appear:
+          - Income transactions are positive amounts, so ``SUM(-amount)``
+            returns a NEGATIVE total — sign conveys "cash in."
+          - Transfers transactions are negative amounts on the source
+            account, so they appear with a POSITIVE total — but it's
+            money moving to your own accounts, not spending.
+        Spending categories are unchanged.
 
     Both modes group by category, sort by total descending.
 
-    Refunds in non-Income categories (positive ``amount``, e.g. Dining
+    Refunds in spending categories (positive ``amount``, e.g. Dining
     refund) are NOT counted in either mode — the "amount < 0" filter
     enforces the literal "spending = money out" contract documented in
     the tool description. If dogfooding shows this matters for net-of-
     refunds analyses, a future ``include_refunds`` flag can be added.
     """
-    rows = query_spending_by_category(store, start, end, include_income=include_income)
+    rows = query_spending_by_category(store, start, end, include_non_spending=include_non_spending)
     return [{k: _serialize_value(v) for k, v in row.items()} for row in rows]

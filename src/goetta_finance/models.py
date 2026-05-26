@@ -65,6 +65,7 @@ class Category(BaseModel):
     name: str
     display_color: str | None = None
     is_default: bool = False
+    is_spending: bool = True
 
 
 class SyncRun(BaseModel):
