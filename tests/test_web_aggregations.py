@@ -309,6 +309,47 @@ def test_spending_by_category_last_n_days_excludes_outside_window(
     assert by_cat["Dining"].transaction_count == 1
 
 
+def test_net_worth_series_excludes_hidden_accounts(store: DuckDBStore) -> None:
+    """Seed two accounts with snapshots; hide one; net-worth series
+    should only contain contributions from the visible account.
+
+    Pins the JOIN filter in web/aggregations.py:net_worth_series — the
+    Fidelity-duplicate use case directly motivates this."""
+    store.upsert_accounts(
+        [
+            Account(
+                id="nw-vis",
+                org_name="Test",
+                name="Visible",
+                balance=Decimal("100.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.CHECKING,
+            ),
+            Account(
+                id="nw-hid",
+                org_name="Test",
+                name="Hidden",
+                balance=Decimal("999.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.CHECKING,
+            ),
+        ]
+    )
+    for acct_id, bal in [("nw-vis", "100"), ("nw-hid", "999")]:
+        store.record_balance_snapshot(
+            BalanceSnapshot(
+                account_id=acct_id,
+                timestamp=datetime(2026, 5, 1, tzinfo=UTC),
+                balance=Decimal(bal),
+            )
+        )
+    store.set_account_hidden("nw-hid", True)
+
+    series = net_worth_series(store, days=30, now=datetime(2026, 5, 16, tzinfo=UTC))
+    # Only the visible account contributes — total is 100, not 1099.
+    assert series[0].balance == Decimal("100")
+
+
 def test_spending_by_category_last_n_days_excludes_income(
     store: DuckDBStore,
 ) -> None:

@@ -123,6 +123,7 @@ def net_worth_series(
         FROM balance_snapshots bs
         JOIN accounts a ON a.id = bs.account_id
         WHERE bs.timestamp >= ?
+          AND COALESCE(a.is_hidden, FALSE) = FALSE
         ORDER BY bs.account_id, bs.timestamp
         """,
         [since],

@@ -80,11 +80,25 @@ Schema:
   sync_runs(id, started_at, finished_at, accounts_touched, transactions_new,
             transactions_updated, warnings, errors)
 
-Columns is_manual (account was added via CLI, not synced) and is_liability
-(account represents debt) are both boolean flags on accounts. For net-worth
-math, use CASE WHEN is_liability THEN -ABS(balance) ELSE balance END to get
-the signed contribution per account — a liability always reduces net worth
-regardless of how the source signs the balance.
+Columns is_manual (account was added via CLI, not synced), is_liability
+(account represents debt), and is_hidden (account excluded from default
+read paths) are user-controlled boolean flags on accounts. All three are
+preserved across SimpleFIN syncs — the sync only overwrites SimpleFIN-
+sourced columns (balance, available_balance, balance_date, name,
+org_name, type, extra). Users flip the flags via `goetta-finance account
+set-liability` / `set-hidden`. The flips apply retroactively: net-worth
+aggregation, the categorization view (transactions_with_category), and
+spending_by_category all join accounts and filter on these flags at
+read time, so toggling them changes historical computations without any
+backfill.
+
+For net-worth math, use CASE WHEN is_liability THEN -ABS(balance) ELSE
+balance END to get the signed contribution per account — a liability
+always reduces net worth regardless of how the source signs the balance.
+For "what does the user actually want to see" queries, filter
+WHERE NOT is_hidden (or COALESCE(is_hidden, FALSE) = FALSE) — the MCP
+tools and the dashboard apply this by default; raw sql_query callers
+opt in explicitly.
 
 Categorization tables (migration 0004):
   categories(id, name, display_color, is_default)
@@ -93,7 +107,9 @@ Categorization tables (migration 0004):
 
 Per-transaction category resolves at read time through the
 transactions_with_category view, which exposes every transactions column
-plus `category` and `category_color`. Resolution order: if a row in
+plus `category`, `category_color`, and `account_is_hidden` (sourced from
+the JOINed accounts row — filter on it to exclude transactions belonging
+to hidden accounts). Resolution order: if a row in
 transaction_overrides exists for the transaction, that override wins;
 otherwise the lowest-priority matching rule in category_rules wins
 (match_type 'contains' is a case-insensitive substring on description,
@@ -125,23 +141,37 @@ def build_server(
 
     @mcp.tool(
         description=(
-            "All accounts with current balance. No arguments. Use for 'what "
-            "accounts do I have' or 'what's my checking balance'. For deeper "
-            "analysis prefer sql_query. Call sync_status if the user asks "
-            "whether the data is current."
+            "All accounts with current balance. Hidden accounts (flag "
+            "set via `goetta-finance account set-hidden`) are excluded by "
+            "default; pass include_hidden=True to see them. Use for 'what "
+            "accounts do I have' or 'what's my checking balance'. For "
+            "deeper analysis prefer sql_query. Call sync_status if the "
+            "user asks whether the data is current."
         )
     )
-    def list_accounts() -> list[dict[str, Any]]:
+    def list_accounts(
+        include_hidden: Annotated[
+            bool,
+            Field(
+                description=(
+                    "When True, include accounts marked is_hidden. Default "
+                    "False (matches the dashboard and net-worth math)."
+                )
+            ),
+        ] = False,
+    ) -> list[dict[str, Any]]:
         _maybe_trigger_lazy_sync(store, client)
-        return _list_accounts(store)
+        return _list_accounts(store, include_hidden=include_hidden)
 
     @mcp.tool(
         description=(
             "Get transactions, optionally filtered by account, date range, "
             "category, or text search across description/payee. Every row "
             "returned carries a resolved `category` field (falling back to "
-            "'Uncategorized'). For aggregations like 'spending by category' "
-            "prefer the spending_by_category tool."
+            "'Uncategorized'). Transactions on hidden accounts are excluded "
+            "by default; pass include_hidden=True to include them. For "
+            "aggregations like 'spending by category' prefer the "
+            "spending_by_category tool."
         )
     )
     def get_transactions(
@@ -162,6 +192,15 @@ def build_server(
                 )
             ),
         ] = None,
+        include_hidden: Annotated[
+            bool,
+            Field(
+                description=(
+                    "When True, include transactions from accounts marked "
+                    "is_hidden. Default False (matches the dashboard)."
+                )
+            ),
+        ] = False,
         search: Annotated[
             str | None,
             Field(description="Case-insensitive substring of description or payee."),
@@ -175,6 +214,7 @@ def build_server(
             start=start,
             end=end,
             category=category,
+            include_hidden=include_hidden,
             search=search,
             limit=limit,
         )

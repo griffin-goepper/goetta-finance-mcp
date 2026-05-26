@@ -437,6 +437,69 @@ def test_account_set_liability_unknown_id_errors(fresh_home: Path) -> None:
     assert "not found" in result.output.lower()
 
 
+def test_account_set_hidden_round_trip(fresh_home: Path) -> None:
+    """set-hidden toggles the flag and `account list` surfaces it with a [hidden] tag."""
+    from datetime import UTC, datetime
+
+    from goetta_finance.models import Account, AccountType
+
+    store = DuckDBStore(fresh_home / "data.duckdb")
+    try:
+        store.upsert_accounts(
+            [
+                Account(
+                    id="ACT-stale-dup",
+                    org_name="Fidelity",
+                    name="401k duplicate",
+                    balance=Decimal("118084.70"),
+                    balance_date=datetime(2026, 5, 4, tzinfo=UTC),
+                    type=AccountType.INVESTMENT,
+                )
+            ]
+        )
+    finally:
+        store.close()
+
+    # Hide
+    on = runner.invoke(app, ["account", "set-hidden", "ACT-stale-dup", "true"])
+    assert on.exit_code == 0, on.output
+    assert "hidden" in on.output.lower()
+
+    # account list shows it WITH the [hidden] tag (discoverability).
+    listed = runner.invoke(app, ["account", "list"])
+    assert listed.exit_code == 0
+    assert "ACT-stale-dup" in listed.output
+    assert "[hidden]" in listed.output
+
+    # Default get_accounts filter excludes it.
+    store = DuckDBStore(fresh_home / "data.duckdb")
+    try:
+        assert store.get_accounts() == []
+        assert len(store.get_accounts(include_hidden=True)) == 1
+    finally:
+        store.close()
+
+    # Unhide
+    off = runner.invoke(app, ["account", "set-hidden", "ACT-stale-dup", "false"])
+    assert off.exit_code == 0, off.output
+    store = DuckDBStore(fresh_home / "data.duckdb")
+    try:
+        assert len(store.get_accounts()) == 1
+    finally:
+        store.close()
+
+
+def test_account_set_hidden_rejects_bad_boolean(fresh_home: Path) -> None:
+    result = runner.invoke(app, ["account", "set-hidden", "ACT-x", "maybe"])
+    assert result.exit_code != 0
+
+
+def test_account_set_hidden_unknown_id_errors(fresh_home: Path) -> None:
+    result = runner.invoke(app, ["account", "set-hidden", "ACT-does-not-exist", "true"])
+    assert result.exit_code != 0
+    assert "not found" in result.output.lower()
+
+
 def test_account_remove_force_yes_skips_prompt(fresh_home: Path) -> None:
     runner.invoke(
         app,

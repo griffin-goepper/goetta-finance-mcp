@@ -69,7 +69,7 @@ def register_routes(app: FastAPI) -> None:
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
         store = _store(request)
-        raw_accounts = store.get_accounts()
+        raw_accounts = store.get_accounts()  # excludes hidden by default
         accounts = [serialize_account(a) for a in raw_accounts]
         # Signed net worth: a liability contributes -ABS(balance) regardless
         # of how the source signs it. Matches the formula documented in
@@ -78,12 +78,23 @@ def register_routes(app: FastAPI) -> None:
             (-abs(a.balance) if a.is_liability else a.balance for a in raw_accounts),
             Decimal("0"),
         )
+        # Compute hidden totals separately for the footer note so the user
+        # sees what's being excluded. Using the same signed-balance formula.
+        all_accounts = store.get_accounts(include_hidden=True)
+        hidden_accounts = [a for a in all_accounts if a.is_hidden]
+        hidden_count = len(hidden_accounts)
+        hidden_total = sum(
+            (-abs(a.balance) if a.is_liability else a.balance for a in hidden_accounts),
+            Decimal("0"),
+        )
         return _render(
             request,
             "accounts.html",
             {
                 "accounts": accounts,
                 "net_worth": f"{net_worth:,.2f}",
+                "hidden_count": hidden_count,
+                "hidden_total": f"{hidden_total:,.2f}",
                 "active": "accounts",
             },
         )
@@ -222,6 +233,8 @@ def _query_transactions(
 
     Search/text filter still runs in Python after the DB call — same
     as before, just on dict keys instead of Transaction attributes."""
+    # include_hidden=False (the default) filters transactions belonging to
+    # hidden accounts. The dashboard mirrors the MCP tool semantic.
     rows = store.get_transactions_with_category(
         account_id=account_id or None,
         start=_parse_iso(start),

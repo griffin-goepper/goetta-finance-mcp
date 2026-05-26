@@ -247,3 +247,54 @@ def test_base_template_has_spending_by_category_nav_link(client: TestClient) -> 
     resp = client.get("/")
     assert resp.status_code == 200
     assert 'href="/spending-by-category"' in resp.text
+
+
+# --- Migration 0005: hidden accounts ---------------------------------------
+
+
+def test_accounts_page_hides_hidden_accounts(client: TestClient) -> None:
+    """Hiding an account removes it from the Accounts page; net-worth
+    drops by its contribution."""
+    from goetta_finance.store.duckdb_store import DuckDBStore
+
+    store = DuckDBStore(client.app.state.store.path)  # type: ignore[arg-type]
+    try:
+        store.set_account_hidden("acc-brokerage", True)
+    finally:
+        store.close()
+    resp = client.get("/")
+    assert resp.status_code == 200
+    body = resp.text
+    # The hidden Brokerage account is no longer in the main table.
+    # (It still appears in the footer note. So check that it's not in
+    # the data-table tbody, by looking for its balance — the Vanguard
+    # 50000 line shouldn't appear as a row.)
+    assert "Vanguard" not in body  # neither header nor footer mentions it by name
+    # The footer note announces the exclusion.
+    assert "1 hidden account" in body
+    assert "Excludes" in body
+    assert "50,000.00" in body  # the hidden balance in the footer note
+
+
+def test_accounts_page_no_footer_note_when_no_hidden(client: TestClient) -> None:
+    """Pin the negative case: with no hidden accounts the footer note
+    doesn't render."""
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "Excludes" not in resp.text
+
+
+def test_transactions_page_hides_hidden_account_txns(client: TestClient) -> None:
+    """Default get_transactions_with_category filters transactions on
+    hidden accounts. Hide the Checking account → its Spotify txn vanishes."""
+    from goetta_finance.store.duckdb_store import DuckDBStore
+
+    store = DuckDBStore(client.app.state.store.path)  # type: ignore[arg-type]
+    try:
+        store.set_account_hidden("acc-checking", True)
+    finally:
+        store.close()
+    resp = client.get("/transactions")
+    assert resp.status_code == 200
+    assert "Spotify Premium" not in resp.text
+    assert "Paycheck" not in resp.text

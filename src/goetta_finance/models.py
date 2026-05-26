@@ -32,6 +32,7 @@ class Account(BaseModel):
     extra: dict[str, Any] = Field(default_factory=dict)
     is_manual: bool = False
     is_liability: bool = False
+    is_hidden: bool = False
 
 
 class Transaction(BaseModel):

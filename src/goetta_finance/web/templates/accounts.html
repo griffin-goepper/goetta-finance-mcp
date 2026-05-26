@@ -37,6 +37,13 @@
         </tr>
       </tfoot>
     </table>
+    {% if hidden_count and hidden_count > 0 %}
+      <p class="muted">
+        Excludes {{ hidden_count }} hidden account{% if hidden_count != 1 %}s{% endif %}
+        (signed total {{ hidden_total }} USD). Unhide via
+        <code>goetta-finance account set-hidden &lt;id&gt; false</code>.
+      </p>
+    {% endif %}
   {% else %}
     <p class="empty">No accounts yet. Run <code>goetta-finance sync</code>.</p>
   {% endif %}

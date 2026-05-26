@@ -20,8 +20,9 @@ def serialize_account(a: Account) -> dict[str, Any]:
         "type": a.type.value if a.type is not None else None,
         "is_manual": a.is_manual,
         "is_liability": a.is_liability,
+        "is_hidden": a.is_hidden,
     }
 
 
-def list_accounts(store: FinanceStore) -> list[dict[str, Any]]:
-    return [serialize_account(a) for a in store.get_accounts()]
+def list_accounts(store: FinanceStore, *, include_hidden: bool = False) -> list[dict[str, Any]]:
+    return [serialize_account(a) for a in store.get_accounts(include_hidden=include_hidden)]

@@ -560,12 +560,15 @@ def _prompt_setup_token_and_claim() -> str:
 
 
 def _print_status(store: DuckDBStore) -> None:
-    accounts = store.get_accounts()
+    # Status is for the human — show hidden accounts too, tagged. They
+    # still own the money; hiding only affects default read paths.
+    accounts = store.get_accounts(include_hidden=True)
     last = store.last_sync_time()
     typer.echo(f"Accounts: {len(accounts)}")
     for a in accounts:
         org = a.org_name or "—"
-        typer.echo(f"  [{org}] {a.name}: {a.balance:.2f} {a.currency}")
+        hidden_tag = " [hidden]" if a.is_hidden else ""
+        typer.echo(f"  [{org}] {a.name}{hidden_tag}: {a.balance:.2f} {a.currency}")
 
     if last is None:
         typer.echo("\nNo successful syncs yet.")
@@ -777,16 +780,19 @@ def account_list() -> None:
         typer.secho(f"account list failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
     try:
-        accounts = store.get_accounts()
+        # Include hidden so the user can find what they've hidden in
+        # order to unhide it. Tags surface the state.
+        accounts = store.get_accounts(include_hidden=True)
         if not accounts:
             typer.echo("No accounts yet.")
             return
         for a in accounts:
             manual_tag = "[manual]" if a.is_manual else "        "
             liability_tag = " [liability]" if a.is_liability else ""
+            hidden_tag = " [hidden]" if a.is_hidden else ""
             org = a.org_name or "—"
             typer.echo(
-                f"  {manual_tag} {a.id}  {org} / {a.name}{liability_tag}: "
+                f"  {manual_tag} {a.id}  {org} / {a.name}{liability_tag}{hidden_tag}: "
                 f"{a.balance:.2f} {a.currency}"
             )
     finally:
@@ -836,6 +842,46 @@ def account_set_liability(
         typer.echo(f"{account_id} is now marked as {state}.")
     except GoettaFinanceError as exc:
         typer.secho(f"account set-liability failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+@account_app.command("set-hidden")
+def account_set_hidden(
+    account_id: Annotated[
+        str, typer.Argument(help="Account id (any account, manual or SimpleFIN).")
+    ],
+    value: Annotated[
+        str,
+        typer.Argument(help="true or false (also accepts yes/no/1/0)."),
+    ],
+) -> None:
+    """Hide an account from default views (or unhide it).
+
+    Hidden accounts disappear from ``list_accounts``, the dashboard
+    Accounts page, the net-worth chart, transactions queries, and
+    spending_by_category. They stay visible in ``goetta-finance
+    account list`` (with a ``[hidden]`` tag) so you can find them to
+    unhide.
+
+    Use this for stale duplicate accounts that SimpleFIN keeps
+    returning, or any account you don't want included in totals. The
+    flag survives sync — the upsert's ON CONFLICT SET clause omits
+    user-owned columns by design.
+    """
+    parsed = _parse_bool(value, field="value")
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"account set-hidden failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        store.set_account_hidden(account_id, parsed)
+        state = "hidden" if parsed else "visible"
+        typer.echo(f"{account_id} is now {state}.")
+    except GoettaFinanceError as exc:
+        typer.secho(f"account set-hidden failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
     finally:
         store.close()

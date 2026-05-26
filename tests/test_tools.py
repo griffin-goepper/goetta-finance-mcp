@@ -379,6 +379,62 @@ def test_get_transactions_category_filter_via_tool(store: DuckDBStore) -> None:
     assert dining_only[0]["category"] == "Dining"
 
 
+def test_spending_by_category_excludes_hidden_account_transactions(
+    store: DuckDBStore,
+) -> None:
+    """A transaction on a hidden account must not contribute to category
+    totals. The Fidelity-duplicate use case has no transactions, but
+    other hidden accounts (e.g. an old closed checking) might — those
+    must not pollute totals."""
+    store.upsert_accounts(
+        [
+            Account(
+                id="cat-vis-acc",
+                org_name="Visible",
+                name="Checking",
+                balance=Decimal("100.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.CHECKING,
+            ),
+            Account(
+                id="cat-hid-acc",
+                org_name="Old",
+                name="Hidden Checking",
+                balance=Decimal("0.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.CHECKING,
+            ),
+        ]
+    )
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="cat-vis-txn",
+                account_id="cat-vis-acc",
+                posted=datetime(2026, 5, 5, tzinfo=UTC),
+                amount=Decimal("-25.00"),
+                description="STARBUCKS STORE #1",
+            ),
+            Transaction(
+                id="cat-hid-txn",
+                account_id="cat-hid-acc",
+                posted=datetime(2026, 5, 6, tzinfo=UTC),
+                amount=Decimal("-200.00"),  # would dominate Dining if counted
+                description="STARBUCKS STORE #2",
+            ),
+        ]
+    )
+    store.set_account_hidden("cat-hid-acc", True)
+
+    rows = spending_by_category(
+        store, datetime(2026, 5, 1, tzinfo=UTC), datetime(2026, 5, 31, tzinfo=UTC)
+    )
+    dining = next(r for r in rows if r["category"] == "Dining")
+    # Only the visible-account transaction contributes; the hidden one is excluded.
+    assert dining["total"] == "25.00"
+    assert dining["transaction_count"] == 1
+
+
 def test_get_transactions_search_still_works_with_category(
     store: DuckDBStore,
 ) -> None:

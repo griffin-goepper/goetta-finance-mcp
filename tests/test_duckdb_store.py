@@ -385,6 +385,176 @@ def test_set_account_liability_raises_on_unknown_id(store: DuckDBStore) -> None:
         store.set_account_liability("MANUAL-does-not-exist", True)
 
 
+# --- 0005: hidden accounts + user-owned-flag preservation -------------------
+
+
+def test_migration_0005_applied(store: DuckDBStore) -> None:
+    rows = store.conn.execute("SELECT name FROM schema_migrations").fetchall()
+    assert ("0005_hidden_accounts.sql",) in rows
+
+
+def test_migration_0005_backward_compat_default_false(store: DuckDBStore) -> None:
+    """Existing-style upsert (no is_hidden specified) defaults to FALSE."""
+    store.upsert_accounts([_account()])
+    fetched = store.get_accounts()
+    assert len(fetched) == 1
+    assert fetched[0].is_hidden is False
+
+
+def test_set_account_hidden_round_trip(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account(id="ACT-hide-me")])
+    assert store.get_accounts()[0].is_hidden is False
+    store.set_account_hidden("ACT-hide-me", True)
+    # Hidden by default → filtered out of get_accounts().
+    visible = store.get_accounts()
+    assert visible == []
+    # include_hidden=True surfaces it again.
+    all_accounts = store.get_accounts(include_hidden=True)
+    assert len(all_accounts) == 1
+    assert all_accounts[0].is_hidden is True
+
+
+def test_set_account_hidden_raises_on_unknown_id(store: DuckDBStore) -> None:
+    with pytest.raises(StoreError, match="not found"):
+        store.set_account_hidden("ACT-does-not-exist", True)
+
+
+def test_user_owned_flags_survive_sync(store: DuckDBStore) -> None:
+    """The class-of-bug regression. is_liability AND is_hidden are
+    user-controlled — they must NOT be overwritten when a sync runs
+    and re-upserts the account with the parser's natural False
+    defaults.
+
+    Pins the conceptual fix, not just the two current flags. A future
+    user-controlled boolean that lands in _SIMPLEFIN_SOURCED_COLUMNS
+    by mistake (instead of _USER_OWNED_COLUMNS) and gets enumerated
+    in the SET clause would also fail this test."""
+    # 1. Insert a SimpleFIN-style account.
+    store.upsert_accounts([_account(id="ACT-user-owned-test")])
+
+    # 2. User flips both user-owned flags TRUE.
+    store.set_account_liability("ACT-user-owned-test", True)
+    store.set_account_hidden("ACT-user-owned-test", True)
+
+    # 3. Sync re-upserts with the parser's natural False defaults
+    #    — same path collect() takes after a fresh SimpleFIN response.
+    #    Also change balance to prove SimpleFIN-sourced columns DO
+    #    still update.
+    store.upsert_accounts([_account(id="ACT-user-owned-test", balance="250.50")])
+
+    # 4. Both user-owned flags survive; SimpleFIN-sourced columns update.
+    after = next(
+        a for a in store.get_accounts(include_hidden=True) if a.id == "ACT-user-owned-test"
+    )
+    assert after.is_liability is True, (
+        "is_liability was clobbered by sync — _USER_OWNED_COLUMNS likely "
+        "missing from the upsert SET-clause exclusion"
+    )
+    assert after.is_hidden is True, (
+        "is_hidden was clobbered by sync — _USER_OWNED_COLUMNS likely "
+        "missing from the upsert SET-clause exclusion"
+    )
+    assert after.balance == Decimal("250.50"), (
+        "balance should still update on sync — SimpleFIN-sourced columns "
+        "are intended to be overwritten"
+    )
+
+
+def test_get_accounts_filters_hidden_by_default(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account(id="ACT-visible"), _account(id="ACT-hidden-one")])
+    store.set_account_hidden("ACT-hidden-one", True)
+    visible = store.get_accounts()
+    assert {a.id for a in visible} == {"ACT-visible"}
+
+
+def test_get_accounts_include_hidden_returns_all(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account(id="ACT-visible"), _account(id="ACT-hidden-one")])
+    store.set_account_hidden("ACT-hidden-one", True)
+    all_accounts = store.get_accounts(include_hidden=True)
+    assert {a.id for a in all_accounts} == {"ACT-visible", "ACT-hidden-one"}
+
+
+def test_view_exposes_account_is_hidden(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account(id="acc-cat")])
+    store.upsert_transactions([_txn("t-view", "ZZZ")])
+    rows = store.conn.execute(
+        "SELECT id, account_is_hidden FROM transactions_with_category WHERE id = ?",
+        ["t-view"],
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][1] is False or rows[0][1] == 0  # DuckDB BOOL→Python
+
+
+def test_view_returns_all_transactions_after_account_join(
+    store: DuckDBStore,
+) -> None:
+    """Pin the LEFT-JOIN-to-JOIN change in 0005 doesn't silently drop
+    rows. The "every transaction has an account" invariant is enforced
+    by the FK constraint today; this test catches a future regression
+    (nullable FK, broken fixture, etc.) that would shrink the
+    dashboard's transaction count."""
+    store.upsert_accounts([_account(id="acc-join-test")])
+    store.upsert_transactions(
+        [
+            Transaction(
+                id=f"t-join-{i}",
+                account_id="acc-join-test",
+                posted=_utc(2026, 5, i + 1),
+                amount=Decimal("-1.00"),
+                description=f"ZZZ-{i}",
+            )
+            for i in range(5)
+        ]
+    )
+    txn_count = store.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()
+    view_count = store.conn.execute("SELECT COUNT(*) FROM transactions_with_category").fetchone()
+    assert txn_count is not None and view_count is not None
+    assert txn_count[0] == view_count[0] == 5
+
+
+def test_get_transactions_filters_hidden_account_by_default(
+    store: DuckDBStore,
+) -> None:
+    store.upsert_accounts([_account(id="acc-vis"), _account(id="acc-hid")])
+    store.upsert_transactions(
+        [
+            _txn("t-vis", "VISIBLE", account_id="acc-vis"),
+            _txn("t-hid", "HIDDEN-ACCT", account_id="acc-hid"),
+        ]
+    )
+    store.set_account_hidden("acc-hid", True)
+    visible = store.get_transactions()
+    assert {t.id for t in visible} == {"t-vis"}
+
+
+def test_get_transactions_include_hidden_returns_all(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account(id="acc-vis"), _account(id="acc-hid")])
+    store.upsert_transactions(
+        [
+            _txn("t-vis", "VISIBLE", account_id="acc-vis"),
+            _txn("t-hid", "HIDDEN-ACCT", account_id="acc-hid"),
+        ]
+    )
+    store.set_account_hidden("acc-hid", True)
+    all_txns = store.get_transactions(include_hidden=True)
+    assert {t.id for t in all_txns} == {"t-vis", "t-hid"}
+
+
+def test_get_transactions_with_category_filters_hidden_by_default(
+    store: DuckDBStore,
+) -> None:
+    store.upsert_accounts([_account(id="acc-vis"), _account(id="acc-hid")])
+    store.upsert_transactions(
+        [
+            _txn("t-vis", "VISIBLE", account_id="acc-vis"),
+            _txn("t-hid", "STARBUCKS STORE", account_id="acc-hid"),
+        ]
+    )
+    store.set_account_hidden("acc-hid", True)
+    rows = store.get_transactions_with_category()
+    assert {r["id"] for r in rows} == {"t-vis"}
+
+
 # --- Regression: whitelist-bypassing payloads must still be refused. ---
 #
 # Scenario: a transaction memo or payee field carries injected SQL. Claude

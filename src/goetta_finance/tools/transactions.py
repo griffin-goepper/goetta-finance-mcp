@@ -56,15 +56,21 @@ def get_transactions(
     start: datetime | None = None,
     end: datetime | None = None,
     category: str | None = None,
+    include_hidden: bool = False,
     search: str | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     """MCP-tool wrapper. Always routes through the
     ``transactions_with_category`` view so every returned dict carries a
-    resolved ``category`` field. The view JOIN cost is bounded
-    (test_get_transactions_view_route_perf_under_10k pins it)."""
+    resolved ``category`` field. Transactions from hidden accounts are
+    filtered by default (``include_hidden=True`` opts back in)."""
     rows = store.get_transactions_with_category(
-        account_id=account_id, start=start, end=end, category=category, limit=limit
+        account_id=account_id,
+        start=start,
+        end=end,
+        category=category,
+        include_hidden=include_hidden,
+        limit=limit,
     )
     if search:
         needle = search.lower()

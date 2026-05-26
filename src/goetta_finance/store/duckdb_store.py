@@ -40,6 +40,45 @@ _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 _SQL_TIMEOUT_DEFAULT_SECONDS = 30.0
 
 
+# Explicit two-list separation drives the ON CONFLICT SET clause in
+# ``upsert_accounts``. Adding a new column? Pick one:
+#   - SimpleFIN-sourced and overwritten on every sync → _SIMPLEFIN_SOURCED_COLUMNS
+#   - User-controlled and preserved across syncs    → _USER_OWNED_COLUMNS
+#
+# The SET clause is generated programmatically from _SIMPLEFIN_SOURCED_COLUMNS,
+# so adding a user-owned column is a one-line edit to the second tuple and
+# correct by construction — the SimpleFIN parser's natural default (False)
+# for the new column will not clobber the user's set value on the next sync.
+#
+# Why this exists: pre-0005 the SET clause enumerated every column including
+# ``is_liability`` and ``is_manual``. The SimpleFIN parser always produces
+# ``is_liability=False`` (there's no SimpleFIN field for it), so every sync
+# silently reset any user-set TRUE back to FALSE. The class-of-bug is pinned
+# by ``test_user_owned_flags_survive_sync`` — a new user-controlled flag
+# that lands in _SIMPLEFIN_SOURCED_COLUMNS by mistake will also fail it.
+# See CLAUDE.md "Things to avoid" for the don't-recreate-this guidance.
+_SIMPLEFIN_SOURCED_COLUMNS: tuple[str, ...] = (
+    "org_id",
+    "org_name",
+    "name",
+    "currency",
+    "balance",
+    "available_balance",
+    "balance_date",
+    "type",
+    "extra",
+)
+_USER_OWNED_COLUMNS: tuple[str, ...] = (
+    "is_manual",
+    "is_liability",
+    "is_hidden",
+)
+_UPSERT_SET_CLAUSE = (
+    ",\n                    ".join(f"{col} = excluded.{col}" for col in _SIMPLEFIN_SOURCED_COLUMNS)
+    + ",\n                    updated_at = now()"
+)
+
+
 def _sql_timeout_seconds() -> float:
     """Read ``query_sql`` statement-timeout from environment, default 30s.
 
@@ -215,6 +254,7 @@ class DuckDBStore:
                 _json_or_none(a.extra),
                 a.is_manual,
                 a.is_liability,
+                a.is_hidden,
             )
             for a in accounts
         ]
@@ -240,27 +280,48 @@ class DuckDBStore:
                     raise StoreError(
                         f"refusing to upsert non-manual data over manual account(s): {collided}"
                     )
+            # The ON CONFLICT SET clause is generated from
+            # _SIMPLEFIN_SOURCED_COLUMNS at module load time — user-owned
+            # flags (is_manual, is_liability, is_hidden) are deliberately
+            # absent from the SET clause so a sync that re-upserts an
+            # account does NOT overwrite the user's set values back to
+            # the SimpleFIN parser's natural False default. See the
+            # module-level comment for the full rationale.
             self.conn.executemany(
-                """
+                f"""
                 INSERT INTO accounts (
                     id, org_id, org_name, name, currency, balance, available_balance,
-                    balance_date, type, extra, is_manual, is_liability, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
+                    balance_date, type, extra, is_manual, is_liability, is_hidden, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
                 ON CONFLICT (id) DO UPDATE SET
-                    org_id = excluded.org_id,
-                    org_name = excluded.org_name,
-                    name = excluded.name,
-                    currency = excluded.currency,
-                    balance = excluded.balance,
-                    available_balance = excluded.available_balance,
-                    balance_date = excluded.balance_date,
-                    type = excluded.type,
-                    extra = excluded.extra,
-                    is_manual = excluded.is_manual,
-                    is_liability = excluded.is_liability,
-                    updated_at = now()
-                """,
+                    {_UPSERT_SET_CLAUSE}
+                """,  # noqa: S608  # nosec B608
                 rows,
+            )
+
+    def set_account_hidden(self, account_id: str, is_hidden: bool) -> None:
+        """Toggle the ``is_hidden`` flag on an existing account.
+
+        Works on any account id (SimpleFIN-sourced or manual). Raises
+        ``StoreError`` if the account does not exist. The flag is
+        preserved across SimpleFIN syncs (the upsert's SET clause
+        excludes user-owned columns; see _SIMPLEFIN_SOURCED_COLUMNS
+        and _USER_OWNED_COLUMNS at the module top).
+
+        Hidden accounts disappear from default read paths
+        (``get_accounts``, ``get_transactions``,
+        ``get_transactions_with_category``, the
+        ``transactions_with_category`` view's ``account_is_hidden``
+        column, net-worth aggregation, spending_by_category).
+        ``include_hidden=True`` on the relevant calls opts back in.
+        """
+        with self._lock:
+            row = self.conn.execute("SELECT 1 FROM accounts WHERE id = ?", [account_id]).fetchone()
+            if row is None:
+                raise StoreError(f"account not found: {account_id}")
+            self.conn.execute(
+                "UPDATE accounts SET is_hidden = ?, updated_at = now() WHERE id = ?",
+                [is_hidden, account_id],
             )
 
     def set_account_liability(self, account_id: str, is_liability: bool) -> None:
@@ -433,16 +494,26 @@ class DuckDBStore:
             return None
         return _from_naive_utc(row[0])
 
-    def get_accounts(self) -> list[Account]:
+    def get_accounts(self, *, include_hidden: bool = False) -> list[Account]:
+        """Return accounts. By default filters out hidden accounts.
+
+        Pass ``include_hidden=True`` to see the full list — used by the
+        CLI's ``account list`` (so users can find what they've hidden in
+        order to unhide it) and the dashboard's footer count of hidden
+        accounts. The MCP ``list_accounts`` tool and the dashboard
+        Accounts page take the default behavior.
+        """
+        where = "" if include_hidden else "WHERE COALESCE(is_hidden, FALSE) = FALSE"
         with self._lock:
             rows = self.conn.execute(
-                """
+                f"""
                 SELECT id, org_id, org_name, name, currency, balance,
                        available_balance, balance_date, type, extra,
-                       is_manual, is_liability
+                       is_manual, is_liability, is_hidden
                 FROM accounts
+                {where}
                 ORDER BY org_name, name
-                """
+                """  # noqa: S608  # nosec B608
             ).fetchall()
         return [self._row_to_account(row) for row in rows]
 
@@ -453,6 +524,7 @@ class DuckDBStore:
         start: datetime | None = None,
         end: datetime | None = None,
         category: str | None = None,
+        include_hidden: bool = False,
         limit: int | None = None,
     ) -> list[Transaction]:
         clauses: list[str] = []
@@ -466,24 +538,28 @@ class DuckDBStore:
         if end is not None:
             clauses.append("posted <= ?")
             params.append(_to_naive_utc(end))
-        # When category is requested, route through the view so resolution
-        # (override > rule > 'Uncategorized') is applied at read time.
-        # Otherwise stay on the bare table — the view's CTEs would force
-        # evaluation of the rule-matching join on every call, which is
-        # wasted work when the caller doesn't care about category.
-        source = "transactions_with_category" if category is not None else "transactions"
+        # When category is requested OR we need to filter hidden accounts,
+        # route through the view (it carries ``account_is_hidden``). The
+        # view's CTEs evaluate the rule-matching join, so we only pay
+        # that cost when category info is in scope.
+        use_view = category is not None or not include_hidden
+        source = "transactions_with_category" if use_view else "transactions"
         if category is not None:
             clauses.append("category = ?")
             params.append(category)
+        if not include_hidden:
+            # Filter through the view's account_is_hidden column.
+            clauses.append("COALESCE(account_is_hidden, FALSE) = FALSE")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         limit_clause = f"LIMIT {int(limit)}" if limit is not None else ""
         with self._lock:
             # ruff S608 / bandit B608: ``clauses`` is a fixed allow-list of
             # column predicates (``account_id = ?``, ``posted >= ?``,
-            # ``posted <= ?``, ``category = ?``); values bind via ``params``.
-            # ``source`` is one of two hard-coded identifiers.
-            # ``limit_clause`` is ``LIMIT {int(...)}`` so the only
-            # interpolated token is a plain integer. Audited 2026-05.
+            # ``posted <= ?``, ``category = ?``, the hidden filter is a
+            # string literal); values bind via ``params``. ``source`` is
+            # one of two hard-coded identifiers. ``limit_clause`` is
+            # ``LIMIT {int(...)}`` so the only interpolated token is a
+            # plain integer. Audited 2026-05.
             rows = self.conn.execute(
                 f"""
                 SELECT id, account_id, posted, transacted_at, amount, description,
@@ -504,6 +580,7 @@ class DuckDBStore:
         start: datetime | None = None,
         end: datetime | None = None,
         category: str | None = None,
+        include_hidden: bool = False,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """Return transactions joined to their resolved category through
@@ -531,6 +608,8 @@ class DuckDBStore:
         if category is not None:
             clauses.append("category = ?")
             params.append(category)
+        if not include_hidden:
+            clauses.append("COALESCE(account_is_hidden, FALSE) = FALSE")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         limit_clause = f"LIMIT {int(limit)}" if limit is not None else ""
         with self._lock:
@@ -814,6 +893,7 @@ class DuckDBStore:
             extra=_parse_json(row[9]),
             is_manual=bool(row[10]),
             is_liability=bool(row[11]),
+            is_hidden=bool(row[12]),
         )
 
     def _row_to_transaction(self, row: tuple[Any, ...]) -> Transaction:

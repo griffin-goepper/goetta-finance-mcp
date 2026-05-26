@@ -49,7 +49,13 @@ def query_spending_by_category(
 
     Semantics: see ``spending_by_category`` docstring below.
     """
-    base_where = "posted >= ? AND posted <= ?"
+    # Always filter transactions from hidden accounts. The MCP tool / web
+    # surface don't expose an include_hidden flag — hiding is a user
+    # statement that "this account doesn't count," and bleeding its
+    # transactions into category totals would defeat the point. Users who
+    # really want raw numbers reach for sql_query against the view
+    # directly.
+    base_where = "posted >= ? AND posted <= ? AND COALESCE(account_is_hidden, FALSE) = FALSE"
     if include_income:
         where = f"{base_where} AND (amount < 0 OR category = 'Income')"
     else:

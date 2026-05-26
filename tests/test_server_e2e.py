@@ -136,10 +136,12 @@ def test_schema_hint_mentions_categorization_tables() -> None:
     for marker in (
         "is_manual",
         "is_liability",
+        "is_hidden",
         "categories",
         "category_rules",
         "transaction_overrides",
         "transactions_with_category",
+        "account_is_hidden",
     ):
         assert marker in SQL_SCHEMA_HINT, f"SQL_SCHEMA_HINT missing {marker!r}"
 
@@ -158,6 +160,7 @@ def test_schema_hint_communicates_categorization_semantics() -> None:
         "transaction_overrides",  # override-beats-rule resolution
         "Uncategorized",  # fallback default
         "spending_by_category",  # tool-preference guidance
+        "preserved across",  # user-owned flag preservation guarantee (0005)
     ]
     for phrase in expected_phrases:
         assert phrase in SQL_SCHEMA_HINT, (

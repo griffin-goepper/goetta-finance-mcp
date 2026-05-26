@@ -27,7 +27,7 @@ class FinanceStore(Protocol):
 
     def last_sync_time(self) -> datetime | None: ...
 
-    def get_accounts(self) -> list[Account]: ...
+    def get_accounts(self, *, include_hidden: bool = False) -> list[Account]: ...
 
     def get_transactions(
         self,
@@ -36,6 +36,7 @@ class FinanceStore(Protocol):
         start: datetime | None = None,
         end: datetime | None = None,
         category: str | None = None,
+        include_hidden: bool = False,
         limit: int | None = None,
     ) -> list[Transaction]: ...
 
@@ -46,6 +47,7 @@ class FinanceStore(Protocol):
         start: datetime | None = None,
         end: datetime | None = None,
         category: str | None = None,
+        include_hidden: bool = False,
         limit: int | None = None,
     ) -> list[dict[str, Any]]: ...
 
@@ -56,6 +58,8 @@ class FinanceStore(Protocol):
     def delete_account(self, account_id: str, *, cascade_snapshots: bool = False) -> int: ...
 
     def set_account_liability(self, account_id: str, is_liability: bool) -> None: ...
+
+    def set_account_hidden(self, account_id: str, is_hidden: bool) -> None: ...
 
     # Categorization (migration 0004).
     def get_categories(self) -> list[Category]: ...
