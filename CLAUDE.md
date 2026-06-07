@@ -141,6 +141,20 @@ A passing PR-equivalent change has: `ruff check` clean, `mypy --strict` clean, a
 
 Users who deleted or edited a default rule must not see it silently re-seeded; the migration-stamp convention is the safeguard.
 
+### Migrations that remove or change seeded data — the 0007 lesson
+
+If a migration deletes or modifies rows that were seeded by an earlier migration AND those rows might have been doing real work for existing users, the migration must include a **pre-migration mitigation step** that copies user-affecting seeded rows into user-owned space before the destructive change runs. Otherwise existing users silently regress between the moment the migration lands and the moment they manually re-curate.
+
+Concrete example: migration 0007 deletes ~32 merchant-specific default rules from 0004's seed (`KROGER`, `STARBUCKS`, `SHELL`, etc.). For existing users, those defaults were almost certainly catching real transactions — `Groceries: 28 txns/yr` is mostly KROGER. After 0007 runs, every txn that only matched via a deleted default reverts to `Uncategorized`. The user has to manually re-add the rules they were depending on.
+
+The 0007 rollout required a manual mitigation dance (query the live DB → identify defaults doing real work with no user-added duplicate → emit re-add commands → user runs them BEFORE restarting the daemon). That was acceptable as a one-off because the user accepted the trade-off in plan review. **Don't ship that shape again.** When the next migration changes seeded data:
+
+1. Query at-migration time: identify rows that are currently catching real work AND don't have a user-owned equivalent.
+2. Copy those rows to user-owned space (e.g. flip `is_default` from TRUE to FALSE, or insert a parallel user-tagged row) WITHIN the migration so users transition transparently.
+3. THEN perform the destructive change.
+
+This matches the [[feedback_pre_fix_audit_for_bug_pinning_tests]] discipline applied to data migrations: surface and handle the user-visible-effect before the schema change, not after.
+
 ### Adding a boolean flag (the `is_X` pattern)
 
 There are now five `is_X BOOLEAN DEFAULT` columns across two tables, following one consistent shape: `is_manual` (0002), `is_liability` (0003), `is_hidden` (0005) on `accounts`; `is_default` (0004), `is_spending` (0006) on `categories`. When you need another, follow the template:
