@@ -16,11 +16,17 @@ runner = CliRunner()
 
 @pytest.fixture
 def fresh_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """GOETTA_FINANCE_HOME with a migrated empty DuckDB. Mirrors
-    test_account_cli.py's fixture exactly."""
+    """GOETTA_FINANCE_HOME with a migrated empty DuckDB + the legacy
+    merchant rules (STARBUCKS / KROGER / SHELL / AMAZON.COM) that
+    migration 0007 demoted. Tests in this file used those merchants as
+    convenient examples of "rule resolves to category" — see
+    conftest.seed_legacy_merchant_rules for the rationale."""
+    from tests.conftest import seed_legacy_merchant_rules
+
     monkeypatch.setenv("GOETTA_FINANCE_HOME", str(tmp_path))
     store = DuckDBStore(tmp_path / "data.duckdb")
     store.init()
+    seed_legacy_merchant_rules(store)
     store.close()
     return tmp_path
 
@@ -219,10 +225,16 @@ def test_category_add_rejects_bad_color(fresh_home: Path) -> None:
 
 
 def test_category_default_rules_lists_seeds(fresh_home: Path) -> None:
+    """After migration 0007 the default rules are intentionally minimal
+    (Spotify/Netflix/Hulu/Disney Plus/Amazon Prime → Subscriptions plus
+    the (?i)transfer regex → Transfers). The CLI's default-rules
+    command should surface that universal set."""
     result = runner.invoke(app, ["category", "default-rules"])
     assert result.exit_code == 0, result.output
-    assert "Groceries" in result.output
-    assert "KROGER" in result.output
+    assert "Subscriptions" in result.output
+    assert "Transfers" in result.output
+    assert "SPOTIFY" in result.output
+    assert "(?i)transfer" in result.output
     assert "[rule " in result.output  # rule ids are printed
 
 

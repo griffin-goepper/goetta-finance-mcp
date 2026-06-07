@@ -774,6 +774,38 @@ def _seed_cat_account(store: DuckDBStore) -> None:
     store.upsert_accounts([_account(id="acc-cat", balance="100.00")])
 
 
+def test_migration_0007_applied(store_no_legacy_rules: DuckDBStore) -> None:
+    rows = store_no_legacy_rules.conn.execute("SELECT name FROM schema_migrations").fetchall()
+    assert ("0007_demote_default_rules.sql",) in rows
+
+
+def test_migration_0007_keeps_only_universal_default_rules(
+    store_no_legacy_rules: DuckDBStore,
+) -> None:
+    """The surviving default rules after 0007 are the universal set:
+    `(?i)transfer` regex + 5 global subscriptions. Pins the editorial
+    decision so a future "let's add KROGER back" change has to
+    confront the principle (per feedback_stranger_test_for_open_source).
+    """
+    rows = store_no_legacy_rules.conn.execute(
+        """
+        SELECT match_type, pattern
+        FROM category_rules
+        WHERE is_default = TRUE
+        ORDER BY match_type, pattern
+        """
+    ).fetchall()
+    survivors = {(r[0], r[1]) for r in rows}
+    assert survivors == {
+        ("contains", "AMAZON PRIME"),
+        ("contains", "DISNEY PLUS"),
+        ("contains", "HULU"),
+        ("contains", "NETFLIX"),
+        ("contains", "SPOTIFY"),
+        ("regex", "(?i)transfer"),
+    }
+
+
 def test_migration_0006_applied(store: DuckDBStore) -> None:
     """Pin migration 0006 (is_spending flag on categories)."""
     rows = store.conn.execute("SELECT name FROM schema_migrations").fetchall()
