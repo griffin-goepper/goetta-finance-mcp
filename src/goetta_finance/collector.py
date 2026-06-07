@@ -125,11 +125,16 @@ def collect(
     except Exception as exc:
         run.errors.append(f"{type(exc).__name__}: {exc}")
         run.accounts_touched = len(touched)
-        run.finished_at = _now_utc()
+        # Use ``end`` so callers passing ``now=`` get a deterministic
+        # finished_at — otherwise ``last_sync_time()`` returns wall-clock
+        # time even when the test ran with a fixed past ``now``, breaking
+        # the overlap-window calc on the next collect.
+        run.finished_at = end
         store.record_sync_run(run)
         raise
 
     run.accounts_touched = len(touched)
-    run.finished_at = _now_utc()
+    # See comment above on respecting the ``now`` parameter.
+    run.finished_at = end
     store.record_sync_run(run)
     return run

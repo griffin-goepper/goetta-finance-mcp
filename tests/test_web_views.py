@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -40,12 +40,17 @@ def _seed(store: DuckDBStore) -> None:
             ),
         ]
     )
+    # Posted dates relative to "now" so the dashboard's hardcoded
+    # "last 30 days" window always includes them. Otherwise these
+    # tests rot as the calendar advances past the previously-fresh
+    # fixed date.
+    recent = datetime.now(tz=UTC) - timedelta(days=3)
     store.upsert_transactions(
         [
             Transaction(
                 id="tx-spotify",
                 account_id="acc-checking",
-                posted=datetime(2026, 5, 1, tzinfo=UTC),
+                posted=recent,
                 amount=Decimal("-9.99"),
                 description="Spotify Premium",
                 payee="Spotify",
@@ -53,7 +58,7 @@ def _seed(store: DuckDBStore) -> None:
             Transaction(
                 id="tx-paycheck",
                 account_id="acc-checking",
-                posted=datetime(2026, 5, 2, tzinfo=UTC),
+                posted=recent + timedelta(days=1),
                 amount=Decimal("4500.00"),
                 description="Paycheck",
                 payee="Acme Corp",

@@ -80,17 +80,20 @@ def test_subsequent_run_uses_overlap_window(store: DuckDBStore, demo_response: d
     now1 = datetime(2026, 5, 23, tzinfo=UTC)
     collect(store, client, now=now1)
 
+    # Snapshot last_sync_time BEFORE the second run — that's the value
+    # the second collect's overlap calc reads. (Reading it after the
+    # second run gives the new run's finished_at, not the previous.)
+    prior_last_sync = store.last_sync_time()
+    assert prior_last_sync is not None
+
     now2 = now1 + timedelta(days=1)
     client.windows.clear()
     collect(store, client, now=now2, overlap_days=5)
     assert client.windows, "expected at least one fetch on the second run"
 
-    last_sync = store.last_sync_time()
-    assert last_sync is not None
-    expected_start = last_sync - timedelta(days=5)
+    expected_start = prior_last_sync - timedelta(days=5)
     first_start, _ = client.windows[0]
-    # Allow tiny tolerance since finished_at is now_utc() inside collect().
-    assert abs((first_start - expected_start).total_seconds()) < 5
+    assert first_start == expected_start
 
 
 def test_snapshot_grows_when_balance_date_advances(store: DuckDBStore, demo_response: dict) -> None:
