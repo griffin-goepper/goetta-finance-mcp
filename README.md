@@ -150,9 +150,18 @@ goetta-finance transaction uncategorize <txn-id>     # back to rule resolution
 
 ### From Claude
 
-The `spending_by_category(start, end)` MCP tool aggregates per-category totals over a date range. By default it returns spending only (amount < 0, Income excluded) as positive dollar magnitudes sorted descending. Pass `include_income=True` to add the Income category as a row whose `total` is *negative* — sign conveys direction (cash in).
+The `spending_by_category(start, end)` MCP tool aggregates per-category totals over a date range. By default it returns spending only (amount < 0, non-spending categories like Transfers and Income excluded) as positive magnitudes sorted descending. Pass `include_non_spending=True` to add them — Income rows come back with a *negative* total (cash in), Transfers positive (outflow to your own accounts).
 
 `get_transactions(category="Dining", ...)` filters server-side through the view. Every transaction Claude sees carries a resolved `category` field — falling back to `"Uncategorized"`, never `None`.
+
+**Curation is conversational.** The whole maintenance loop runs in chat — no terminal needed:
+
+> *You: "what's still uncategorized this month?"*
+> *Claude calls `top_uncategorized_patterns` → "$85 CRUMBL COOKIES (3×), $60 NEW GYM LLC (2×)..."*
+> *You: "Crumbl is dining, the gym is healthcare"*
+> *Claude calls `add_category_rule` twice. Rules apply retroactively; done.*
+
+One-off fixes use `categorize_transaction` (override beats any rule) and `uncategorize_transaction` (undo). The MCP rule-write path runs the same pattern validation as the CLI.
 
 For anything custom, query the view directly via `sql_query`:
 
@@ -172,10 +181,11 @@ Inline categorize-from-dashboard (HTMX dropdown + write endpoint) is deliberatel
 
 ### Heads-up
 
-- **Rule patterns are MCP-reachable.** A transaction memo can carry text that tricks Claude into running `category set-rule ... --pattern <evil-regex>`. The CLI validator does best-effort filtering (refuses uncompilable regexes, nested quantifiers like `(X+)+`, large counted repetitions like `(.*a){25}`) but CPython's `re` engine doesn't release the GIL so a runtime regex timeout isn't possible. The load-bearing runtime defense is the existing `query_sql` statement-timeout watchdog (`GOETTA_FINANCE_SQL_TIMEOUT_SECONDS`, default 30s). See [`CLAUDE.md`](./CLAUDE.md) for the threat model.
-- **Default rules are USA-biased.** Rename a default rule by removing it (`--force`) and adding your own, or just add a higher-priority rule that wins (lower number = higher precedence).
+- **Rule patterns are MCP-reachable.** A transaction memo can carry text that tricks Claude into calling `add_category_rule` (or running `category set-rule ... --pattern <evil-regex>`). Both surfaces run the same best-effort validator (refuses uncompilable regexes, nested quantifiers like `(X+)+`, large counted repetitions like `(.*a){25}`) but CPython's `re` engine doesn't release the GIL so a runtime regex timeout isn't possible. The load-bearing runtime defense is the existing `query_sql` statement-timeout watchdog (`GOETTA_FINANCE_SQL_TIMEOUT_SECONDS`, default 30s). See [`CLAUDE.md`](./CLAUDE.md) for the threat model.
 - **One category per transaction.** Costco-style mixed purchases get one label. No splits in v1.
-- **Default rules don't re-seed if you delete them.** Migrations run once per database; the slate stays where you leave it. To add new defaults later, add a new migration file (`0005_default_rules_expansion.sql`, etc.) — never edit `0004_categorization.sql`.
+- **Default rules don't re-seed if you delete them.** Migrations run once per database; the slate stays where you leave it. New defaults arrive only via new migration files — never edits to shipped ones.
+
+See [`CUSTOMIZATION.md`](./CUSTOMIZATION.md) for the full map of user-tunable surfaces (rules, prefix list, categories, flags, colors).
 
 ## Daemon mode
 
@@ -301,15 +311,19 @@ Once registered, restart your Claude client and try things like:
 - *"What's my checking balance?"* → `list_accounts`
 - *"Show me everything I spent at Starbucks last month"* → `get_transactions(search="Starbucks", ...)`
 - *"Chart my net worth over the last 90 days"* → `account_balance_history` + Claude renders an inline chart artifact
-- *"How much did I spend on dining last month?"* → `spending_by_category` returns categorized totals (Income excluded by default)
+- *"How much did I spend on dining last month?"* → `spending_by_category` returns categorized totals (non-spending categories excluded by default)
+- *"What's still uncategorized?"* → `top_uncategorized_patterns` surfaces the biggest gaps; tell Claude which category each belongs to and it adds the rules
 - *"Is the data current?"* → `sync_status` reports last sync + freshness
 
-The MCP server exposes seven tools:
+The MCP server exposes eleven tools:
 
-- **`list_accounts`** — all accounts with current balances
+- **`list_accounts`** — all accounts with current balances (hidden accounts excluded by default)
 - **`get_transactions`** — filter by account, date range, category, text search; up to 1000 rows. Every row carries a resolved `category` field.
 - **`account_balance_history`** — per-account balance snapshots over time
-- **`spending_by_category`** — categorized spending totals between two dates. Income excluded by default; opt in via `include_income=True`.
+- **`spending_by_category`** — categorized spending totals between two dates. Non-spending categories (Transfers, Income) excluded by default; opt in via `include_non_spending=True`.
+- **`top_uncategorized_patterns`** — the curation entry point: the largest spending patterns sitting in Uncategorized, normalized via your `prefixes.txt`
+- **`categorize_transaction`** / **`uncategorize_transaction`** — per-transaction override and its undo
+- **`add_category_rule`** — add a rule from conversation; retroactive, validator-gated (same ReDoS checks as the CLI)
 - **`sql_query`** — read-only SQL against the local DuckDB store (see security notes below). Prefer `transactions_with_category` over the bare `transactions` table when you want category info.
 - **`sync_status`** — report when the SimpleFIN data was last synced and whether it's stale
 - **`sync_now`** — trigger a fresh pull from SimpleFIN
