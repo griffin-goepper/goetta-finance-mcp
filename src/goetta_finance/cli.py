@@ -21,6 +21,7 @@ from goetta_finance.config import (
     home_dir,
     load_config,
     save_config,
+    write_default_prefixes_file,
 )
 from goetta_finance.daemon import run_daemon
 from goetta_finance.errors import GoettaFinanceError, SetupTokenError
@@ -40,6 +41,11 @@ from goetta_finance.models import Account, AccountType, BalanceSnapshot
 from goetta_finance.server import build_server
 from goetta_finance.simplefin import SimpleFinClient
 from goetta_finance.store.duckdb_store import DuckDBStore
+from goetta_finance.validators import (
+    RulePatternError,
+    parse_match_type,
+    validate_rule_pattern,
+)
 
 MANUAL_ID_PREFIX = "MANUAL-"
 
@@ -328,6 +334,8 @@ def _run_init() -> None:
     store = DuckDBStore(db_path(config))
     store.init()
     typer.echo(f"  ✓ Initialized DuckDB at {db_path(config)}")
+    prefixes_file = write_default_prefixes_file()
+    typer.echo(f"  ✓ Prefix-strip list at {prefixes_file} (edit to match your bank)")
     typer.echo("")
 
     # [3/4] Initial data pull
@@ -1038,96 +1046,28 @@ transaction_app = typer.Typer(
 app.add_typer(transaction_app, name="transaction")
 
 _HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
-_PATTERN_MAX_LEN = 500
-
-# Heuristic detectors for ReDoS-prone shapes. Caught at write time so the user
-# gets a friendly error; the real runtime defense remains the query_sql
-# statement-timeout watchdog (GOETTA_FINANCE_SQL_TIMEOUT_SECONDS, default 30s)
-# which bounds any pattern that slips past these heuristics.
-#
-# Why heuristics, not a runtime timeout: CPython's ``re`` engine does NOT
-# release the GIL during matching, so spawning a daemon thread to evaluate
-# the pattern with a ``threading.Event.wait(timeout=1.0)`` does not actually
-# bound execution — the main thread can't preempt the worker until the
-# regex completes. Measured locally with ``(a+)+$`` against a 30-a sentinel:
-# the daemon thread held the GIL for ~49 seconds while ``wait(1.0)`` was
-# blocked the whole time. (See CLAUDE.md "Don'ts" → pattern surface.)
-#
-# Patterns the heuristics catch:
-#   ``(X+)+``, ``(X*)*``, ``(X+)*``, ``(X*)+`` — nested quantifiers (the
-#   classic backtracking shape)
-#   ``{N,}`` / ``{N}`` with N > 10 — counted repetitions with overlap
-#     potential
-# Patterns they miss (by design, to keep false positives low):
-#   ``(a|aa)+`` — alternation-overlap ReDoS; relies on runtime timeout
-_NESTED_QUANTIFIER_RE = re.compile(r"\([^()]*[+*][^()]*\)[+*]")
-_LARGE_REPETITION_RE = re.compile(r"\{\s*([0-9]+)\s*,?\s*[0-9]*\s*\}")
-_LARGE_REPETITION_THRESHOLD = 10
 
 
 def _parse_match_type(value: str) -> str:
-    lowered = value.strip().lower()
-    if lowered not in ("contains", "regex"):
-        raise typer.BadParameter(
-            f"--match must be 'contains' or 'regex', got {value!r}", param_hint="--match"
-        )
-    return lowered
+    try:
+        return parse_match_type(value)
+    except RulePatternError as exc:
+        raise typer.BadParameter(str(exc), param_hint=exc.param_hint) from exc
 
 
 def _validate_rule_pattern(pattern: str, match_type: str) -> None:
-    """Refuse syntactically invalid or heuristically ReDoS-prone patterns.
+    """CLI wrapper over the shared validator (``validators.py``).
 
-    Best-effort check at write time. The load-bearing runtime defense is
-    the existing ``query_sql`` statement-timeout watchdog
-    (GOETTA_FINANCE_SQL_TIMEOUT_SECONDS, default 30s), which bounds any
-    pattern that slips past these heuristics. See CLAUDE.md "Don'ts" →
-    rule-pattern surface for the threat model.
-
-    Three layers, fastest first:
-      1. Non-empty + length cap.
-      2. For ``regex``: ``re.compile()`` — catches syntax errors.
-      3. For ``regex``: heuristic shape detector — refuses obviously
-         ReDoS-prone constructs (nested quantifiers; large counted
-         repetitions). False-positive rate is low; the heuristic is
-         conservative on purpose since legitimate finance-merchant
-         patterns are short.
+    The validator logic — and its ReDoS heuristics + GIL rationale —
+    lives in ``validators.validate_rule_pattern`` so the CLI and the
+    MCP ``add_category_rule`` tool gate the same write surface
+    identically. This wrapper only translates the typer-free
+    :class:`RulePatternError` into ``typer.BadParameter``.
     """
-    if not pattern.strip():
-        raise typer.BadParameter("pattern cannot be empty", param_hint="--pattern")
-    if len(pattern) > _PATTERN_MAX_LEN:
-        raise typer.BadParameter(
-            f"pattern is too long (>{_PATTERN_MAX_LEN} chars)", param_hint="--pattern"
-        )
-    if match_type == "contains":
-        return
-    if match_type != "regex":
-        raise typer.BadParameter(
-            f"--match must be 'contains' or 'regex', got {match_type!r}",
-            param_hint="--match",
-        )
     try:
-        re.compile(pattern)
-    except re.error as exc:
-        raise typer.BadParameter(f"regex did not compile: {exc}", param_hint="--pattern") from exc
-
-    if _NESTED_QUANTIFIER_RE.search(pattern):
-        raise typer.BadParameter(
-            "pattern contains a nested quantifier (e.g. (X+)+ or (X*)*); "
-            "this is the canonical ReDoS shape and is refused. Rewrite "
-            "without the outer quantifier or use 'contains' instead.",
-            param_hint="--pattern",
-        )
-    for match in _LARGE_REPETITION_RE.finditer(pattern):
-        try:
-            n = int(match.group(1))
-        except (TypeError, ValueError):
-            continue
-        if n > _LARGE_REPETITION_THRESHOLD:
-            raise typer.BadParameter(
-                f"pattern uses a counted repetition with N={n} "
-                f"(>{_LARGE_REPETITION_THRESHOLD}); refused as ReDoS-prone.",
-                param_hint="--pattern",
-            )
+        validate_rule_pattern(pattern, match_type)
+    except RulePatternError as exc:
+        raise typer.BadParameter(str(exc), param_hint=exc.param_hint) from exc
 
 
 def _suggest_category(store: DuckDBStore, user_input: str) -> str:

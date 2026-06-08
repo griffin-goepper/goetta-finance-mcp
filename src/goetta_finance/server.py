@@ -15,12 +15,24 @@ from goetta_finance.tools.accounts import list_accounts as _list_accounts
 from goetta_finance.tools.balance_history import (
     account_balance_history as _account_balance_history,
 )
+from goetta_finance.tools.categorize import (
+    add_category_rule as _add_category_rule,
+)
+from goetta_finance.tools.categorize import (
+    categorize_transaction as _categorize_transaction,
+)
+from goetta_finance.tools.categorize import (
+    uncategorize_transaction as _uncategorize_transaction,
+)
 from goetta_finance.tools.spending_by_category import (
     spending_by_category as _spending_by_category,
 )
 from goetta_finance.tools.sql_query import sql_query as _sql_query
 from goetta_finance.tools.sync_now import sync_now as _sync_now
 from goetta_finance.tools.transactions import get_transactions as _get_transactions
+from goetta_finance.tools.uncategorized import (
+    top_uncategorized_patterns as _top_uncategorized_patterns,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +138,14 @@ non-spending-categories-excluded semantic (spending = negative amounts
 only, returned as positive dollar values; non-spending categories like
 Transfers and Income are excluded by default) and the
 include_non_spending opt-in.
+
+Categorization curation happens in conversation: call
+top_uncategorized_patterns to surface what's hiding in the
+Uncategorized bucket, then categorize_transaction (one-off override)
+or add_category_rule (retroactive class-of-transactions rule) to act
+on it. Don't write INSERTs via sql_query — it's read-only; the
+curation tools are the write path and they run the same pattern
+validation as the CLI.
 
 The categories table carries an is_spending boolean (default TRUE) for
 each category. Transfers and Income are seeded with is_spending=FALSE
@@ -325,5 +345,96 @@ def build_server(
     )
     def sync_now() -> dict[str, Any]:
         return _sync_now(store, client)
+
+    @mcp.tool(
+        description=(
+            "Apply a manual per-transaction category override. The override "
+            "beats any matching rule and applies immediately to all reads. "
+            "Use for one-off recategorizations ('this transaction is actually "
+            "rent, not shopping'). Category names are case-insensitive; on a "
+            "typo the error suggests the closest match. For categorizing a "
+            "CLASS of transactions (every future occurrence of a merchant), "
+            "prefer add_category_rule instead."
+        )
+    )
+    def categorize_transaction(
+        transaction_id: Annotated[
+            str, Field(description="Transaction id (from get_transactions).")
+        ],
+        category: Annotated[
+            str, Field(description="Category name (case-insensitive, e.g. 'Dining').")
+        ],
+    ) -> dict[str, Any]:
+        return _categorize_transaction(store, transaction_id, category)
+
+    @mcp.tool(
+        description=(
+            "Remove a per-transaction category override. Idempotent — safe to "
+            "call even if no override exists. After clearing, the transaction "
+            "resolves through rules again (or falls back to 'Uncategorized'). "
+            "Use when the user wants to undo a categorize_transaction call."
+        )
+    )
+    def uncategorize_transaction(
+        transaction_id: Annotated[
+            str, Field(description="Transaction id to clear the override on.")
+        ],
+    ) -> dict[str, Any]:
+        return _uncategorize_transaction(store, transaction_id)
+
+    @mcp.tool(
+        description=(
+            "Add a categorization rule that applies retroactively to every "
+            "matching transaction — past and future — with no backfill needed. "
+            "match_type 'contains' is a case-insensitive substring on the "
+            "transaction description; 'regex' is a DuckDB regexp_matches call. "
+            "Lower priority wins when multiple rules match (default 100; "
+            "transfer-like patterns typically use 5 so they beat spending "
+            "rules). Patterns are validated for ReDoS shapes before insert. "
+            "Use when the user asks to categorize a class of transactions "
+            "('from now on, anything from Duke Energy is Utilities'). For "
+            "one-off fixes prefer categorize_transaction."
+        )
+    )
+    def add_category_rule(
+        category: Annotated[
+            str, Field(description="Category name (case-insensitive, e.g. 'Utilities').")
+        ],
+        pattern: Annotated[
+            str,
+            Field(description="Pattern matched against transaction description."),
+        ],
+        match_type: Annotated[
+            str, Field(description="'contains' (default) or 'regex'.")
+        ] = "contains",
+        priority: Annotated[
+            int,
+            Field(
+                ge=1,
+                le=1000,
+                description="Lower number = higher precedence. Default 100.",
+            ),
+        ] = 100,
+    ) -> dict[str, Any]:
+        return _add_category_rule(store, category, match_type, pattern, priority)
+
+    @mcp.tool(
+        description=(
+            "Surface the largest spending patterns currently sitting in the "
+            "Uncategorized bucket, normalized by stripping bank/processor "
+            "description prefixes (configurable via prefixes.txt) and grouping "
+            "by the first two tokens of what remains. Sorted by total "
+            "descending. Use when the user asks 'what's still uncategorized?' "
+            "or 'what should I add a rule for next?'. Each row carries a "
+            "suggested CLI command; alternatively call add_category_rule "
+            "directly once the user picks a category for a pattern."
+        )
+    )
+    def top_uncategorized_patterns(
+        days: Annotated[int, Field(ge=1, le=3650, description="Lookback window in days.")] = 30,
+        top: Annotated[int, Field(ge=1, le=100, description="Maximum rows returned.")] = 10,
+    ) -> list[dict[str, Any]]:
+        _maybe_trigger_lazy_sync(store, client)
+        return _top_uncategorized_patterns(store, days=days, top=top)
 
     return mcp

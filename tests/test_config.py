@@ -85,3 +85,68 @@ def test_db_path_uses_configured_filename(tmp_path: Path, monkeypatch: pytest.Mo
     cfg = Config(db_filename="custom.duckdb")
     assert db_path(cfg) == tmp_path / "custom.duckdb"
     assert db_path() == tmp_path / "data.duckdb"
+
+
+# --- prefix-strip list (prefixes.txt) ---------------------------------------
+
+
+def test_load_prefixes_falls_back_to_universal_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No prefixes.txt → the three processor-level defaults (TST*, SQ *,
+    AplPay). Bank-template prefixes are deliberately NOT in the default —
+    they vary per institution (stranger-test principle)."""
+    from goetta_finance.config import load_prefix_strip_patterns
+
+    monkeypatch.setenv("GOETTA_FINANCE_HOME", str(tmp_path))
+    patterns = load_prefix_strip_patterns()
+    assert len(patterns) == 3
+    assert patterns[0].match("TST* SOMETHING")
+    assert patterns[1].match("SQ *COFFEE")
+    assert patterns[2].match("AplPay SP MERCHANT")
+    # Bank templates are NOT stripped by default.
+    assert not any(p.match("Web Authorized Pmt X") for p in patterns)
+
+
+def test_load_prefixes_reads_user_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from goetta_finance.config import load_prefix_strip_patterns
+
+    monkeypatch.setenv("GOETTA_FINANCE_HOME", str(tmp_path))
+    (tmp_path / "prefixes.txt").write_text(
+        "# comment line\n\nWeb Authorized Pmt\\s*\nTST\\*\\s*\n", encoding="utf-8"
+    )
+    patterns = load_prefix_strip_patterns()
+    assert len(patterns) == 2  # comment + blank skipped
+    assert patterns[0].match("Web Authorized Pmt Spotify")
+
+
+def test_load_prefixes_skips_invalid_regex_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One bad line must not break the whole load."""
+    from goetta_finance.config import load_prefix_strip_patterns
+
+    monkeypatch.setenv("GOETTA_FINANCE_HOME", str(tmp_path))
+    (tmp_path / "prefixes.txt").write_text("[\nTST\\*\\s*\n", encoding="utf-8")
+    patterns = load_prefix_strip_patterns()
+    assert len(patterns) == 1
+    assert patterns[0].match("TST* X")
+
+
+def test_write_default_prefixes_file_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """init writes the template once; a user-edited file is never
+    clobbered on re-run (same posture as config.json)."""
+    from goetta_finance.config import prefixes_path, write_default_prefixes_file
+
+    monkeypatch.setenv("GOETTA_FINANCE_HOME", str(tmp_path))
+    path = write_default_prefixes_file()
+    assert path == prefixes_path()
+    content = path.read_text(encoding="utf-8")
+    assert "TST" in content
+    assert "uncomment" in content.lower()
+    # User edits the file; re-running init must not clobber it.
+    path.write_text("MY CUSTOM PREFIX\\s*\n", encoding="utf-8")
+    write_default_prefixes_file()
+    assert path.read_text(encoding="utf-8") == "MY CUSTOM PREFIX\\s*\n"

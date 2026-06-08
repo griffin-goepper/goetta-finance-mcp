@@ -71,6 +71,10 @@ async def test_server_lists_expected_tools(store: DuckDBStore) -> None:
             "sync_now",
             "sync_status",
             "spending_by_category",
+            "categorize_transaction",
+            "uncategorize_transaction",
+            "add_category_rule",
+            "top_uncategorized_patterns",
         }
 
 
@@ -128,6 +132,91 @@ async def test_server_spending_by_category_e2e(store: DuckDBStore) -> None:
     assert Decimal(by_cat["Groceries"]["total"]) > Decimal(by_cat["Dining"]["total"])
 
 
+@pytest.mark.anyio
+async def test_server_curation_tools_e2e(store: DuckDBStore) -> None:
+    """Full MCP round-trip for the curation surface: surface an
+    uncategorized pattern → add a rule → verify resolution; then
+    override one transaction and clear it."""
+    store.upsert_accounts(
+        [
+            Account(
+                id="cur-e2e",
+                org_name="Test",
+                name="Checking",
+                balance=Decimal("100.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.CHECKING,
+            )
+        ]
+    )
+    now = datetime.now(tz=UTC)
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="cur-e2e-t1",
+                account_id="cur-e2e",
+                posted=now - timedelta(days=2),
+                amount=Decimal("-45.00"),
+                description="NEW GYM LLC MEMBERSHIP",
+            )
+        ]
+    )
+    mcp = build_server(store)
+    async with create_connected_server_and_client_session(mcp) as session:
+        await session.initialize()
+
+        # 1. Discovery: the gym shows up as uncategorized.
+        result = await session.call_tool("top_uncategorized_patterns", {"days": 30, "top": 5})
+        payload = _decode(result)
+        assert isinstance(payload, list)
+        assert any("NEW GYM" in r["pattern"] for r in payload)
+
+        # 2. Curation: add a rule through MCP.
+        result = await session.call_tool(
+            "add_category_rule",
+            {"category": "Healthcare", "pattern": "NEW GYM LLC"},
+        )
+        payload = _decode(result)
+        assert payload["ok"] is True
+
+        # 3. The transaction now resolves through the rule.
+        result = await session.call_tool("get_transactions", {"search": "GYM"})
+        payload = _decode(result)
+        assert payload[0]["category"] == "Healthcare"
+
+        # 4. Override beats the rule; clearing falls back.
+        result = await session.call_tool(
+            "categorize_transaction",
+            {"transaction_id": "cur-e2e-t1", "category": "Entertainment"},
+        )
+        assert _decode(result)["ok"] is True
+        result = await session.call_tool("get_transactions", {"search": "GYM"})
+        assert _decode(result)[0]["category"] == "Entertainment"
+
+        result = await session.call_tool(
+            "uncategorize_transaction", {"transaction_id": "cur-e2e-t1"}
+        )
+        assert _decode(result)["ok"] is True
+        result = await session.call_tool("get_transactions", {"search": "GYM"})
+        assert _decode(result)[0]["category"] == "Healthcare"
+
+
+@pytest.mark.anyio
+async def test_server_add_category_rule_rejects_redos_e2e(store: DuckDBStore) -> None:
+    """The MCP write surface refuses ReDoS patterns — same validator as
+    the CLI, exercised through the real FastMCP parameter path."""
+    mcp = build_server(store)
+    async with create_connected_server_and_client_session(mcp) as session:
+        await session.initialize()
+        result = await session.call_tool(
+            "add_category_rule",
+            {"category": "Dining", "pattern": "(a+)+$", "match_type": "regex"},
+        )
+        payload = _decode(result)
+        assert payload["ok"] is False
+        assert "validation failed" in payload["error"]
+
+
 def test_schema_hint_mentions_categorization_tables() -> None:
     """Floor: identifier markers present. If a future schema slice
     adds a table or flag, this test fails until the hint is updated."""
@@ -163,6 +252,9 @@ def test_schema_hint_communicates_categorization_semantics() -> None:
         "spending_by_category",  # tool-preference guidance
         "preserved across",  # user-owned flag preservation guarantee (0005)
         "non-spending",  # is_spending semantic guarantee (0006)
+        "top_uncategorized_patterns",  # curation discovery entry point
+        "add_category_rule",  # curation write path (NOT sql_query)
+        "categorize_transaction",  # one-off override path
     ]
     for phrase in expected_phrases:
         assert phrase in SQL_SCHEMA_HINT, (
