@@ -14,6 +14,7 @@ import plotly.graph_objects as go
 
 from goetta_finance.store import FinanceStore
 from goetta_finance.web.aggregations import (
+    display_currency,
     monthly_income_spending,
     net_worth_series,
     spending_by_category_last_n_days,
@@ -24,6 +25,7 @@ def net_worth_figure(
     store: FinanceStore, *, days: int = 90, now: datetime | None = None
 ) -> dict[str, Any]:
     points = net_worth_series(store, days=days, now=now)
+    currency = display_currency(store)
     figure = go.Figure(
         data=[
             go.Scatter(
@@ -31,13 +33,13 @@ def net_worth_figure(
                 y=[float(p.balance) for p in points],
                 mode="lines+markers",
                 name="Net worth",
-                hovertemplate="%{x|%b %d, %Y}<br>$%{y:,.2f}<extra></extra>",
+                hovertemplate="%{x|%b %d, %Y}<br>%{y:,.2f}<extra></extra>",
             )
         ],
         layout=go.Layout(
             title="Net worth",
             xaxis={"title": "Date"},
-            yaxis={"title": "Balance (USD)", "tickformat": ",.0f"},
+            yaxis={"title": f"Balance ({currency})", "tickformat": ",.0f"},
             margin={"l": 60, "r": 20, "t": 50, "b": 50},
         ),
     )
@@ -61,7 +63,7 @@ def spending_by_category_figure(
             go.Pie(
                 labels=[r.category for r in rows],
                 values=[float(r.total) for r in rows],
-                hovertemplate="%{label}<br>$%{value:,.2f} (%{percent})<extra></extra>",
+                hovertemplate="%{label}<br>%{value:,.2f} (%{percent})<extra></extra>",
                 textinfo="label+percent",
                 sort=False,  # preserve descending-by-total order from SQL
             )
@@ -79,6 +81,7 @@ def spending_figure(
 ) -> dict[str, Any]:
     rows = monthly_income_spending(store, months=months, now=now)
     months_axis = [r.month.isoformat() for r in rows]
+    currency = display_currency(store)
     figure = go.Figure(
         data=[
             go.Bar(
@@ -86,14 +89,14 @@ def spending_figure(
                 y=[float(r.income) for r in rows],
                 name="Income",
                 marker_color="#2ecc71",
-                hovertemplate="%{x|%b %Y}<br>+$%{y:,.2f}<extra></extra>",
+                hovertemplate="%{x|%b %Y}<br>+%{y:,.2f}<extra></extra>",
             ),
             go.Bar(
                 x=months_axis,
                 y=[-float(r.spending) for r in rows],
                 name="Spending",
                 marker_color="#e74c3c",
-                hovertemplate="%{x|%b %Y}<br>-$%{customdata:,.2f}<extra></extra>",
+                hovertemplate="%{x|%b %Y}<br>-%{customdata:,.2f}<extra></extra>",
                 customdata=[float(r.spending) for r in rows],
             ),
         ],
@@ -101,7 +104,7 @@ def spending_figure(
             title="Income and spending by month",
             barmode="relative",
             xaxis={"title": "Month", "type": "category"},
-            yaxis={"title": "USD", "tickformat": ",.0f"},
+            yaxis={"title": currency, "tickformat": ",.0f"},
             margin={"l": 60, "r": 20, "t": 50, "b": 50},
         ),
     )

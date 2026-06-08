@@ -704,6 +704,13 @@ def account_add(
             help="Mark this account as a liability (debt). Subtracts from net worth.",
         ),
     ] = False,
+    currency: Annotated[
+        str,
+        typer.Option(
+            "--currency",
+            help="ISO 4217 currency code (e.g. USD, EUR, GBP). Default USD.",
+        ),
+    ] = "USD",
 ) -> None:
     """Add a manual account. Prompts interactively for any missing values."""
     # Validate provided flag values up-front, before any interactive prompt.
@@ -753,7 +760,7 @@ def account_add(
             org_id=None,
             org_name=org,
             name=name,
-            currency="USD",
+            currency=currency.strip().upper(),
             balance=balance_value,
             available_balance=None,
             balance_date=balance_date,
@@ -769,7 +776,7 @@ def account_add(
         typer.echo(f"Added {account_id}")
         tags = " [liability]" if liability else ""
         typer.echo(
-            f"  {org or '—'} / {name}{tags}: {balance_value:.2f} USD as of "
+            f"  {org or '—'} / {name}{tags}: {balance_value:.2f} {account.currency} as of "
             f"{balance_date.astimezone().isoformat(timespec='seconds')}"
         )
     except GoettaFinanceError as exc:

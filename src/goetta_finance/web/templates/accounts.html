@@ -31,7 +31,7 @@
       <tfoot>
         <tr class="net-worth-row">
           <td colspan="2"><strong>Net worth</strong> <span class="muted">(liabilities subtracted)</span></td>
-          <td class="num"><strong>{{ net_worth }} USD</strong></td>
+          <td class="num"><strong>{{ net_worth }} {{ currency }}</strong></td>
           <td class="num">—</td>
           <td>—</td>
         </tr>
@@ -40,7 +40,7 @@
     {% if hidden_count and hidden_count > 0 %}
       <p class="muted">
         Excludes {{ hidden_count }} hidden account{% if hidden_count != 1 %}s{% endif %}
-        (signed total {{ hidden_total }} USD). Unhide via
+        (signed total {{ hidden_total }} {{ currency }}). Unhide via
         <code>goetta-finance account set-hidden &lt;id&gt; false</code>.
       </p>
     {% endif %}

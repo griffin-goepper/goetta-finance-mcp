@@ -15,7 +15,7 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from goetta_finance.tools.accounts import serialize_account
-from goetta_finance.web.aggregations import recent_sync_runs
+from goetta_finance.web.aggregations import display_currency, recent_sync_runs
 from goetta_finance.web.charts import (
     net_worth_figure,
     spending_by_category_figure,
@@ -95,6 +95,10 @@ def register_routes(app: FastAPI) -> None:
                 "net_worth": f"{net_worth:,.2f}",
                 "hidden_count": hidden_count,
                 "hidden_total": f"{hidden_total:,.2f}",
+                # Aggregate label: the unique currency across visible
+                # accounts, or 'mixed'. Per-row currency comes from each
+                # account's own field. FX conversion is out of scope.
+                "currency": display_currency(store),
                 "active": "accounts",
             },
         )

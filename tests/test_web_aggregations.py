@@ -6,6 +6,7 @@ from decimal import Decimal
 from goetta_finance.models import Account, AccountType, BalanceSnapshot, Transaction
 from goetta_finance.store.duckdb_store import DuckDBStore
 from goetta_finance.web.aggregations import (
+    display_currency,
     monthly_income_spending,
     net_worth_series,
     recent_sync_runs,
@@ -381,3 +382,56 @@ def test_spending_by_category_last_n_days_excludes_income(
     store.set_transaction_override("paycheck", "Income")
     series = spending_by_category_last_n_days(store, days=30, now=fixed_now)
     assert "Income" not in {p.category for p in series}
+
+
+# --- display_currency --------------------------------------------------------
+
+
+def test_display_currency_single_currency(store: DuckDBStore) -> None:
+    """A GBP-only user sees GBP on aggregate labels, not a hardcoded USD
+    (stranger-test principle: don't bake US assumptions into the display)."""
+    store.upsert_accounts(
+        [
+            Account(
+                id="gbp-1",
+                org_name="Monzo",
+                name="Current",
+                currency="GBP",
+                balance=Decimal("100.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.CHECKING,
+            )
+        ]
+    )
+    assert display_currency(store) == "GBP"
+
+
+def test_display_currency_mixed_is_honest(store: DuckDBStore) -> None:
+    """Accounts spanning currencies → 'mixed', not a silent USD sum-label.
+    Hidden accounts don't contribute (a hidden EUR account shouldn't flip
+    a USD-only display to 'mixed')."""
+    store.upsert_accounts(
+        [
+            Account(
+                id="usd-1",
+                org_name="Chase",
+                name="Checking",
+                currency="USD",
+                balance=Decimal("100.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.CHECKING,
+            ),
+            Account(
+                id="eur-1",
+                org_name="N26",
+                name="Konto",
+                currency="EUR",
+                balance=Decimal("50.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.CHECKING,
+            ),
+        ]
+    )
+    assert display_currency(store) == "mixed"
+    store.set_account_hidden("eur-1", True)
+    assert display_currency(store) == "USD"

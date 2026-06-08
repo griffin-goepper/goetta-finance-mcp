@@ -176,6 +176,24 @@ def spending_by_category_last_n_days(
     ]
 
 
+def display_currency(store: FinanceStore) -> str:
+    """Currency code for cross-account aggregate displays.
+
+    If every visible (non-hidden) account shares one currency, use it —
+    a UK-only user sees GBP on the net-worth chart, not USD. If accounts
+    span currencies, return 'mixed' so the label is honest rather than
+    silently summing apples and oranges under a dollar sign.
+    Multi-currency *arithmetic* (FX conversion) is out of scope; this
+    only fixes the label.
+    """
+    currencies = {a.currency for a in store.get_accounts()}
+    if len(currencies) == 1:
+        return next(iter(currencies))
+    if not currencies:
+        return "USD"
+    return "mixed"
+
+
 def recent_sync_runs(store: FinanceStore, *, limit: int = 10) -> list[dict[str, object]]:
     """Most recent sync_runs rows, newest first. Warnings/errors come back
     as JSON strings from DuckDB; callers can parse them as needed."""
@@ -204,6 +222,7 @@ __all__: Sequence[str] = (
     "CategoryTotal",
     "MonthlyCashflow",
     "NetWorthPoint",
+    "display_currency",
     "monthly_income_spending",
     "net_worth_series",
     "recent_sync_runs",

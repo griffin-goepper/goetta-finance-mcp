@@ -135,7 +135,7 @@ For category-aware queries prefer transactions_with_category over the
 bare transactions table. For "what did I spend on X" questions prefer
 the spending_by_category tool over ad-hoc SQL; it already enforces the
 non-spending-categories-excluded semantic (spending = negative amounts
-only, returned as positive dollar values; non-spending categories like
+only, returned as positive amounts; non-spending categories like
 Transfers and Income are excluded by default) and the
 include_non_spending opt-in.
 
@@ -253,7 +253,7 @@ def build_server(
     @mcp.tool(
         description=(
             "Returns categorized spending totals (negative amounts only, "
-            "returned as positive dollar values). Non-spending categories "
+            "returned as positive amounts). Non-spending categories "
             "(Transfers, Income, and any category with is_spending=FALSE) "
             "are excluded by default; pass include_non_spending=True to "
             "include them. Income rows come back with a negative total "
