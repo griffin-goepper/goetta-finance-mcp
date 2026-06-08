@@ -12,7 +12,20 @@ version = "0.1.0"
 description = "Local-first MCP server that connects SimpleFIN to Claude."
 readme = "README.md"
 requires-python = ">=3.11"
-authors = [{ name = "goetta-finance contributors" }]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Griffin Goepper" }]
+keywords = ["simplefin", "mcp", "personal-finance", "duckdb", "claude", "local-first"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial",
+]
 dependencies = [
     "pydantic>=2.6",
     "httpx>=0.27",
@@ -24,6 +37,11 @@ dependencies = [
     "jinja2>=3",
     "plotly>=5",
 ]
+
+[project.urls]
+Homepage = "https://github.com/griffin-goepper/goetta-finance-mcp"
+Repository = "https://github.com/griffin-goepper/goetta-finance-mcp"
+Issues = "https://github.com/griffin-goepper/goetta-finance-mcp/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -40,10 +58,14 @@ dev = [
 goetta-finance = "goetta_finance.cli:app"
 
 [tool.hatch.build.targets.wheel]
+# ``packages`` already ships every file under src/goetta_finance, including
+# the .sql migration files and the bundled web assets (templates, static).
+# A previous ``force-include`` of the migrations re-added them at the same
+# wheel path and broke ``python -m build`` with a duplicate-path error
+# (hatchling rejects two files at one archive path). The package include
+# is sufficient on its own — verified by inspecting the built wheel's
+# contents (see the build-verification step in the license/packaging slice).
 packages = ["src/goetta_finance"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/goetta_finance/store/migrations" = "goetta_finance/store/migrations"
 
 [tool.ruff]
 line-length = 100

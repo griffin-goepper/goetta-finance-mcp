@@ -425,4 +425,6 @@ Raw scanner output is git-ignored on purpose — see [`docs/SECURITY_AUDIT_2026-
 
 ## License
 
-Not yet declared. The project isn't published; choose a license before publishing.
+[MIT](./LICENSE) © 2026 Griffin Goepper. Use it, fork it, ship it.
+
+Contributions welcome — see [`CONTRIBUTING.md`](./CONTRIBUTING.md).
