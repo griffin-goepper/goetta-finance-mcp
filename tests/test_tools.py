@@ -270,13 +270,13 @@ def test_spending_by_category_includes_non_spending_with_opt_in(
     assert Decimal(transfers["total"]) == Decimal("500.00")
 
 
-def test_spending_by_category_excludes_rule_resolved_refund_in_default(
+def test_spending_by_category_rule_resolved_refund_net_reduces(
     store: DuckDBStore,
 ) -> None:
-    """A POSITIVE-amount transaction whose category resolves via the
-    default RULE for STARBUCKS → Dining must NOT pollute the Dining
-    total in default mode. Exercises the matched_rule branch of the
-    view (no override row)."""
+    """A POSITIVE-amount refund whose category resolves via the default
+    RULE for STARBUCKS → Dining NET-REDUCES the Dining total (net
+    spending). Exercises the matched_rule branch of the view (no
+    override row)."""
     store.upsert_accounts(
         [
             Account(
@@ -311,11 +311,11 @@ def test_spending_by_category_excludes_rule_resolved_refund_in_default(
         store, datetime(2026, 5, 1, tzinfo=UTC), datetime(2026, 5, 31, tzinfo=UTC)
     )
     dining = next(r for r in rows if r["category"] == "Dining")
-    assert dining["total"] == "12.50"  # not 8.50 — the refund is excluded
-    assert dining["transaction_count"] == 1
+    assert dining["total"] == "8.50"  # 12.50 - 4.00 net (refund subtracts)
+    assert dining["transaction_count"] == 2
 
 
-def test_spending_by_category_excludes_override_resolved_refund_in_default(
+def test_spending_by_category_override_resolved_refund_net_reduces(
     store: DuckDBStore,
 ) -> None:
     """Same as above but the refund's category comes from a manual
@@ -359,8 +359,8 @@ def test_spending_by_category_excludes_override_resolved_refund_in_default(
         store, datetime(2026, 5, 1, tzinfo=UTC), datetime(2026, 5, 31, tzinfo=UTC)
     )
     dining = next(r for r in rows if r["category"] == "Dining")
-    assert dining["total"] == "50.00"  # not 30.00 — refund excluded
-    assert dining["transaction_count"] == 1
+    assert dining["total"] == "30.00"  # 50.00 - 20.00 net (refund subtracts)
+    assert dining["transaction_count"] == 2
 
 
 def test_spending_by_category_total_is_string(store: DuckDBStore) -> None:

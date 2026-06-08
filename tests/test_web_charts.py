@@ -72,6 +72,10 @@ def test_net_worth_figure_shape(store: DuckDBStore) -> None:
 
 def test_spending_figure_has_income_and_spending_traces(store: DuckDBStore) -> None:
     _seed(store)
+    # Income is strict (Income-categorized only); the paycheck must be
+    # overridden to Income to drive the income bar. The rent stays
+    # uncategorized spending.
+    store.set_transaction_override("t1", "Income")
     fig = spending_figure(store, months=3, now=datetime(2026, 5, 16, tzinfo=UTC))
     assert set(fig.keys()) == {"data", "layout"}
     assert len(fig["data"]) == 2

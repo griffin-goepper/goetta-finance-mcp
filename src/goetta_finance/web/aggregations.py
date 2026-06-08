@@ -36,10 +36,22 @@ class CategoryTotal(NamedTuple):
 def monthly_income_spending(
     store: FinanceStore, *, months: int = 12, now: datetime | None = None
 ) -> list[MonthlyCashflow]:
-    """Sum income (positive amounts) and spending (abs of negative amounts)
-    grouped by month for the last ``months`` calendar months. Pending
-    transactions are excluded by upstream parsing (collector drops them),
-    but we double-guard with ``pending = false`` anyway.
+    """Category-aware monthly income / net-spending, last ``months`` months.
+
+    Routes through ``transactions_with_category`` JOIN ``categories`` so
+    the bars respect categorization (the bare-``transactions`` version
+    predated it and double-counted transfers, miscounted refunds, and
+    ignored hidden accounts):
+
+    - **Spending** uses the SAME net-spending expression as the pie
+      (``query_spending_by_category``): ``-amount`` over ``is_spending``
+      categories (refunds net-reduce), EXCEPT a positive amount in
+      ``Uncategorized`` which contributes 0. Non-spending categories
+      (Transfers, Income) and hidden accounts contribute 0.
+    - **Income** is strict: positive amounts whose resolved category is
+      ``Income``. A raw positive amount is NOT income until categorized
+      (it could be a refund or a transfer leg). So the income bar reads
+      ~0 until the user adds an Income rule.
 
     Months with no activity are returned as zero-rows so the chart's bars
     line up on the x axis.
@@ -56,12 +68,18 @@ def monthly_income_spending(
     rows = store.query_sql(
         """
         SELECT
-            date_trunc('month', posted) AS month,
-            SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) AS income,
-            SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END) AS spending
-        FROM transactions
-        WHERE posted >= ?
-          AND pending = false
+            date_trunc('month', t.posted) AS month,
+            SUM(CASE WHEN c.name = 'Income' AND t.amount > 0 THEN t.amount ELSE 0 END) AS income,
+            SUM(CASE
+                WHEN COALESCE(c.is_spending, TRUE) = FALSE THEN 0
+                WHEN t.amount > 0 AND t.category = 'Uncategorized' THEN 0
+                ELSE -t.amount
+            END) AS spending
+        FROM transactions_with_category t
+        LEFT JOIN categories c ON c.name = t.category
+        WHERE t.posted >= ?
+          AND t.pending = false
+          AND COALESCE(t.account_is_hidden, FALSE) = FALSE
         GROUP BY 1
         ORDER BY 1
         """,

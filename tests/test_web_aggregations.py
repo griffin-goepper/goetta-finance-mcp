@@ -64,15 +64,187 @@ def test_monthly_income_spending_groups_by_month(store: DuckDBStore) -> None:
             ),
         ]
     )
+    # Income is strict (Income-categorized only) — the paycheck must be
+    # overridden to Income to count on the income bar. A raw positive
+    # amount is no longer income (it could be a refund/transfer leg).
+    store.set_transaction_override("t2", "Income")
     rows = monthly_income_spending(store, months=3, now=datetime(2026, 5, 16, tzinfo=UTC))
     assert len(rows) == 3  # March (zero), April, May
     by_month = {r.month: r for r in rows}
     assert by_month[date(2026, 3, 1)].income == Decimal("0")
     assert by_month[date(2026, 3, 1)].spending == Decimal("0")
-    assert by_month[date(2026, 4, 1)].income == Decimal("5000.00")
-    assert by_month[date(2026, 4, 1)].spending == Decimal("100.00")
+    assert by_month[date(2026, 4, 1)].income == Decimal("5000.00")  # via Income category
+    assert by_month[date(2026, 4, 1)].spending == Decimal("100.00")  # rent only; paycheck excluded
     assert by_month[date(2026, 5, 1)].income == Decimal("0")
     assert by_month[date(2026, 5, 1)].spending == Decimal("250.00")
+
+
+def test_uncategorized_positive_amount_does_not_net_reduce_spending(
+    store: DuckDBStore,
+) -> None:
+    """The uncategorized-positive guard: a +$5000 uncategorized deposit
+    must NOT be treated as a phantom refund dragging the spending bar to
+    -4800. It contributes 0; the bar shows only the -$200 spend. And it
+    is NOT income (not Income-categorized)."""
+    _seed_accounts(store)
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="up-deposit",
+                account_id="a1",
+                posted=datetime(2026, 4, 10, tzinfo=UTC),
+                amount=Decimal("5000.00"),  # uncategorized positive
+                description="ZZZ MYSTERY DEPOSIT",
+            ),
+            Transaction(
+                id="up-spend",
+                account_id="a1",
+                posted=datetime(2026, 4, 12, tzinfo=UTC),
+                amount=Decimal("-200.00"),  # uncategorized spend
+                description="ZZZ MYSTERY SPEND",
+            ),
+        ]
+    )
+    rows = monthly_income_spending(store, months=2, now=datetime(2026, 4, 30, tzinfo=UTC))
+    april = next(r for r in rows if r.month == date(2026, 4, 1))
+    assert april.spending == Decimal("200.00"), "uncategorized positive must not net-reduce"
+    assert april.income == Decimal("0"), "uncategorized positive is not income"
+
+
+def test_monthly_income_spending_excludes_transfers_and_hidden(
+    store: DuckDBStore,
+) -> None:
+    """Transfers (is_spending=FALSE) and hidden-account transactions
+    contribute to neither bar."""
+    _seed_accounts(store)
+    store.upsert_accounts(
+        [
+            Account(
+                id="hidden-acc",
+                org_name="Old",
+                name="Closed",
+                balance=Decimal("0.00"),
+                balance_date=datetime(2026, 4, 1, tzinfo=UTC),
+                type=AccountType.CHECKING,
+            )
+        ]
+    )
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="real-spend",
+                account_id="a1",
+                posted=datetime(2026, 4, 5, tzinfo=UTC),
+                amount=Decimal("-50.00"),
+                description="ZZZ REAL SPEND",
+            ),
+            Transaction(
+                id="a-transfer",
+                account_id="a1",
+                posted=datetime(2026, 4, 6, tzinfo=UTC),
+                amount=Decimal("-3000.00"),  # would inflate spending pre-fix
+                description="ZZZ XFER OUT",
+            ),
+            Transaction(
+                id="hidden-spend",
+                account_id="hidden-acc",
+                posted=datetime(2026, 4, 7, tzinfo=UTC),
+                amount=Decimal("-999.00"),  # hidden account
+                description="ZZZ HIDDEN SPEND",
+            ),
+        ]
+    )
+    store.set_transaction_override("a-transfer", "Transfers")
+    store.set_account_hidden("hidden-acc", True)
+    rows = monthly_income_spending(store, months=2, now=datetime(2026, 4, 30, tzinfo=UTC))
+    april = next(r for r in rows if r.month == date(2026, 4, 1))
+    assert april.spending == Decimal("50.00")  # only the real spend
+    assert april.income == Decimal("0")
+
+
+def test_pie_and_monthly_bar_agree_on_net_spending(store: DuckDBStore) -> None:
+    """The unification property as a pinned contract: for one mixed month
+    (spend + refund + transfer + hidden + uncategorized positive), the
+    pie's category-summed total == the monthly bar's spending value, to
+    the cent. Both compute net spending the same way."""
+    _seed_accounts(store)
+    store.upsert_accounts(
+        [
+            Account(
+                id="hid2",
+                org_name="Old",
+                name="Closed",
+                balance=Decimal("0.00"),
+                balance_date=datetime(2026, 4, 1, tzinfo=UTC),
+                type=AccountType.CHECKING,
+            )
+        ]
+    )
+    store.upsert_transactions(
+        [
+            # Categorized spend (Dining via legacy STARBUCKS rule) + a refund.
+            Transaction(
+                id="m-sbux",
+                account_id="a1",
+                posted=datetime(2026, 4, 5, tzinfo=UTC),
+                amount=Decimal("-40.00"),
+                description="STARBUCKS STORE",
+            ),
+            Transaction(
+                id="m-sbux-refund",
+                account_id="a1",
+                posted=datetime(2026, 4, 6, tzinfo=UTC),
+                amount=Decimal("10.00"),  # refund → net-reduces Dining
+                description="STARBUCKS STORE REFUND",
+            ),
+            # Uncategorized: a spend and an ambiguous positive (contributes 0).
+            Transaction(
+                id="m-uncat-spend",
+                account_id="a1",
+                posted=datetime(2026, 4, 7, tzinfo=UTC),
+                amount=Decimal("-25.00"),
+                description="ZZZ MYSTERY",
+            ),
+            Transaction(
+                id="m-uncat-pos",
+                account_id="a1",
+                posted=datetime(2026, 4, 8, tzinfo=UTC),
+                amount=Decimal("500.00"),  # ambiguous → 0
+                description="ZZZ MYSTERY CREDIT",
+            ),
+            # Transfer (excluded) and hidden-account spend (excluded).
+            Transaction(
+                id="m-xfer",
+                account_id="a1",
+                posted=datetime(2026, 4, 9, tzinfo=UTC),
+                amount=Decimal("-3000.00"),
+                description="ZZZ XFER",
+            ),
+            Transaction(
+                id="m-hidden",
+                account_id="hid2",
+                posted=datetime(2026, 4, 10, tzinfo=UTC),
+                amount=Decimal("-777.00"),
+                description="ZZZ HIDDEN",
+            ),
+        ]
+    )
+    store.set_transaction_override("m-xfer", "Transfers")
+    store.set_account_hidden("hid2", True)
+
+    fixed_now = datetime(2026, 4, 30, tzinfo=UTC)
+    bar = next(
+        r
+        for r in monthly_income_spending(store, months=1, now=fixed_now)
+        if r.month == date(2026, 4, 1)
+    )
+    pie = spending_by_category_last_n_days(store, days=30, now=fixed_now)
+    pie_total = sum((p.total for p in pie), Decimal("0"))
+
+    # Dining net = 40 - 10 = 30; Uncategorized = 25 (positive ignored).
+    # Transfer + hidden excluded. Expected = 55.00 on both surfaces.
+    assert bar.spending == Decimal("55.00")
+    assert pie_total == bar.spending
 
 
 def test_monthly_income_spending_handles_year_boundary(store: DuckDBStore) -> None:

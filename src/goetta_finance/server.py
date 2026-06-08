@@ -252,13 +252,17 @@ def build_server(
 
     @mcp.tool(
         description=(
-            "Returns categorized spending totals (negative amounts only, "
-            "returned as positive amounts). Non-spending categories "
-            "(Transfers, Income, and any category with is_spending=FALSE) "
-            "are excluded by default; pass include_non_spending=True to "
-            "include them. Income rows come back with a negative total "
-            "(cash in); Transfers rows come back positive (cash leaving "
-            "the source account, but moving to one of your own accounts)."
+            "Returns NET spending totals per category (spending minus "
+            "refunds), as positive dollar values. A refund within a "
+            "spending category (a positive amount, e.g. a returned Dining "
+            "purchase) reduces that category's total. A positive amount in "
+            "Uncategorized contributes 0 (ambiguous until categorized). "
+            "Non-spending categories (Transfers, Income, and any category "
+            "with is_spending=FALSE) are excluded by default; pass "
+            "include_non_spending=True to include them — Income rows come "
+            "back with a negative total (cash in), Transfers positive "
+            "(cash leaving the source account, but moving to one of your "
+            "own accounts)."
         )
     )
     def spending_by_category(
