@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.png" alt="goetta-finance logo" width="180">
+</p>
+
 # goetta-finance
 
 A local-first tool that connects [SimpleFIN](https://bridge.simplefin.org/) to Claude. Your bank data lives only on your machine, in a DuckDB file you own. Claude reads it through an MCP server; you read it through a small web dashboard at `localhost:8765`.
