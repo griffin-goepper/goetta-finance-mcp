@@ -4,6 +4,14 @@
 
 # goetta-finance
 
+[![CI](https://img.shields.io/github/actions/workflow/status/griffin-goepper/goetta-finance-mcp/ci.yml?branch=main&label=CI&logo=github)](https://github.com/griffin-goepper/goetta-finance-mcp/actions/workflows/ci.yml)
+[![security](https://img.shields.io/github/actions/workflow/status/griffin-goepper/goetta-finance-mcp/security.yml?branch=main&label=security&logo=github)](https://github.com/griffin-goepper/goetta-finance-mcp/actions/workflows/security.yml)
+[![license](https://img.shields.io/github/license/griffin-goepper/goetta-finance-mcp?color=green)](./LICENSE)
+![python](https://img.shields.io/badge/python-3.11%2B-blue?logo=python&logoColor=white)
+![storage](https://img.shields.io/badge/storage-DuckDB-fcc419)
+![MCP](https://img.shields.io/badge/MCP-ready-orange)
+[![lint: ruff](https://img.shields.io/badge/lint-ruff-261230?logo=ruff&logoColor=white)](https://github.com/astral-sh/ruff)
+
 A local-first tool that connects [SimpleFIN](https://bridge.simplefin.org/) to Claude. Your bank data lives only on your machine, in a DuckDB file you own. Claude reads it through an MCP server; you read it through a small web dashboard at `localhost:8765`.
 
 See [`PROJECT_PLAN.md`](./PROJECT_PLAN.md) for the full vision and roadmap.
