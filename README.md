@@ -4,6 +4,7 @@
 
 # goetta-finance
 
+[![PyPI](https://img.shields.io/pypi/v/goetta-finance?logo=pypi&logoColor=white)](https://pypi.org/project/goetta-finance/)
 [![CI](https://img.shields.io/github/actions/workflow/status/griffin-goepper/goetta-finance-mcp/ci.yml?branch=main&label=CI&logo=github)](https://github.com/griffin-goepper/goetta-finance-mcp/actions/workflows/ci.yml)
 [![security](https://img.shields.io/github/actions/workflow/status/griffin-goepper/goetta-finance-mcp/security.yml?branch=main&label=security&logo=github)](https://github.com/griffin-goepper/goetta-finance-mcp/actions/workflows/security.yml)
 [![license](https://img.shields.io/github/license/griffin-goepper/goetta-finance-mcp?color=green)](./LICENSE)
@@ -23,18 +24,25 @@ See [`PROJECT_PLAN.md`](./PROJECT_PLAN.md) for the full vision and roadmap.
 
 ## Install
 
-`goetta-finance` isn't on PyPI yet. Clone the repo and install in editable mode:
+```bash
+pipx install goetta-finance      # recommended
+# or:  pip install goetta-finance
+```
+
+[`pipx`](https://pipx.pypa.io/) is the cleanest way to install a Python CLI: it lives in its own isolated environment and puts the `goetta-finance` command on your `PATH`. That global path is also the stable thing to point Claude Desktop's MCP config at — no project venv path to chase.
+
+<details>
+<summary>From source (for development)</summary>
 
 ```bash
-git clone <repo-url>
-cd goetta-finance
+git clone https://github.com/griffin-goepper/goetta-finance-mcp.git
+cd goetta-finance-mcp
 python -m venv .venv
 .venv/Scripts/activate         # Windows
 # source .venv/bin/activate    # macOS/Linux
 pip install -e ".[dev]"
 ```
-
-This puts a `goetta-finance` executable on your `PATH` (inside the venv).
+</details>
 
 ## Quick start
 
