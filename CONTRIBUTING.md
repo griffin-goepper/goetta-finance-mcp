@@ -42,3 +42,23 @@ The repo ships `bandit` / `ruff S` / `pip-audit` / `gitleaks` wired through pre-
 ## Opening a PR
 
 Keep changes to one concern (operating principle #3 — don't bundle the collector refactor with the SQL-tool work). Describe what changed, anything you decided that wasn't obvious, and anything you stubbed or skipped. CI runs the four gates above plus the security scanners.
+
+## Releasing (maintainer)
+
+Releases publish to PyPI via **Trusted Publishing** (OIDC) — no API token is stored anywhere.
+
+One-time setup, before the first release:
+
+1. On **PyPI** → *Your account → Publishing* → add a *pending* Trusted Publisher:
+   - PyPI Project Name: `goetta-finance`
+   - Owner: `griffin-goepper` · Repository: `goetta-finance-mcp`
+   - Workflow: `release.yml` · Environment: `pypi`
+2. On **GitHub** → *Settings → Environments* → create an environment named `pypi`
+   (optionally require a reviewer so a deploy needs approval).
+
+To cut a release:
+
+1. Bump `version` in `pyproject.toml`; open it as a PR and merge.
+2. Create a **GitHub Release** with tag `vX.Y.Z` (matching the version).
+3. [`.github/workflows/release.yml`](./.github/workflows/release.yml) builds the sdist +
+   wheel, verifies the wheel ships the migrations and web assets, then publishes via OIDC.
