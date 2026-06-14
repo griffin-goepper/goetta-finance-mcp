@@ -1,0 +1,60 @@
+# Functional CI: lint + format + type-check + tests on every PR + push to main.
+#
+# Companion to security.yml (bandit + pip-audit + gitleaks). Both share the
+# `pip install -e ".[dev]"` setup; if a third workflow lands, factor the setup
+# into a composite action rather than copying it a third time.
+#
+# Enforces the project's "passing PR-equivalent" bar from CLAUDE.md:
+# ruff check + ruff format --check + mypy --strict + pytest.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Tests don't touch the GitHub API; read-only is all this needs.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ruff + mypy + pytest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both Python versions are in pyproject's classifiers. Windows is in
+        # the matrix on purpose: several behaviors are Windows-specific (DuckDB
+        # exclusive file lock; the POSIX-only file-permission test skips there).
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install project + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: ruff format --check
+        run: ruff format --check .
+
+      - name: mypy (strict)
+        run: mypy src/goetta_finance
+
+      - name: pytest
+        run: pytest

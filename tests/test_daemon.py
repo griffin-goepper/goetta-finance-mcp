@@ -27,9 +27,7 @@ class _FakeClient:
     def __init__(self) -> None:
         self.fetch_count = 0
 
-    def fetch_chunked(
-        self, start: Any, end: Any, chunk_days: int = 60
-    ) -> Iterator[dict[str, Any]]:
+    def fetch_chunked(self, start: Any, end: Any, chunk_days: int = 60) -> Iterator[dict[str, Any]]:
         self.fetch_count += 1
         yield {"accounts": [], "errors": []}
 
@@ -66,9 +64,7 @@ def _scheduler_task_alive() -> bool:
     behind by the daemon — the asyncio task cancellation is verified by
     the daemon shutting down within the timeout below.
     """
-    return any(
-        t.name == "goetta-finance-scheduler" and t.is_alive() for t in threading.enumerate()
-    )
+    return any(t.name == "goetta-finance-scheduler" and t.is_alive() for t in threading.enumerate())
 
 
 @pytest.fixture
@@ -162,8 +158,7 @@ def test_daemon_mcp_endpoint_handles_real_initialize(
         f"(status {response.status_code}): {response.text[:400]!r}"
     )
     assert response.status_code == 200, (
-        f"MCP initialize did not succeed (status {response.status_code}): "
-        f"{response.text[:400]!r}"
+        f"MCP initialize did not succeed (status {response.status_code}): {response.text[:400]!r}"
     )
     body_text = response.text
     # streamable-http may return JSON or text/event-stream; both should

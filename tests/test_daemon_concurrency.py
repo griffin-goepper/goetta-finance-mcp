@@ -206,15 +206,12 @@ def test_daemon_under_parallel_read_and_write_load(
             f.result()
 
     assert not errors, (
-        f"{len(errors)} exception(s) under concurrent load — "
-        f"first few: {errors[:3]!r}"
+        f"{len(errors)} exception(s) under concurrent load — first few: {errors[:3]!r}"
     )
     assert "1234.56" in seen_balances, (
-        "seeded balance never appeared in any dashboard read — "
-        "writes may have corrupted reads"
+        "seeded balance never appeared in any dashboard read — writes may have corrupted reads"
     )
     assert client.fetch_count >= 1, "no sync writes ran"
     assert store.last_sync_time() is not None, (
-        "writes ran but sync_runs table never recorded one — "
-        "transactional consistency broken"
+        "writes ran but sync_runs table never recorded one — transactional consistency broken"
     )
