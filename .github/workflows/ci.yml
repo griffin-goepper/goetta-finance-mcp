@@ -15,6 +15,10 @@ on:
   pull_request:
     branches: [main]
 
+# Tests don't touch the GitHub API; read-only is all this needs.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: ruff + mypy + pytest

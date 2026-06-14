@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import click
 import pytest
 import typer
 from typer.testing import CliRunner
@@ -12,10 +11,12 @@ from goetta_finance.cli import app
 runner = CliRunner()
 
 
-def _root_group() -> click.Group:
-    command = typer.main.get_command(app)
-    assert isinstance(command, click.Group)
-    return command
+def _root_group():  # type: ignore[no-untyped-def]
+    # typer.main.get_command(app) returns the app's Click group. We don't
+    # assert its concrete class: a TyperGroup isn't reliably `isinstance` of
+    # the imported click.Group across click/typer versions (it was False on
+    # CI's newer click). Duck-type the .commands / .params attributes instead.
+    return typer.main.get_command(app)
 
 
 def _command_names() -> set[str]:

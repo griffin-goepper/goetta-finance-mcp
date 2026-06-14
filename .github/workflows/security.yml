@@ -15,6 +15,13 @@ on:
   pull_request:
     branches: [main]
 
+# Least-privilege token. gitleaks-action needs pull-requests:read to list a
+# PR's commits (GET /repos/.../pulls/:n/commits) on pull_request events —
+# without it the action 403s. contents:read covers checkout + history scan.
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   scan:
     name: bandit + pip-audit + gitleaks
