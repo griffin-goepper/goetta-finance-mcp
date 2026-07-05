@@ -28,6 +28,8 @@ from fastapi import FastAPI
 from mcp.server.fastmcp import FastMCP
 
 from goetta_finance.collector import collect_under_lock
+from goetta_finance.errors import GoettaFinanceError
+from goetta_finance.goals import goal_breach_warnings
 from goetta_finance.server import build_server
 from goetta_finance.simplefin import SimpleFinClient
 from goetta_finance.store import FinanceStore
@@ -66,6 +68,17 @@ def _run_collect_blocking(store: FinanceStore, client: SimpleFinClient) -> None:
         result = collect_under_lock(store, client)
         if result is None:
             logger.info("scheduled sync skipped — another sync in flight")
+            return
+        # Post-sync goal breach summary. WARNING because a breached
+        # threshold is the one thing the user asked to be told about;
+        # messages carry goal/category/account names and amounts only,
+        # never transaction text. Evaluation failures must not make a
+        # successful sync look failed.
+        try:
+            for line in goal_breach_warnings(store):
+                logger.warning("goal breach: %s", line)
+        except GoettaFinanceError:
+            logger.exception("goal evaluation after scheduled sync failed")
     except Exception:
         logger.exception("scheduled sync raised")
 

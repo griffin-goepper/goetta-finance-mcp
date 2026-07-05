@@ -271,3 +271,64 @@ def test_daemon_shutdown_drains_scheduler_within_timeout(tmp_path: Path) -> None
         store.close()
     assert not thread.is_alive(), "daemon did not shut down — lifespan likely broken"
     assert elapsed < 8.0, f"shutdown took {elapsed:.1f}s — scheduler not cancelled cleanly"
+
+
+def test_run_collect_blocking_logs_goal_breaches(
+    store: DuckDBStore,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a scheduled sync, breached goals land in the daemon log at
+    WARNING (goal/category names and amounts only — never transaction
+    text). Uses the store fixture directly; collect is stubbed."""
+    import logging
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    from goetta_finance import daemon as daemon_module
+    from goetta_finance.models import Account, AccountType, SyncRun, Transaction
+
+    store.upsert_accounts(
+        [
+            Account(
+                id="d-goal",
+                name="Daemon Checking",
+                balance=Decimal("100.00"),
+                balance_date=datetime.now(tz=UTC),
+                type=AccountType.CHECKING,
+            )
+        ]
+    )
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="d-tx-1",
+                account_id="d-goal",
+                posted=datetime.now(tz=UTC),
+                amount=Decimal("-450.00"),
+                description="daemon goal txn",
+            )
+        ]
+    )
+    store.set_transaction_override("d-tx-1", "Dining")
+    store.add_goal(
+        "Dining cap",
+        kind="spending_cap",
+        amount=Decimal("400"),
+        category_name="Dining",
+        period="month",
+    )
+
+    def fake_collect(s: object, c: object) -> SyncRun:
+        now = datetime.now(tz=UTC)
+        return SyncRun(started_at=now, finished_at=now)
+
+    monkeypatch.setattr(daemon_module, "collect_under_lock", fake_collect)
+    with caplog.at_level(logging.WARNING, logger="goetta_finance.daemon"):
+        daemon_module._run_collect_blocking(store, _FakeClient())  # type: ignore[arg-type]
+    breach_records = [r for r in caplog.records if "goal breach" in r.getMessage()]
+    assert len(breach_records) == 1
+    message = breach_records[0].getMessage()
+    assert "Dining cap" in message
+    assert "450.00" in message
+    assert "daemon goal txn" not in message

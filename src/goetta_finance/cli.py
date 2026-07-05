@@ -25,6 +25,12 @@ from goetta_finance.config import (
 )
 from goetta_finance.daemon import run_daemon
 from goetta_finance.errors import GoettaFinanceError, SetupTokenError
+from goetta_finance.goals import (
+    describe_goal,
+    describe_progress,
+    evaluate_goals,
+    goal_breach_warnings,
+)
 from goetta_finance.mcp_config import (
     SERVER_KEY,
     build_http_server_entry,
@@ -42,8 +48,14 @@ from goetta_finance.server import build_server
 from goetta_finance.simplefin import SimpleFinClient
 from goetta_finance.store.duckdb_store import DuckDBStore
 from goetta_finance.validators import (
+    GoalValidationError,
     RulePatternError,
+    parse_goal_direction,
+    parse_goal_period,
+    parse_goal_target_date,
     parse_match_type,
+    validate_goal_amount,
+    validate_goal_name,
     validate_rule_pattern,
 )
 
@@ -95,9 +107,16 @@ def sync() -> None:
             raise typer.Exit(code=1)
         store = DuckDBStore(db_path(config))
         store.init()
+        breach_lines: list[str] = []
         try:
             client = SimpleFinClient(config.access_url)
             run = collect(store, client)
+            try:
+                breach_lines = goal_breach_warnings(store)
+            except GoettaFinanceError as exc:
+                # A goal-math failure must never make a successful sync
+                # look failed — log it and move on.
+                logging.getLogger(__name__).warning("goal evaluation after sync failed: %s", exc)
         finally:
             store.close()
         typer.echo(
@@ -107,6 +126,8 @@ def sync() -> None:
         )
         for warning in run.warnings:
             typer.secho(f"  warning: {warning}", fg=typer.colors.YELLOW)
+        for line in breach_lines:
+            typer.secho(f"  goal: {line}", fg=typer.colors.YELLOW)
     except GoettaFinanceError as exc:
         typer.secho(f"Sync failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
@@ -1382,6 +1403,202 @@ def transaction_uncategorize(
         typer.echo(f"Cleared override for {transaction_id}.")
     except GoettaFinanceError as exc:
         typer.secho(f"transaction uncategorize failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+goal_app = typer.Typer(
+    help=(
+        "Spending caps and balance targets, evaluated at read time. "
+        "Progress is never stored — recategorizing transactions or new "
+        "syncs retroactively change it."
+    ),
+    no_args_is_help=True,
+)
+app.add_typer(goal_app, name="goal")
+
+
+def _goal_bad_parameter(exc: GoalValidationError) -> typer.BadParameter:
+    """Translate the shared validator's error onto the offending flag."""
+    return typer.BadParameter(str(exc), param_hint=exc.param_hint)
+
+
+@goal_app.command("add-spending")
+def goal_add_spending(
+    category: Annotated[str, typer.Argument(help="Category name (case-insensitive).")],
+    limit: Annotated[str, typer.Option("--limit", help="Cap amount, e.g. 400 or 400.00.")],
+    period: Annotated[
+        str,
+        typer.Option("--period", help="'month' or 'year' — calendar buckets (UTC)."),
+    ] = "month",
+    name: Annotated[
+        str | None,
+        typer.Option("--name", help="Goal name (default: derived from category and limit)."),
+    ] = None,
+) -> None:
+    """Cap net spending in CATEGORY at --limit per calendar --period.
+
+    Uses the same math as the spending-by-category pie: refunds reduce
+    the total, hidden accounts are excluded, pending transactions count.
+    """
+    amount = _parse_decimal(limit, field="limit")
+    try:
+        validate_goal_amount(amount)
+        normalized_period = parse_goal_period(period)
+        goal_name = validate_goal_name(
+            name if name is not None else f"{category} under {amount}/{normalized_period}"
+        )
+    except GoalValidationError as exc:
+        raise _goal_bad_parameter(exc) from exc
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"goal add-spending failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        goal = store.add_goal(
+            goal_name,
+            kind="spending_cap",
+            amount=amount,
+            category_name=category,
+            period=normalized_period,
+        )
+        typer.echo(f'Added goal "{goal.name}" (id {goal.id}): {describe_goal(goal)}.')
+    except GoettaFinanceError as exc:
+        message = str(exc)
+        if _is_category_not_found(exc):
+            message += _suggest_category(store, category)
+        typer.secho(f"goal add-spending failed: {message}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+@goal_app.command("add-balance")
+def goal_add_balance(
+    account_id: Annotated[
+        str, typer.Argument(help="Account id (see `goetta-finance account list`).")
+    ],
+    target: Annotated[str, typer.Option("--target", help="Target amount, e.g. 10000.")],
+    direction: Annotated[
+        str,
+        typer.Option(
+            "--direction",
+            help=(
+                "'at_least' (savings target / emergency-fund floor) or "
+                "'at_most' (debt ceiling / paydown)."
+            ),
+        ),
+    ] = "at_least",
+    by: Annotated[
+        str | None,
+        typer.Option("--by", help="Optional target date YYYY-MM-DD (must be in the future)."),
+    ] = None,
+    name: Annotated[
+        str | None,
+        typer.Option("--name", help="Goal name (default: derived from account and target)."),
+    ] = None,
+) -> None:
+    """Track ACCOUNT_ID's balance toward --target.
+
+    Liability accounts evaluate the absolute balance (amount owed):
+    `--direction at_most --target 2000` on a credit card means "owe
+    under 2000" whichever way the institution signs the balance.
+    """
+    amount = _parse_decimal(target, field="target")
+    try:
+        validate_goal_amount(amount)
+        normalized_direction = parse_goal_direction(direction)
+        target_date = parse_goal_target_date(by)
+        goal_name = validate_goal_name(
+            name
+            if name is not None
+            else f"{account_id} {normalized_direction.replace('_', ' ')} {amount}"
+        )
+    except GoalValidationError as exc:
+        raise _goal_bad_parameter(exc) from exc
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"goal add-balance failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        goal = store.add_goal(
+            goal_name,
+            kind="balance",
+            amount=amount,
+            account_id=account_id,
+            direction=normalized_direction,
+            target_date=target_date,
+        )
+        typer.echo(f'Added goal "{goal.name}" (id {goal.id}): {describe_goal(goal)}.')
+    except GoettaFinanceError as exc:
+        typer.secho(f"goal add-balance failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+@goal_app.command("list")
+def goal_list() -> None:
+    """List goals with progress, status, and pace (evaluated now)."""
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"goal list failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        progresses = evaluate_goals(store)
+        if not progresses:
+            typer.echo(
+                "No goals yet. Add one with `goetta-finance goal add-spending` "
+                "or `goetta-finance goal add-balance`."
+            )
+            return
+        for progress in progresses:
+            goal = progress.goal
+            typer.echo(
+                f'{goal.id:>4}  {progress.status.value:<9} "{goal.name}" — {describe_goal(goal)}'
+            )
+            typer.echo(f"{'':>4}  {'':<9} {describe_progress(progress)}")
+    except GoettaFinanceError as exc:
+        typer.secho(f"goal list failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+@goal_app.command("remove")
+def goal_remove(
+    goal_id: Annotated[int, typer.Argument(help="Goal id (see `goetta-finance goal list`).")],
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", help="Skip the confirmation prompt (for scripts)."),
+    ] = False,
+) -> None:
+    """Remove a goal by id."""
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"goal remove failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        goal = next((g for g in store.list_goals() if g.id == goal_id), None)
+        if goal is None:
+            typer.secho(f"goal not found: {goal_id}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+        if not yes:
+            confirmed = typer.confirm(
+                f'Remove goal {goal_id} "{goal.name}" ({describe_goal(goal)})?'
+            )
+            if not confirmed:
+                typer.echo("Aborted.")
+                raise typer.Exit(code=1)
+        store.remove_goal(goal_id)
+        typer.echo(f'Removed goal {goal_id} "{goal.name}".')
+    except GoettaFinanceError as exc:
+        typer.secho(f"goal remove failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
     finally:
         store.close()

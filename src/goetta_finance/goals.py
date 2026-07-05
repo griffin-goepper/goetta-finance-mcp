@@ -284,8 +284,55 @@ def goal_breach_warnings(store: FinanceStore, *, now: datetime | None = None) ->
     return lines
 
 
+def describe_goal(goal: Goal) -> str:
+    """One-line human definition, shared by CLI and dashboard."""
+    if goal.kind is GoalKind.SPENDING_CAP:
+        period_noun = "month" if goal.period is GoalPeriod.MONTH else "year"
+        return f"{goal.category_name} under {goal.amount} per {period_noun}"
+    direction = "at least" if goal.direction is GoalDirection.AT_LEAST else "at most"
+    label = goal.account_name or goal.account_id
+    suffix = f" by {goal.target_date.isoformat()}" if goal.target_date is not None else ""
+    return f"{label} {direction} {goal.amount}{suffix}"
+
+
+def describe_progress(progress: GoalProgress) -> str:
+    """One-line progress/pace summary, shared by CLI and dashboard.
+
+    The MCP tool does NOT use this — it returns the raw fields so
+    Claude can phrase things itself.
+    """
+    goal = progress.goal
+    if goal.kind is GoalKind.SPENDING_CAP:
+        period_noun = "month" if goal.period is GoalPeriod.MONTH else "year"
+        line = (
+            f"{progress.current} of {progress.target} ({progress.percent}%) "
+            f"this {period_noun} — {progress.period_elapsed_percent}% of period elapsed"
+        )
+        if progress.status is GoalStatus.AT_RISK:
+            line += ", ahead of pace"
+        elif progress.status is GoalStatus.OVER:
+            line += ", over the cap"
+        return line
+    if goal.direction is GoalDirection.AT_MOST:
+        line = f"{progress.current} vs ceiling {progress.target}"
+    else:
+        line = f"{progress.current} of {progress.target} ({progress.percent}%)"
+    if progress.monthly_delta is not None:
+        line += f" — {progress.monthly_delta:+}/mo avg"
+    if progress.projected_date is not None:
+        line += f", projected {progress.projected_date.isoformat()}"
+    if goal.target_date is not None:
+        line += f" (target {goal.target_date.isoformat()}"
+        if progress.required_monthly is not None:
+            line += f", need {progress.required_monthly}/mo"
+        line += ")"
+    return line
+
+
 __all__ = [
     "balance_goal_progress",
+    "describe_goal",
+    "describe_progress",
     "evaluate_goals",
     "goal_breach_warnings",
     "period_bounds",
