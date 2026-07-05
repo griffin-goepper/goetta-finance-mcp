@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Goals — goetta-finance{% endblock %}
+{% block content %}
+  <h2>Goals</h2>
+  <p class="muted">Evaluated just now from current data — recategorizing
+    transactions or a fresh sync changes progress retroactively.</p>
+  {% if goals %}
+    <div class="goal-list">
+      {% for g in goals %}
+        <section class="goal-card">
+          <div class="goal-header">
+            <span class="goal-name">{{ g.name }}</span>
+            <span class="badge badge-status-{{ g.status }}">{{ g.status }}</span>
+          </div>
+          <p class="muted goal-definition">{{ g.definition }}</p>
+          <div class="progress-track">
+            <div class="progress-fill {{ g.status }}" style="width: {{ g.bar_percent }}%"></div>
+          </div>
+          <p class="goal-pace">{{ g.pace }}</p>
+        </section>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="empty">No goals yet. Add one from the CLI:
+      <code>goetta-finance goal add-spending Groceries --limit 400 --period month</code>
+      or ask Claude to call <code>set_goal</code>.</p>
+  {% endif %}
+{% endblock %}

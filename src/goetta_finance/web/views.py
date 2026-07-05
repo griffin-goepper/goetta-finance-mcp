@@ -14,6 +14,8 @@ from typing import Annotated, Any, cast
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from goetta_finance.goals import describe_goal, describe_progress, evaluate_goals
+from goetta_finance.models import GoalProgress
 from goetta_finance.tools.accounts import serialize_account
 from goetta_finance.web.aggregations import display_currency, recent_sync_runs
 from goetta_finance.web.charts import (
@@ -42,6 +44,21 @@ def _parse_iso(value: str | None) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt
+
+
+def _goal_row(progress: GoalProgress) -> dict[str, Any]:
+    """Template-ready dict for one goal. The bar width clamps to [0, 100]
+    (a refund-negative or blown-cap percent still displays as text)."""
+    bar = min(Decimal("100"), max(Decimal("0"), progress.percent))
+    return {
+        "id": progress.goal.id,
+        "name": progress.goal.name,
+        "status": progress.status.value,
+        "definition": describe_goal(progress.goal),
+        "pace": describe_progress(progress),
+        "percent": str(progress.percent),
+        "bar_percent": str(bar),
+    }
 
 
 def register_routes(app: FastAPI) -> None:
@@ -203,6 +220,15 @@ def register_routes(app: FastAPI) -> None:
         store = _store(request)
         rows = _query_transactions(store, account_id, start, end, category, q, limit)
         return _render(request, "partials/transactions_table.html", {"rows": rows})
+
+    @app.get("/goals", response_class=HTMLResponse)
+    async def goals_page(request: Request) -> HTMLResponse:
+        """Goals with progress bars. GET-only like every dashboard route
+        (the app's no-CSRF posture depends on it) — goal creation and
+        deletion stay on the CLI and MCP write surfaces."""
+        store = _store(request)
+        rows = [_goal_row(p) for p in evaluate_goals(store)]
+        return _render(request, "goals.html", {"goals": rows, "active": "goals"})
 
     @app.get("/sync", response_class=HTMLResponse)
     async def sync_health(request: Request) -> HTMLResponse:

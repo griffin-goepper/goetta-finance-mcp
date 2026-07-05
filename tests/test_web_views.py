@@ -303,3 +303,71 @@ def test_transactions_page_hides_hidden_account_txns(client: TestClient) -> None
     assert resp.status_code == 200
     assert "Spotify Premium" not in resp.text
     assert "Paycheck" not in resp.text
+
+
+# --- Goals page (migration 0008) --------------------------------------------
+
+
+def test_goals_page_renders_progress_and_status(client: TestClient, store: DuckDBStore) -> None:
+    """A blown cap renders its name, an `over` status badge, a clamped
+    progress bar, and the pace line."""
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="tx-goal-dining",
+                account_id="acc-checking",
+                posted=datetime.now(tz=UTC),
+                amount=Decimal("-450.00"),
+                description="goal web test txn",
+            )
+        ]
+    )
+    store.set_transaction_override("tx-goal-dining", "Dining")
+    store.add_goal(
+        "Dining cap",
+        kind="spending_cap",
+        amount=Decimal("400"),
+        category_name="Dining",
+        period="month",
+    )
+    resp = client.get("/goals")
+    assert resp.status_code == 200
+    body = resp.text
+    assert "Dining cap" in body
+    assert "badge-status-over" in body
+    assert "progress-fill over" in body
+    # Bar width clamps to 100 even though percent is 112.5.
+    assert "width: 100%" in body
+    assert "112.5" in body  # raw percent still displayed in the pace text
+    assert "Dining under 400.00 per month" in body
+
+
+def test_goals_page_balance_goal_met(client: TestClient, store: DuckDBStore) -> None:
+    store.add_goal(
+        "Brokerage floor",
+        kind="balance",
+        amount=Decimal("10000"),
+        account_id="acc-brokerage",
+        direction="at_least",
+    )
+    resp = client.get("/goals")
+    assert resp.status_code == 200
+    body = resp.text
+    assert "Brokerage floor" in body
+    assert "badge-status-met" in body
+    assert "50000.00 of 10000.00" in body
+
+
+def test_goals_page_empty_state(store: DuckDBStore) -> None:
+    app = build_app(store)
+    with TestClient(app) as c:
+        resp = c.get("/goals")
+        assert resp.status_code == 200
+        assert "No goals yet" in resp.text
+        assert "goal add-spending" in resp.text
+
+
+def test_base_template_has_goals_nav_link(client: TestClient) -> None:
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert 'href="/goals"' in resp.text
