@@ -11,6 +11,7 @@ from goetta_finance.store.duckdb_store import DuckDBStore
 from goetta_finance.tools._serialize import serialize_value
 from goetta_finance.tools.accounts import list_accounts
 from goetta_finance.tools.balance_history import account_balance_history
+from goetta_finance.tools.goals import remove_goal, set_goal
 from goetta_finance.tools.spending_by_category import spending_by_category
 from goetta_finance.tools.sql_query import sql_query
 from goetta_finance.tools.sync_now import sync_now
@@ -147,6 +148,25 @@ def test_serialize_value_conversions() -> None:
     assert serialize_value("plain") == "plain"
     assert serialize_value(42) == 42
     assert serialize_value(None) is None
+
+
+def test_goal_tools_error_shapes(store: DuckDBStore) -> None:
+    """Write tools return {ok: false, error} — never raise — so Claude
+    can read the outcome and self-correct."""
+    assert remove_goal(store, 999) == {"ok": False, "error": "goal not found: 999"}
+    missing_fields = set_goal(store, name="x", kind="balance", amount=Decimal("100"))
+    assert missing_fields["ok"] is False
+    assert "validation failed" in missing_fields["error"]
+    bad_amount = set_goal(
+        store,
+        name="x",
+        kind="spending_cap",
+        amount=Decimal("9.999"),
+        category="Dining",
+        period="month",
+    )
+    assert bad_amount["ok"] is False
+    assert "sub-cent" in bad_amount["error"]
 
 
 def test_sync_now_without_client_returns_error_payload(

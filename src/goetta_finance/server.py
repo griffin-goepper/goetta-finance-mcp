@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
@@ -24,6 +25,9 @@ from goetta_finance.tools.categorize import (
 from goetta_finance.tools.categorize import (
     uncategorize_transaction as _uncategorize_transaction,
 )
+from goetta_finance.tools.goals import list_goals as _list_goals
+from goetta_finance.tools.goals import remove_goal as _remove_goal
+from goetta_finance.tools.goals import set_goal as _set_goal
 from goetta_finance.tools.spending_by_category import (
     spending_by_category as _spending_by_category,
 )
@@ -91,6 +95,8 @@ Schema:
   balance_snapshots(account_id, timestamp, balance)
   sync_runs(id, started_at, finished_at, accounts_touched, transactions_new,
             transactions_updated, warnings, errors)
+  goals(id, name, kind, amount, category_id, period, account_id, direction,
+        target_date, created_at)
 
 Columns is_manual (account was added via CLI, not synced), is_liability
 (account represents debt), and is_hidden (account excluded from default
@@ -155,6 +161,20 @@ categories via `goetta-finance category add --no-spending` or toggle
 existing ones with `category set-spending <name> <bool>`. The
 spending_by_category tool joins categories on the resolved name and
 filters WHERE c.is_spending = TRUE by default.
+
+The goals table (migration 0008) holds user-defined thresholds with a
+kind discriminator: 'spending_cap' rows set category_id + period
+('month'|'year'), 'balance' rows set account_id + direction
+('at_least'|'at_most') and an optional target_date. Goal status and
+progress are NOT stored — they are computed at read time (the same
+retroactivity property as the categorization view: recategorizing a
+transaction changes goal progress with no backfill). Spending caps use
+the same net-spending semantics as spending_by_category over UTC
+calendar buckets. Balance goals on is_liability accounts evaluate the
+absolute balance (amount owed): at_most is a debt ceiling, at_least a
+savings floor. Prefer the list_goals tool over ad-hoc SQL on this
+table — it carries the computed status, pace, and projection fields.
+Goal writes go through set_goal / remove_goal, not sql_query.
 
 Money columns are DECIMAL(18,2); timestamps are TIMESTAMP in UTC. Transaction
 `amount` is signed (negative = money out). Results are well-suited to be
@@ -440,5 +460,101 @@ def build_server(
     ) -> list[dict[str, Any]]:
         _maybe_trigger_lazy_sync(store, client)
         return _top_uncategorized_patterns(store, days=days, top=top)
+
+    @mcp.tool(
+        description=(
+            "List the user's goals with progress, status, and pace computed "
+            "fresh at call time. Spending caps report net spending in the "
+            "category this calendar month/year (UTC buckets, same math as "
+            "spending_by_category — refunds reduce the total, hidden "
+            "accounts excluded, pending transactions count) versus the cap, "
+            "plus percent of the period elapsed for pace comparison. "
+            "Balance goals report the account's current balance versus the "
+            "target — for liability accounts the ABSOLUTE balance is used, "
+            "so direction 'at_most' 2000 on a credit card means 'owe under "
+            "2000' regardless of sign convention. Balance goals also carry "
+            "monthly_delta (average movement toward the goal from the last "
+            "90 days of history; positive = approaching), projected_date "
+            "(trend extrapolation), and required_monthly (when a "
+            "target_date is set). status is one of on_track / at_risk / "
+            "over / met, evaluated at read time — recategorizing "
+            "transactions retroactively changes progress. Use when the "
+            "user asks about budgets, caps, savings targets, or debt "
+            "paydown. To create or delete goals use set_goal / remove_goal."
+        )
+    )
+    def list_goals() -> list[dict[str, Any]]:
+        _maybe_trigger_lazy_sync(store, client)
+        return _list_goals(store)
+
+    @mcp.tool(
+        description=(
+            "Create a goal. kind='spending_cap' requires category + period "
+            "('month' or 'year'): net spending in that category should stay "
+            "under amount per calendar period. kind='balance' requires "
+            "account_id (from list_accounts) + direction: 'at_least' for "
+            "savings targets and emergency-fund floors, 'at_most' for debt "
+            "ceilings/paydown (liability accounts evaluate the absolute "
+            "balance = amount owed); target_date (YYYY-MM-DD, future) is "
+            "optional and enables required-per-month pace tracking. amount "
+            "must be positive, at most two decimal places. name must be "
+            "unique. Errors return {ok: false, error} with a did-you-mean "
+            "suggestion for category typos — fix and retry. Confirm the "
+            "amount and shape with the user before creating."
+        )
+    )
+    def set_goal(
+        name: Annotated[
+            str, Field(description="Unique goal name, e.g. 'Groceries cap' or 'Emergency fund'.")
+        ],
+        kind: Annotated[str, Field(description="'spending_cap' or 'balance'.")],
+        amount: Annotated[float, Field(gt=0, description="Threshold amount, e.g. 400 or 400.00.")],
+        category: Annotated[
+            str | None,
+            Field(description="Spending caps only: category name (case-insensitive)."),
+        ] = None,
+        period: Annotated[
+            str | None, Field(description="Spending caps only: 'month' or 'year'.")
+        ] = None,
+        account_id: Annotated[
+            str | None,
+            Field(description="Balance goals only: account id (from list_accounts)."),
+        ] = None,
+        direction: Annotated[
+            str | None, Field(description="Balance goals only: 'at_least' or 'at_most'.")
+        ] = None,
+        target_date: Annotated[
+            str | None,
+            Field(description="Balance goals only: optional future deadline, YYYY-MM-DD."),
+        ] = None,
+    ) -> dict[str, Any]:
+        # The only float in goal math is this wire boundary. str() gives
+        # the shortest round-trip repr, so two-decimal JSON inputs convert
+        # exactly; sub-cent inputs reach the shared validator and are
+        # rejected with a friendly error rather than silently rounded —
+        # keeps this surface gated identically to the CLI.
+        return _set_goal(
+            store,
+            name=name,
+            kind=kind,
+            amount=Decimal(str(amount)),
+            category=category,
+            period=period,
+            account_id=account_id,
+            direction=direction,
+            target_date=target_date,
+        )
+
+    @mcp.tool(
+        description=(
+            "Delete a goal by id (get ids from list_goals). Unknown ids "
+            "return {ok: false, error}. Confirm with the user before "
+            "deleting — goals are user-authored configuration."
+        )
+    )
+    def remove_goal(
+        goal_id: Annotated[int, Field(ge=1, description="Goal id from list_goals.")],
+    ) -> dict[str, Any]:
+        return _remove_goal(store, goal_id)
 
     return mcp
