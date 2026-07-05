@@ -17,7 +17,7 @@ An open-source, local-first MCP server that lets people chat with their finances
 ## 2. Non-goals
 
 - Bank integrations beyond SimpleFIN. Use what works.
-- Budgeting features that compete with Actual Budget or Firefly III.
+- Budgeting features that compete with Actual Budget or Firefly III. **Carve-out:** lightweight *goals* — per-category spending caps (month/year) and per-account balance targets (`at_least`/`at_most`, optional target date) — are in scope because they are read-time-computed thresholds over data we already store, with no envelopes, allocations, rollover, or stored budget state.
 - Multi-user, multi-tenancy, or cloud hosting. This is local-first by design.
 - Mobile apps.
 
@@ -411,6 +411,27 @@ The dashboard is part of v1 because it's where rich, persistent visualization li
 - [ ] Saved-query system in the dashboard (named SQL queries that render as cards)
 - [ ] Revisit MCP-side chart rendering if/when client support lands
 
+### Phase 6 — Goals
+
+User-defined thresholds, evaluated at READ TIME (no stored status, no events table — recategorizing a transaction retroactively changes goal progress, same design as the `transactions_with_category` view). Two kinds in one `goals` table (migration 0008): `spending_cap` (net spending in a category stays under $N per calendar month/year) and `balance` (account balance `at_least`/`at_most` $N, optional `target_date` for pace math).
+
+Design invariants:
+
+- All goal math lives in `src/goetta_finance/goals.py` (`evaluate_goals`); every surface calls it — no per-surface re-derivation.
+- Spending-cap totals reuse `query_spending_by_category` (the pie's helper): caps, pie, and monthly bars agree to the cent. Pending transactions count (the pie includes them; a cap is an early-warning device).
+- Periods are UTC calendar buckets, matching `date_trunc('month', posted)` in the dashboard.
+- Liability accounts evaluate `abs(balance)` — "at_most 2000" on a credit card means "owe under 2000" regardless of sign convention.
+- Post-sync breach summary (CLI `sync` + daemon scheduler log) fires only on status `over` — never `at_risk` (pace noise) or unmet `at_least` (normal saving state).
+
+Slices:
+
+- [x] `tools/_serialize.py` extraction (the deferred rule-of-three cleanup)
+- [ ] Migration 0008 + `Goal`/`GoalProgress` models + validators + store methods + `goals.py` domain math
+- [ ] CLI `goal` group (add-spending / add-balance / list / remove) + post-sync breach lines
+- [ ] MCP tools: `list_goals` / `set_goal` / `remove_goal` + `SQL_SCHEMA_HINT` paragraph
+- [ ] Dashboard `/goals` page (GET-only; progress bars, status badges)
+- [ ] Docs: CLAUDE.md pattern entry, README
+
 ## 12. Out-of-scope reminders
 
 If a contributor PR adds any of the following without discussion, push back:
@@ -418,7 +439,7 @@ If a contributor PR adds any of the following without discussion, push back:
 - A web service hosted by us
 - A SaaS auth layer
 - Mobile companion apps
-- Replacement-grade budgeting features (envelope budgeting, etc.)
+- Replacement-grade budgeting features (envelope budgeting, budget allocation/rollover, transaction splitting). The goals feature (Phase 6) is the deliberate ceiling: user-defined thresholds evaluated at read time. Anything that needs persisted budget state or period-close semantics belongs in a dedicated budgeting app.
 - Cloud sync between devices (let users self-host syncthing if they want it)
 
 ## 13. Open questions for first session

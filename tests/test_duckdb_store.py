@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -11,6 +11,9 @@ from goetta_finance.models import (
     Account,
     AccountType,
     BalanceSnapshot,
+    GoalDirection,
+    GoalKind,
+    GoalPeriod,
     SyncRun,
     Transaction,
 )
@@ -1234,3 +1237,193 @@ def test_view_planner_under_10k_transactions(store: DuckDBStore) -> None:
         f"baseline {_MEDIAN_BASELINE_MS_OBSERVED:.1f}ms or 500ms ceiling). "
         f"All durations: {[round(d, 1) for d in durations_ms]}"
     )
+
+
+# --- Goals (migration 0008) -------------------------------------------------
+
+
+def test_migration_0008_applied(store: DuckDBStore) -> None:
+    """Pin the migration filename so re-runs of init() stay idempotent
+    and so renaming the file forces a deliberate test update."""
+    rows = store.conn.execute("SELECT name FROM schema_migrations").fetchall()
+    assert ("0008_goals.sql",) in rows
+    count = store.conn.execute("SELECT COUNT(*) FROM goals").fetchone()
+    assert count is not None
+    # No seeded rows: goals are pure user-state (stranger test).
+    assert int(count[0]) == 0
+
+
+def test_add_goal_spending_cap_round_trip(store: DuckDBStore) -> None:
+    goal = store.add_goal(
+        "Groceries cap",
+        kind="spending_cap",
+        amount=Decimal("400.00"),
+        category_name="groceries",  # case-insensitive lookup
+        period="month",
+    )
+    assert goal.id >= 1
+    assert goal.kind is GoalKind.SPENDING_CAP
+    assert goal.amount == Decimal("400.00")
+    assert goal.category_name == "Groceries"  # resolved to stored casing
+    assert goal.period is GoalPeriod.MONTH
+    assert goal.account_id is None
+    assert goal.direction is None
+    assert goal.created_at.tzinfo is not None
+
+    listed = store.list_goals()
+    assert len(listed) == 1
+    fetched = listed[0]
+    assert fetched == goal
+
+
+def test_add_goal_balance_round_trip(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account(id="acc-goal")])
+    goal = store.add_goal(
+        "Emergency fund",
+        kind="balance",
+        amount=Decimal("10000.00"),
+        account_id="acc-goal",
+        direction="at_least",
+        target_date=date(2027, 6, 1),
+    )
+    assert goal.kind is GoalKind.BALANCE
+    assert goal.direction is GoalDirection.AT_LEAST
+    assert goal.target_date == date(2027, 6, 1)
+    assert goal.account_name == "Checking 1234"
+    assert goal.category_id is None
+    assert goal.period is None
+
+    fetched = store.list_goals()[0]
+    assert fetched == goal
+
+
+def test_add_goal_unknown_category_raises(store: DuckDBStore) -> None:
+    with pytest.raises(StoreError, match="category not found: Gorceries"):
+        store.add_goal(
+            "typo cap",
+            kind="spending_cap",
+            amount=Decimal("100"),
+            category_name="Gorceries",
+            period="month",
+        )
+
+
+def test_add_goal_unknown_account_raises(store: DuckDBStore) -> None:
+    with pytest.raises(StoreError, match="account not found: nope"):
+        store.add_goal(
+            "ghost balance",
+            kind="balance",
+            amount=Decimal("100"),
+            account_id="nope",
+            direction="at_least",
+        )
+
+
+def test_add_goal_duplicate_name_case_insensitive(store: DuckDBStore) -> None:
+    store.add_goal(
+        "Dining cap",
+        kind="spending_cap",
+        amount=Decimal("200"),
+        category_name="Dining",
+        period="month",
+    )
+    with pytest.raises(StoreError, match="goal already exists"):
+        store.add_goal(
+            "dining CAP",
+            kind="spending_cap",
+            amount=Decimal("300"),
+            category_name="Dining",
+            period="month",
+        )
+
+
+def test_add_goal_bad_shape_raises(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account(id="acc-shape")])
+    with pytest.raises(StoreError, match="require a category and a period"):
+        store.add_goal("no cat", kind="spending_cap", amount=Decimal("100"))
+    with pytest.raises(StoreError, match="require an account_id and a direction"):
+        store.add_goal("no acct", kind="balance", amount=Decimal("100"))
+    with pytest.raises(StoreError, match="do not take account_id"):
+        store.add_goal(
+            "mixed",
+            kind="spending_cap",
+            amount=Decimal("100"),
+            category_name="Dining",
+            period="month",
+            account_id="acc-shape",
+        )
+    with pytest.raises(StoreError, match="do not take a category"):
+        store.add_goal(
+            "mixed2",
+            kind="balance",
+            amount=Decimal("100"),
+            account_id="acc-shape",
+            direction="at_most",
+            category_name="Dining",
+        )
+    with pytest.raises(StoreError, match="kind must be"):
+        store.add_goal("bad kind", kind="envelope", amount=Decimal("100"))
+
+
+def test_remove_goal_round_trip(store: DuckDBStore) -> None:
+    goal = store.add_goal(
+        "Gas cap",
+        kind="spending_cap",
+        amount=Decimal("150"),
+        category_name="Gas",
+        period="month",
+    )
+    store.remove_goal(goal.id)
+    assert store.list_goals() == []
+
+
+def test_remove_goal_unknown_raises(store: DuckDBStore) -> None:
+    with pytest.raises(StoreError, match="goal not found: 999"):
+        store.remove_goal(999)
+
+
+def test_delete_account_refuses_when_goal_references_it(store: DuckDBStore) -> None:
+    """Goals are user-authored config — deleting an account must not
+    silently cascade them away (the 0007 lesson). The error names the
+    fix (`goal remove`)."""
+    store.upsert_accounts([_manual_account(id="MANUAL-goal")])
+    store.add_goal(
+        "Savings target",
+        kind="balance",
+        amount=Decimal("5000"),
+        account_id="MANUAL-goal",
+        direction="at_least",
+    )
+    with pytest.raises(StoreError, match=r"goal\(s\) referencing it"):
+        store.delete_account("MANUAL-goal")
+    # Account and goal are both still present.
+    assert any(a.id == "MANUAL-goal" for a in store.get_accounts())
+    assert len(store.list_goals()) == 1
+
+
+def test_query_sql_normalizes_tz_aware_datetime_params(store: DuckDBStore) -> None:
+    """Class-of-bug pin: timestamps are stored naive UTC, so a tz-aware
+    datetime param must be normalized to naive UTC before binding.
+    Without normalization DuckDB binds it as TIMESTAMP WITH TIME ZONE
+    and casts the naive *column* through the session (local) time zone,
+    silently shifting every date-window query by the machine's UTC
+    offset — a boundary transaction falls out of its month on any
+    non-UTC machine (this passes trivially on UTC CI; the pin is for
+    developer machines and user installs)."""
+    store.upsert_accounts([_account(id="acc-tz")])
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="t-tz-boundary",
+                account_id="acc-tz",
+                posted=datetime(2026, 5, 31, 23, 59, 59, 999999, tzinfo=UTC),
+                amount=Decimal("-10.00"),
+                description="month-boundary txn",
+            )
+        ]
+    )
+    rows = store.query_sql(
+        "SELECT COUNT(*) AS n FROM transactions WHERE posted <= ? AND id = 't-tz-boundary'",
+        [datetime(2026, 5, 31, 23, 59, 59, 999999, tzinfo=UTC)],
+    )
+    assert rows[0]["n"] == 1
