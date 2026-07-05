@@ -136,6 +136,13 @@ def test_validate_goal_amount_rejections(amount: str, message: str) -> None:
         validate_goal_amount(Decimal(amount))
 
 
+def test_validate_goal_amount_carries_custom_param_hint() -> None:
+    """The CLI names the flag it actually exposes (--limit / --target)."""
+    with pytest.raises(GoalValidationError) as exc_info:
+        validate_goal_amount(Decimal("-1"), param_hint="--limit")
+    assert exc_info.value.param_hint == "--limit"
+
+
 def test_parse_goal_kind_normalizes_and_rejects() -> None:
     assert parse_goal_kind("  Spending_Cap ") == "spending_cap"
     assert parse_goal_kind("BALANCE") == "balance"

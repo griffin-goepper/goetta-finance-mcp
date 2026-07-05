@@ -1444,7 +1444,7 @@ def goal_add_spending(
     """
     amount = _parse_decimal(limit, field="limit")
     try:
-        validate_goal_amount(amount)
+        validate_goal_amount(amount, param_hint="--limit")
         normalized_period = parse_goal_period(period)
         goal_name = validate_goal_name(
             name if name is not None else f"{category} under {amount}/{normalized_period}"
@@ -1508,7 +1508,7 @@ def goal_add_balance(
     """
     amount = _parse_decimal(target, field="target")
     try:
-        validate_goal_amount(amount)
+        validate_goal_amount(amount, param_hint="--target")
         normalized_direction = parse_goal_direction(direction)
         target_date = parse_goal_target_date(by)
         goal_name = validate_goal_name(

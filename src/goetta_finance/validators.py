@@ -161,17 +161,25 @@ def validate_goal_name(name: str) -> str:
     return stripped
 
 
-def validate_goal_amount(amount: Decimal) -> None:
-    """Finite, positive, at most GOAL_AMOUNT_MAX, no sub-cent precision."""
+def validate_goal_amount(amount: Decimal, *, param_hint: str = "--amount") -> None:
+    """Finite, positive, at most GOAL_AMOUNT_MAX, no sub-cent precision.
+
+    ``param_hint`` lets the CLI name the flag it actually exposes
+    (``--limit`` on add-spending, ``--target`` on add-balance).
+    """
     if not amount.is_finite():
-        raise GoalValidationError(f"amount must be a finite number, got {amount}")
+        raise GoalValidationError(
+            f"amount must be a finite number, got {amount}", param_hint=param_hint
+        )
     if amount <= 0:
-        raise GoalValidationError(f"amount must be positive, got {amount}")
+        raise GoalValidationError(f"amount must be positive, got {amount}", param_hint=param_hint)
     if amount > GOAL_AMOUNT_MAX:
-        raise GoalValidationError(f"amount is implausibly large (>{GOAL_AMOUNT_MAX}): {amount}")
+        raise GoalValidationError(
+            f"amount is implausibly large (>{GOAL_AMOUNT_MAX}): {amount}", param_hint=param_hint
+        )
     exponent = amount.as_tuple().exponent
     if isinstance(exponent, int) and exponent < -2:
-        raise GoalValidationError(f"amount has sub-cent precision: {amount}")
+        raise GoalValidationError(f"amount has sub-cent precision: {amount}", param_hint=param_hint)
 
 
 def parse_goal_kind(value: str) -> str:
