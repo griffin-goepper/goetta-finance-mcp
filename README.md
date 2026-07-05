@@ -66,6 +66,7 @@ Re-running `init` is safe — each step detects existing state and offers to ski
 | `goetta-finance account add\|list\|set-balance\|set-liability\|remove` | Manage manual accounts and liability flags. See "Manual accounts and liabilities" below. |
 | `goetta-finance category list\|add\|set-rule\|remove-rule\|default-rules` | Manage categories and the rules that map descriptions to them. See "Transaction categorization" below. |
 | `goetta-finance transaction categorize\|uncategorize` | Manual per-transaction category overrides. See "Transaction categorization" below. |
+| `goetta-finance goal add-spending\|add-balance\|list\|remove` | Spending caps and balance targets, evaluated at read time. See "Goals" below. |
 
 ## Manual accounts and liabilities
 
@@ -199,6 +200,31 @@ Inline categorize-from-dashboard (HTMX dropdown + write endpoint) is deliberatel
 
 See [`CUSTOMIZATION.md`](./CUSTOMIZATION.md) for the full map of user-tunable surfaces (rules, prefix list, categories, flags, colors).
 
+## Goals
+
+Lightweight thresholds, not envelope budgeting: cap a category's spending per calendar month/year, or track an account balance toward a target. Progress is **computed at read time** — nothing is stored, so recategorizing transactions or a fresh sync changes goal progress retroactively, exactly like the categorization view.
+
+```bash
+# Cap net spending in a category per calendar month (or --period year).
+goetta-finance goal add-spending Groceries --limit 400 --period month
+
+# Track a balance: at_least = savings target / emergency-fund floor,
+# at_most = debt ceiling / paydown. --by adds required-per-month pace math.
+goetta-finance goal add-balance <account-id> --target 10000 --direction at_least --by 2027-06-01
+goetta-finance goal add-balance <card-id> --target 2000 --direction at_most
+
+goetta-finance goal list          # progress, status, and pace per goal
+goetta-finance goal remove 3      # confirms unless --yes
+```
+
+Semantics worth knowing:
+
+- **Cap math matches the pie exactly.** Spending caps reuse the same net-spending SQL as `spending_by_category` and the dashboard pie: refunds reduce the total, hidden accounts are excluded, pending transactions count, and periods are UTC calendar buckets.
+- **Liability accounts evaluate the absolute balance** (amount owed): `--direction at_most --target 2000` on a credit card means "owe under 2000" whichever way the institution signs the balance.
+- **Status** is `on_track` / `at_risk` (ahead of linear pace, or trend projects past `--by`) / `over` (cap blown, ceiling breached) / `met`. Balance goals derive pace from the last 90 days of balance snapshots.
+- **Breach summary after sync.** `goetta-finance sync` prints a yellow `goal:` line for each goal at status `over`; the daemon logs the same at WARNING after scheduled syncs. `at_risk` never fires a warning — it's pace noise by design.
+- From Claude: `list_goals` (progress + pace), `set_goal`, `remove_goal`. The dashboard has a **Goals** page with progress bars.
+
 ## Daemon mode
 
 `goetta-finance daemon` runs one long-lived process that hosts:
@@ -326,8 +352,9 @@ Once registered, restart your Claude client and try things like:
 - *"How much did I spend on dining last month?"* → `spending_by_category` returns categorized totals (non-spending categories excluded by default)
 - *"What's still uncategorized?"* → `top_uncategorized_patterns` surfaces the biggest gaps; tell Claude which category each belongs to and it adds the rules
 - *"Is the data current?"* → `sync_status` reports last sync + freshness
+- *"Am I on track with my dining budget?"* → `list_goals` reports progress, pace, and status per goal
 
-The MCP server exposes eleven tools:
+The MCP server exposes fourteen tools:
 
 - **`list_accounts`** — all accounts with current balances (hidden accounts excluded by default)
 - **`get_transactions`** — filter by account, date range, category, text search; up to 1000 rows. Every row carries a resolved `category` field.
@@ -336,6 +363,8 @@ The MCP server exposes eleven tools:
 - **`top_uncategorized_patterns`** — the curation entry point: the largest spending patterns sitting in Uncategorized, normalized via your `prefixes.txt`
 - **`categorize_transaction`** / **`uncategorize_transaction`** — per-transaction override and its undo
 - **`add_category_rule`** — add a rule from conversation; retroactive, validator-gated (same ReDoS checks as the CLI)
+- **`list_goals`** — every goal with progress, status, and pace computed fresh (spending caps use the same math as `spending_by_category`)
+- **`set_goal`** / **`remove_goal`** — create and delete goals from conversation; validator-gated identically to the CLI
 - **`sql_query`** — read-only SQL against the local DuckDB store (see security notes below). Prefer `transactions_with_category` over the bare `transactions` table when you want category info.
 - **`sync_status`** — report when the SimpleFIN data was last synced and whether it's stale
 - **`sync_now`** — trigger a fresh pull from SimpleFIN
@@ -344,12 +373,13 @@ The MCP server exposes eleven tools:
 
 ## The web dashboard
 
-`goetta-finance web` serves six views at `http://127.0.0.1:8765`:
+`goetta-finance web` serves seven views at `http://127.0.0.1:8765`:
 
 - **Accounts** — current balances and as-of timestamps
 - **Net worth** — Plotly line chart from balance snapshots
 - **Spending** — monthly income (up) and spending (down) stacked bars
 - **By category** — pie chart of the last 30 days' spending (Income excluded)
+- **Goals** — progress bars and status badges per goal, evaluated at page load
 - **Transactions** — sortable, searchable table with a category filter and a colored category badge per row. Filters update via HTMX without full page reloads. The badge tooltip carries the pre-filled CLI command to recategorize that specific transaction.
 - **Sync** — last sync time and recent warnings/errors
 

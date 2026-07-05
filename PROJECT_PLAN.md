@@ -426,11 +426,11 @@ Design invariants:
 Slices:
 
 - [x] `tools/_serialize.py` extraction (the deferred rule-of-three cleanup)
-- [ ] Migration 0008 + `Goal`/`GoalProgress` models + validators + store methods + `goals.py` domain math
-- [ ] CLI `goal` group (add-spending / add-balance / list / remove) + post-sync breach lines
-- [ ] MCP tools: `list_goals` / `set_goal` / `remove_goal` + `SQL_SCHEMA_HINT` paragraph
-- [ ] Dashboard `/goals` page (GET-only; progress bars, status badges)
-- [ ] Docs: CLAUDE.md pattern entry, README
+- [x] Migration 0008 + `Goal`/`GoalProgress` models + validators + store methods + `goals.py` domain math
+- [x] CLI `goal` group (add-spending / add-balance / list / remove) + post-sync breach lines
+- [x] MCP tools: `list_goals` / `set_goal` / `remove_goal` + `SQL_SCHEMA_HINT` paragraph
+- [x] Dashboard `/goals` page (GET-only; progress bars, status badges)
+- [x] Docs: CLAUDE.md pattern entry, README
 
 ## 12. Out-of-scope reminders
 

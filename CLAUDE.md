@@ -40,18 +40,27 @@ goetta-finance/
 │       ├── __main__.py          # `python -m goetta_finance`
 │       ├── cli.py               # typer app, command entry points
 │       ├── config.py            # config loading, XDG paths
+│       ├── daemon.py            # one-process host: MCP HTTP + dashboard + scheduler
 │       ├── errors.py            # GoettaFinanceError hierarchy
+│       ├── goals.py             # ALL goal progress/pace math (one home)
+│       ├── mcp_config.py        # Claude Desktop/Code registration helpers
 │       ├── models.py            # pydantic models
 │       ├── simplefin.py         # SimpleFinClient
 │       ├── collector.py         # collect() function
 │       ├── server.py            # MCP server, tool registration (phase 2)
+│       ├── validators.py        # shared CLI/MCP write-surface validation
 │       ├── tools/               # one file per MCP tool, for clarity (phase 2)
 │       │   ├── __init__.py
+│       │   ├── _serialize.py    # shared Decimal/date JSON conversion
 │       │   ├── accounts.py
 │       │   ├── transactions.py
 │       │   ├── balance_history.py
+│       │   ├── categorize.py
+│       │   ├── goals.py
+│       │   ├── spending_by_category.py
 │       │   ├── sql_query.py
-│       │   └── sync_now.py
+│       │   ├── sync_now.py
+│       │   └── uncategorized.py
 │       ├── store/
 │       │   ├── __init__.py      # FinanceStore Protocol
 │       │   ├── duckdb_store.py  # default backend
@@ -155,6 +164,10 @@ The 0007 rollout required a manual mitigation dance (query the live DB → ident
 3. THEN perform the destructive change.
 
 This matches the [[feedback_pre_fix_audit_for_bug_pinning_tests]] discipline applied to data migrations: surface and handle the user-visible-effect before the schema change, not after.
+
+### Goal math has one home
+
+All goal progress/status/pace is computed in `src/goetta_finance/goals.py` (`evaluate_goals`); CLI `goal list`, MCP `list_goals`, the dashboard `/goals` page, and the post-sync breach warnings all call it — never re-derive spending or pace math per surface. Display wording likewise: `describe_goal` / `describe_progress` feed the CLI and dashboard (MCP returns raw fields). Spending-cap totals reuse `query_spending_by_category` (the pie's helper) so caps, pie, and monthly bars agree to the cent; pending transactions count, hidden accounts are excluded, periods are UTC calendar buckets. Balance goals on `is_liability` accounts evaluate `abs(balance)` (amount owed). Progress is never stored — no status columns, no events table; read-time evaluation is the feature (same retroactivity contract as the categorization view). Goal writes are gated by the shared validators in `validators.py` on both the CLI and MCP surfaces. Schema changes to `goals` must update `SQL_SCHEMA_HINT` and its marker tests, and `delete_account` refuses accounts that goals reference — extend that guard for any new FK.
 
 ### Adding a boolean flag (the `is_X` pattern)
 
