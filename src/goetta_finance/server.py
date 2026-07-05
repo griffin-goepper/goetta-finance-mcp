@@ -23,6 +23,9 @@ from goetta_finance.tools.categorize import (
     categorize_transaction as _categorize_transaction,
 )
 from goetta_finance.tools.categorize import (
+    remove_category_rule as _remove_category_rule,
+)
+from goetta_finance.tools.categorize import (
     uncategorize_transaction as _uncategorize_transaction,
 )
 from goetta_finance.tools.goals import list_goals as _list_goals
@@ -149,9 +152,11 @@ Categorization curation happens in conversation: call
 top_uncategorized_patterns to surface what's hiding in the
 Uncategorized bucket, then categorize_transaction (one-off override)
 or add_category_rule (retroactive class-of-transactions rule) to act
-on it. Don't write INSERTs via sql_query — it's read-only; the
-curation tools are the write path and they run the same pattern
-validation as the CLI.
+on it. remove_category_rule deletes a user rule by id, equally
+retroactively (default seeded rules are refused — those go through
+the CLI's confirmed --force path). Don't write INSERTs via sql_query
+— it's read-only; the curation tools are the write path and they run
+the same pattern validation as the CLI.
 
 The categories table carries an is_spending boolean (default TRUE) for
 each category. Transfers and Income are seeded with is_spending=FALSE
@@ -441,6 +446,29 @@ def build_server(
         ] = 100,
     ) -> dict[str, Any]:
         return _add_category_rule(store, category, match_type, pattern, priority)
+
+    @mcp.tool(
+        description=(
+            "Remove a categorization rule by id. Retroactive like "
+            "add_category_rule: transactions the rule matched immediately "
+            "resolve through the remaining rules (or fall back to "
+            "'Uncategorized') — no backfill. Find rule ids via sql_query on "
+            "category_rules (join categories for the category name). Confirm "
+            "with the user before deleting — rules are user-authored "
+            "configuration, and tell them what still matches afterwards if "
+            "another rule covers the same transactions. Default (seeded, "
+            "is_default=TRUE) rules are refused; removing those requires the "
+            "CLI's typed-confirmation path "
+            "(goetta-finance category remove-rule <id> --force)."
+        )
+    )
+    def remove_category_rule(
+        rule_id: Annotated[
+            int,
+            Field(ge=1, description="Rule id (from sql_query on category_rules)."),
+        ],
+    ) -> dict[str, Any]:
+        return _remove_category_rule(store, rule_id)
 
     @mcp.tool(
         description=(
