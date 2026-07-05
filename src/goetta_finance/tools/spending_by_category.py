@@ -1,29 +1,10 @@
 from __future__ import annotations
 
-from datetime import date, datetime
-from decimal import Decimal
+from datetime import datetime
 from typing import Any
 
 from goetta_finance.store import FinanceStore
-
-
-def _serialize_value(value: Any) -> Any:
-    """JSON-friendly conversion for Decimal/datetime — third copy of this
-    helper in ``tools/`` (after ``sql_query.py`` and ``transactions.py``).
-
-    NOTE: Per the categorization slice plan's "rule of three with explicit
-    defer" — this is the third place we serialize Decimals / datetimes in
-    tools/. Worth a small follow-on slice to factor into
-    ``tools/_serialize.py`` when a fourth copy emerges or before the
-    sub-seam 4 dashboard work if its row serialization wants the same
-    shape. Logged here so the duplication doesn't quietly become
-    permanent.
-    """
-    if isinstance(value, Decimal):
-        return str(value)
-    if isinstance(value, datetime | date):
-        return value.isoformat()
-    return value
+from goetta_finance.tools._serialize import serialize_value
 
 
 def query_spending_by_category(
@@ -122,4 +103,4 @@ def spending_by_category(
     agree to the cent.
     """
     rows = query_spending_by_category(store, start, end, include_non_spending=include_non_spending)
-    return [{k: _serialize_value(v) for k, v in row.items()} for row in rows]
+    return [{k: serialize_value(v) for k, v in row.items()} for row in rows]

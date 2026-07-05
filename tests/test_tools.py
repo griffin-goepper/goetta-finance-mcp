@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
 from goetta_finance.models import Account, AccountType, BalanceSnapshot, Transaction
 from goetta_finance.store.duckdb_store import DuckDBStore
+from goetta_finance.tools._serialize import serialize_value
 from goetta_finance.tools.accounts import list_accounts
 from goetta_finance.tools.balance_history import account_balance_history
 from goetta_finance.tools.spending_by_category import spending_by_category
@@ -134,6 +135,18 @@ def test_sql_query_serializes_decimal(store: DuckDBStore) -> None:
         {"id": "a1", "balance": "100.00"},
         {"id": "a2", "balance": "50000.00"},
     ]
+
+
+def test_serialize_value_conversions() -> None:
+    """Decimal -> str, datetime/date -> isoformat, everything else untouched."""
+    assert serialize_value(Decimal("12.50")) == "12.50"
+    assert serialize_value(datetime(2026, 5, 1, 12, 30, tzinfo=UTC)) == (
+        "2026-05-01T12:30:00+00:00"
+    )
+    assert serialize_value(date(2026, 5, 1)) == "2026-05-01"
+    assert serialize_value("plain") == "plain"
+    assert serialize_value(42) == 42
+    assert serialize_value(None) is None
 
 
 def test_sync_now_without_client_returns_error_payload(
