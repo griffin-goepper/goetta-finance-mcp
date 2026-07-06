@@ -50,12 +50,14 @@ from goetta_finance.store.duckdb_store import DuckDBStore
 from goetta_finance.validators import (
     GoalValidationError,
     RulePatternError,
+    format_rule_bounds,
     parse_goal_direction,
     parse_goal_period,
     parse_goal_target_date,
     parse_match_type,
     validate_goal_amount,
     validate_goal_name,
+    validate_rule_amount_bounds,
     validate_rule_pattern,
 )
 
@@ -1098,6 +1100,16 @@ def _validate_rule_pattern(pattern: str, match_type: str) -> None:
         raise typer.BadParameter(str(exc), param_hint=exc.param_hint) from exc
 
 
+def _validate_rule_amount_bounds(min_amount: Decimal | None, max_amount: Decimal | None) -> None:
+    """CLI wrapper over the shared bounds validator — same contract as
+    :func:`_validate_rule_pattern`: translation only, logic in
+    ``validators.validate_rule_amount_bounds``."""
+    try:
+        validate_rule_amount_bounds(min_amount, max_amount)
+    except RulePatternError as exc:
+        raise typer.BadParameter(str(exc), param_hint=exc.param_hint) from exc
+
+
 def _suggest_category(store: DuckDBStore, user_input: str) -> str:
     """Return a ' Did you mean "X"?' or list-command fallback string.
 
@@ -1249,10 +1261,27 @@ def category_set_rule(
             help="Lower number = higher precedence when multiple rules match (default 100).",
         ),
     ] = 100,
+    min_amount: Annotated[
+        str | None,
+        typer.Option(
+            "--min-amount",
+            help="Only match when abs(amount) >= this (inclusive). Refines the pattern.",
+        ),
+    ] = None,
+    max_amount: Annotated[
+        str | None,
+        typer.Option(
+            "--max-amount",
+            help="Only match when abs(amount) < this (exclusive). E.g. 20 for 'under $20'.",
+        ),
+    ] = None,
 ) -> None:
     """Add a categorization rule. Patterns are validated against a 1s ReDoS smoke test."""
     match_type = _parse_match_type(match)
     _validate_rule_pattern(pattern, match_type)
+    min_bound = _parse_decimal(min_amount, field="min-amount") if min_amount is not None else None
+    max_bound = _parse_decimal(max_amount, field="max-amount") if max_amount is not None else None
+    _validate_rule_amount_bounds(min_bound, max_bound)
     try:
         store = _open_writable_store()
     except GoettaFinanceError as exc:
@@ -1260,10 +1289,18 @@ def category_set_rule(
         raise typer.Exit(code=1) from exc
     try:
         rule_id = store.add_rule(
-            category_name, match_type=match_type, pattern=pattern, priority=priority
+            category_name,
+            match_type=match_type,
+            pattern=pattern,
+            priority=priority,
+            min_amount=min_bound,
+            max_amount=max_bound,
         )
+        bounds = format_rule_bounds(min_bound, max_bound)
+        bounds_suffix = f" Amount bounds: {bounds}." if bounds else ""
         typer.echo(
-            f"Added rule {rule_id}: {category_name} {match_type} {pattern!r} (priority {priority})."
+            f"Added rule {rule_id}: {category_name} {match_type} {pattern!r} "
+            f"(priority {priority}).{bounds_suffix}"
         )
     except GoettaFinanceError as exc:
         suffix = _suggest_category(store, category_name) if _is_category_not_found(exc) else ""
@@ -1293,7 +1330,8 @@ def category_remove_rule(
         raise typer.Exit(code=1) from exc
     try:
         row = store.conn.execute(
-            "SELECT r.is_default, r.pattern, r.match_type, c.name "
+            "SELECT r.is_default, r.pattern, r.match_type, c.name, "
+            "r.min_amount, r.max_amount "
             "FROM category_rules r JOIN categories c ON c.id = r.category_id "
             "WHERE r.id = ?",
             [rule_id],
@@ -1307,10 +1345,15 @@ def category_remove_rule(
             str(row[2]),
             str(row[3]),
         )
+        bounds = format_rule_bounds(
+            row[4] if isinstance(row[4], Decimal) else None,
+            row[5] if isinstance(row[5], Decimal) else None,
+        )
+        bounds_suffix = f", {bounds}" if bounds else ""
         if is_default and not force:
             typer.secho(
                 f"refusing to remove default rule {rule_id} "
-                f"({cat_name} {match_type} {pattern!r}) without --force.",
+                f"({cat_name} {match_type} {pattern!r}{bounds_suffix}) without --force.",
                 fg=typer.colors.YELLOW,
                 err=True,
             )
@@ -1324,7 +1367,7 @@ def category_remove_rule(
                 typer.secho("Pattern did not match. Aborted.", fg=typer.colors.RED, err=True)
                 raise typer.Exit(code=1)
         store.remove_rule(rule_id, force=force)
-        typer.echo(f"Removed rule {rule_id} ({cat_name} {match_type} {pattern!r}).")
+        typer.echo(f"Removed rule {rule_id} ({cat_name} {match_type} {pattern!r}{bounds_suffix}).")
     except GoettaFinanceError as exc:
         typer.secho(f"category remove-rule failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
@@ -1342,7 +1385,8 @@ def category_default_rules() -> None:
         raise typer.Exit(code=1) from exc
     try:
         rows = store.conn.execute(
-            "SELECT c.name, r.id, r.match_type, r.pattern, r.priority "
+            "SELECT c.name, r.id, r.match_type, r.pattern, r.priority, "
+            "r.min_amount, r.max_amount "
             "FROM category_rules r JOIN categories c ON c.id = r.category_id "
             "WHERE r.is_default = TRUE "
             "ORDER BY c.name, r.priority, r.pattern"
@@ -1351,13 +1395,20 @@ def category_default_rules() -> None:
             typer.echo("No default rules found (was the 0004 migration applied?).")
             return
         current_cat: str | None = None
-        for cat_name, rid, mtype, pattern, priority in rows:
+        for cat_name, rid, mtype, pattern, priority, min_amount, max_amount in rows:
             if cat_name != current_cat:
                 if current_cat is not None:
                     typer.echo("")
                 typer.secho(f"{cat_name} (priority {priority}, {mtype}):", bold=True)
                 current_cat = cat_name
-            typer.echo(f"  [rule {rid}]  {pattern}")
+            # No shipped default carries bounds; shown for completeness in
+            # case a user flips is_default on a bounded rule by hand.
+            bounds = format_rule_bounds(
+                min_amount if isinstance(min_amount, Decimal) else None,
+                max_amount if isinstance(max_amount, Decimal) else None,
+            )
+            bounds_note = f"  ({bounds})" if bounds else ""
+            typer.echo(f"  [rule {rid}]  {pattern}{bounds_note}")
     finally:
         store.close()
 

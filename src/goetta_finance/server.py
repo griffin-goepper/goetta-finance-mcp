@@ -123,7 +123,8 @@ opt in explicitly.
 
 Categorization tables (migration 0004):
   categories(id, name, display_color, is_default)
-  category_rules(id, category_id, match_type, pattern, priority, is_default)
+  category_rules(id, category_id, match_type, pattern, priority, is_default,
+                 min_amount, max_amount)
   transaction_overrides(transaction_id, category_id, created_at)
 
 Per-transaction category resolves at read time through the
@@ -135,10 +136,16 @@ transaction_overrides exists for the transaction, that override wins;
 otherwise the lowest-priority matching rule in category_rules wins
 (match_type 'contains' is a case-insensitive substring on description,
 match_type 'regex' is a DuckDB regexp_matches call); otherwise the
-fallback literal 'Uncategorized' is returned. Rule and override changes
-apply retroactively to every existing transaction without backfill —
-this is the whole point of read-time resolution; do not write a
-category_id column on transactions.
+fallback literal 'Uncategorized' is returned. Rules may carry optional
+min_amount/max_amount bounds compared against the absolute value of the
+transaction amount (a rule matches when abs(amount) >= min_amount AND
+abs(amount) < max_amount; NULL = unbounded on that side). Bounds only
+refine a pattern match — a rule never matches on amount alone — and the
+max bound is exclusive, so complementary rules at the same threshold
+(e.g. SPEEDWAY under/over 20) have no gap or overlap. Rule and override
+changes apply retroactively to every existing transaction without
+backfill — this is the whole point of read-time resolution; do not
+write a category_id column on transactions.
 
 For category-aware queries prefer transactions_with_category over the
 bare transactions table. For "what did I spend on X" questions prefer
@@ -420,9 +427,15 @@ def build_server(
             "Lower priority wins when multiple rules match (default 100; "
             "transfer-like patterns typically use 5 so they beat spending "
             "rules). Patterns are validated for ReDoS shapes before insert. "
-            "Use when the user asks to categorize a class of transactions "
-            "('from now on, anything from Duke Energy is Utilities'). For "
-            "one-off fixes prefer categorize_transaction."
+            "Optional min_amount/max_amount bounds refine a match by the "
+            "ABSOLUTE transaction amount (min inclusive, max exclusive): "
+            "dual-use merchants split cleanly, e.g. pattern 'SPEEDWAY' with "
+            "max_amount 20 catches gas-station snacks while a complementary "
+            "min_amount 20 rule catches fuel fills — no gap or overlap at "
+            "exactly 20.00. Bounds never match on their own; pattern is "
+            "always required. Use when the user asks to categorize a class "
+            "of transactions ('from now on, anything from Duke Energy is "
+            "Utilities'). For one-off fixes prefer categorize_transaction."
         )
     )
     def add_category_rule(
@@ -444,8 +457,33 @@ def build_server(
                 description="Lower number = higher precedence. Default 100.",
             ),
         ] = 100,
+        min_amount: Annotated[
+            float | None,
+            Field(
+                description="Optional: only match when abs(amount) >= this "
+                "(inclusive). Refines the pattern — never matches on amount alone."
+            ),
+        ] = None,
+        max_amount: Annotated[
+            float | None,
+            Field(
+                description="Optional: only match when abs(amount) < this "
+                "(exclusive, half-open). E.g. 20 for 'under $20'."
+            ),
+        ] = None,
     ) -> dict[str, Any]:
-        return _add_category_rule(store, category, match_type, pattern, priority)
+        # Same wire-boundary rationale as set_goal: str() gives the exact
+        # shortest repr, so sub-cent floats reach the shared validator and
+        # fail with a friendly error instead of being silently rounded.
+        return _add_category_rule(
+            store,
+            category,
+            match_type,
+            pattern,
+            priority,
+            min_amount=Decimal(str(min_amount)) if min_amount is not None else None,
+            max_amount=Decimal(str(max_amount)) if max_amount is not None else None,
+        )
 
     @mcp.tool(
         description=(

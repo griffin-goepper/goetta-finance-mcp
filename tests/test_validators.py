@@ -16,8 +16,10 @@ import pytest
 from goetta_finance.validators import (
     GOAL_NAME_MAX_LEN,
     PATTERN_MAX_LEN,
+    RULE_AMOUNT_MAX,
     GoalValidationError,
     RulePatternError,
+    format_rule_bounds,
     parse_goal_direction,
     parse_goal_kind,
     parse_goal_period,
@@ -26,6 +28,7 @@ from goetta_finance.validators import (
     validate_goal_amount,
     validate_goal_name,
     validate_goal_shape,
+    validate_rule_amount_bounds,
     validate_rule_pattern,
 )
 
@@ -256,3 +259,69 @@ def test_validate_goal_shape_unknown_kind() -> None:
             direction=None,
             target_date=None,
         )
+
+
+# --- Rule amount bounds (migration 0009) -------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("min_amount", "max_amount"),
+    [
+        (None, None),
+        (None, Decimal("20")),
+        (Decimal("10"), None),
+        (Decimal("0.01"), RULE_AMOUNT_MAX),
+        (Decimal("19.99"), Decimal("20.00")),  # adjacent cents are a valid interval
+    ],
+)
+def test_validate_rule_amount_bounds_accepts(
+    min_amount: Decimal | None, max_amount: Decimal | None
+) -> None:
+    validate_rule_amount_bounds(min_amount, max_amount)  # no raise
+
+
+@pytest.mark.parametrize(
+    ("min_amount", "max_amount", "message", "hint"),
+    [
+        (Decimal("0"), None, "positive", "--min-amount"),
+        (Decimal("-5"), None, "positive", "--min-amount"),
+        (None, Decimal("0"), "positive", "--max-amount"),
+        (Decimal("9.999"), None, "sub-cent", "--min-amount"),
+        (None, Decimal("19.999"), "sub-cent", "--max-amount"),
+        (Decimal("NaN"), None, "finite", "--min-amount"),
+        (None, Decimal("Infinity"), "finite", "--max-amount"),
+        (None, RULE_AMOUNT_MAX + Decimal("0.01"), "implausibly large", "--max-amount"),
+    ],
+)
+def test_validate_rule_amount_bounds_rejections(
+    min_amount: Decimal | None, max_amount: Decimal | None, message: str, hint: str
+) -> None:
+    with pytest.raises(RulePatternError, match=message) as exc_info:
+        validate_rule_amount_bounds(min_amount, max_amount)
+    assert exc_info.value.param_hint == hint
+
+
+@pytest.mark.parametrize(
+    ("min_amount", "max_amount"),
+    [
+        (Decimal("20"), Decimal("20")),  # equal bounds match nothing in [min, max)
+        (Decimal("30"), Decimal("20")),
+    ],
+)
+def test_validate_rule_amount_bounds_rejects_min_not_below_max(
+    min_amount: Decimal, max_amount: Decimal
+) -> None:
+    with pytest.raises(RulePatternError, match="strictly below") as exc_info:
+        validate_rule_amount_bounds(min_amount, max_amount)
+    assert exc_info.value.param_hint == "--min-amount"
+
+
+def test_format_rule_bounds_shapes() -> None:
+    """All four shapes, ASCII only — CLI output must survive cp1252."""
+    assert format_rule_bounds(None, None) == ""
+    assert format_rule_bounds(None, Decimal("20")) == "|amount| < $20.00"
+    assert format_rule_bounds(Decimal("20"), None) == "|amount| >= $20.00"
+    assert format_rule_bounds(Decimal("10"), Decimal("20")) == "$10.00 <= |amount| < $20.00"
+    combined = format_rule_bounds(Decimal("1234.5"), Decimal("2000"))
+    assert combined == "$1,234.50 <= |amount| < $2,000.00"
+    assert combined.isascii()

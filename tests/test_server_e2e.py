@@ -343,6 +343,44 @@ async def test_server_add_category_rule_rejects_redos_e2e(store: DuckDBStore) ->
         assert "validation failed" in payload["error"]
 
 
+@pytest.mark.anyio
+async def test_server_add_category_rule_with_bounds_e2e(store: DuckDBStore) -> None:
+    """Amount bounds through the real FastMCP parameter path: pins the
+    nullable float Field shape (no gt= constraint — pydantic v2 can't
+    always apply constraints to nullable schemas) and the float→Decimal
+    wire-boundary conversion."""
+    mcp = build_server(store)
+    async with create_connected_server_and_client_session(mcp) as session:
+        await session.initialize()
+        result = await session.call_tool(
+            "add_category_rule",
+            {"category": "Dining", "pattern": "ZZZ-SPEEDY", "max_amount": 20},
+        )
+        payload = _decode(result)
+        assert payload["ok"] is True, payload
+        row = store.conn.execute(
+            "SELECT min_amount, max_amount FROM category_rules WHERE id = ?",
+            [payload["rule_id"]],
+        ).fetchone()
+        assert row is not None
+        assert row[0] is None
+        assert row[1] == Decimal("20.00")
+
+        # Inverted bounds refused through the same path — shared validator.
+        result = await session.call_tool(
+            "add_category_rule",
+            {
+                "category": "Dining",
+                "pattern": "ZZZ-SPEEDY-2",
+                "min_amount": 30,
+                "max_amount": 20,
+            },
+        )
+        payload = _decode(result)
+        assert payload["ok"] is False
+        assert "validation failed" in payload["error"]
+
+
 def test_schema_hint_mentions_categorization_tables() -> None:
     """Floor: identifier markers present. If a future schema slice
     adds a table or flag, this test fails until the hint is updated."""
@@ -360,6 +398,8 @@ def test_schema_hint_mentions_categorization_tables() -> None:
         "account_is_hidden",
         "goals",
         "target_date",
+        "min_amount",
+        "max_amount",
     ):
         assert marker in SQL_SCHEMA_HINT, f"SQL_SCHEMA_HINT missing {marker!r}"
 
@@ -388,6 +428,8 @@ def test_schema_hint_communicates_categorization_semantics() -> None:
         "set_goal",  # goal write path (NOT sql_query)
         "at_most",  # balance-goal direction semantics
         "amount owed",  # liability abs rule
+        "absolute value",  # amount bounds compare against abs(amount) (0009)
+        "exclusive",  # max bound is exclusive — half-open interval (0009)
     ]
     for phrase in expected_phrases:
         assert phrase in SQL_SCHEMA_HINT, (
