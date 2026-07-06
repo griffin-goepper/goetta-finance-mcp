@@ -1657,3 +1657,47 @@ def test_close_tolerates_invalidated_database(store: DuckDBStore) -> None:
     store._conn = _InvalidatedConn()  # type: ignore[assignment]
     store.close()  # must not raise
     assert store._conn is None
+
+
+# --- Drop overrides->transactions FK (migration 0011) --------------------------
+
+
+def test_migration_0011_override_fk_to_transactions_gone(store: DuckDBStore) -> None:
+    """Pin the migration filename + the constraint shape it leaves behind."""
+    rows = store.conn.execute("SELECT name FROM schema_migrations").fetchall()
+    assert ("0011_drop_override_transactions_fk.sql",) in rows
+    constraints = {
+        (row[0], tuple(row[1]))
+        for row in store.conn.execute(
+            "SELECT constraint_type, constraint_column_names FROM duckdb_constraints() "
+            "WHERE table_name = 'transaction_overrides'"
+        ).fetchall()
+    }
+    assert ("PRIMARY KEY", ("transaction_id",)) in constraints
+    assert ("FOREIGN KEY", ("category_id",)) in constraints
+    assert ("FOREIGN KEY", ("transaction_id",)) not in constraints
+
+
+def test_sync_reupsert_of_overridden_transaction_succeeds(store: DuckDBStore) -> None:
+    """The armed bug 0011 defuses: DuckDB refuses ON CONFLICT DO UPDATE on a
+    row referenced by a foreign key, so with the old overrides->transactions
+    FK, categorize-overriding any transaction inside the sync re-pull window
+    (~30 days) made every later sync throw ConstraintException on that row's
+    re-upsert until it aged out. Pin the full user story: override, then the
+    row comes back from SimpleFIN both unchanged and changed."""
+    _seed_cat_account(store)
+    txn = _txn("t-override-sync", "SPEEDWAY 44025", amount="-16.30")
+    store.upsert_transactions([txn])
+    store.set_transaction_override("t-override-sync", "Dining")
+
+    # Unchanged re-upsert (every sync re-pulls the window even when the
+    # bank sent nothing new).
+    store.upsert_transactions([txn])
+    # Changed re-upsert (pending flip / re-dated posted — Amex daily churn).
+    changed = txn.model_copy(update={"pending": False, "amount": Decimal("-17.01")})
+    store.upsert_transactions([changed])
+
+    rows = {r["id"]: r for r in store.get_transactions_with_category()}
+    row = rows["t-override-sync"]
+    assert row["category"] == "Dining"  # override survived both upserts
+    assert row["amount"] == Decimal("-17.01")
