@@ -402,6 +402,33 @@ The MCP server exposes fifteen tools:
 
 The dashboard binds to `127.0.0.1` only by default. If you pass a non-loopback `--host`, the CLI prints a warning — **there is no auth**. Don't expose this to a network you don't fully trust.
 
+## Companion frontends (`/api/v1` + `--dash-dir`)
+
+If you want to build your own dashboard UI, the daemon (and `web`) also serve a **read-only JSON API** under `/api/v1` — the same data the HTML pages render, machine-readable:
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/v1/summary` | signed net worth, account counts, last sync |
+| `GET /api/v1/accounts?include_hidden=` | accounts (money as strings) |
+| `GET /api/v1/net-worth?days=` | daily net-worth points |
+| `GET /api/v1/cashflow/monthly?months=` | income vs spending per month (pending excluded) |
+| `GET /api/v1/spending/by-category?days=` or `?start=&end=` | net spending per category, with display colors |
+| `GET /api/v1/spending/by-month?months=&category=` | month × category matrix (pending **included** — matches goal-cap math) |
+| `GET /api/v1/goals` | goals with computed progress (same shape as the MCP `list_goals` tool) |
+| `GET /api/v1/goals/{id}/history?periods=` | per-period actuals vs a spending cap, or balance snapshots for balance goals |
+| `GET /api/v1/transactions?account_id=&start=&end=&category=&q=&limit=` | filtered transactions with resolved categories |
+| `GET /api/v1/categories` | category names, colors, `is_spending` flags |
+| `GET /api/v1/sync/status?limit=` | recent sync runs with parsed warnings/errors |
+
+Conventions: GET-only, money as strings (never floats), timestamps ISO 8601 UTC. There is deliberately **no CORS** — serve your frontend same-origin instead:
+
+```bash
+goetta-finance daemon --dash-dir /path/to/your-spa/dist
+# → your app at http://127.0.0.1:8765/dash/, calling /api/v1 same-origin
+```
+
+`--dash-dir` mounts any static single-page-app build (a folder containing `index.html`) at `/dash`. Use hash-based routing in the SPA — unknown deep paths under a static mount 404. The API has the same security posture as the HTML dashboard: no auth, whoever can reach the port can read your finances. For phone access, bind to a VPN/Tailscale interface rather than your LAN.
+
 ## Where your data lives
 
 Default paths (XDG-compliant on Linux/macOS, follows the same layout on Windows):

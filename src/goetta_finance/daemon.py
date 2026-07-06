@@ -231,6 +231,7 @@ def build_daemon_app(
     stop_file: Path | None = None,
     request_shutdown: Callable[[], None] | None = None,
     stop_poll_seconds: float = 2.0,
+    dash_dir: Path | None = None,
 ) -> FastAPI:
     """Construct the daemon's FastAPI app without binding a port.
 
@@ -256,7 +257,7 @@ def build_daemon_app(
         request_shutdown=request_shutdown,
         stop_poll_seconds=stop_poll_seconds,
     )
-    return build_app(store, mcp_server=mcp, lifespan=lifespan)
+    return build_app(store, mcp_server=mcp, lifespan=lifespan, dash_dir=dash_dir)
 
 
 def run_daemon(
@@ -269,6 +270,7 @@ def run_daemon(
     schedule_enabled: bool = True,
     mcp_enabled: bool = True,
     stop_file: Path | None = None,
+    dash_dir: Path | None = None,
 ) -> None:
     """Run the goetta-finance daemon: dashboard + MCP HTTP + scheduler.
 
@@ -295,6 +297,7 @@ def run_daemon(
         mcp_enabled=mcp_enabled,
         stop_file=stop_file,
         request_shutdown=request_shutdown,
+        dash_dir=dash_dir,
     )
     logger.info(
         "goetta-finance daemon: http://%s:%d  mcp=%s  schedule=%s @ %s  stop_file=%s",

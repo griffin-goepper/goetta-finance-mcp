@@ -160,15 +160,43 @@ def serve() -> None:
         raise typer.Exit(code=1) from exc
 
 
+def _validate_dash_dir(dash_dir: Path | None) -> Path | None:
+    """Friendly-fail validation for ``--dash-dir``: must exist, be a
+    directory, and contain an ``index.html`` (a built SPA, not a source
+    tree). Returns the resolved path or raises ``typer.Exit``."""
+    if dash_dir is None:
+        return None
+    resolved = dash_dir.expanduser().resolve()
+    problem: str | None = None
+    if not resolved.exists():
+        problem = "does not exist"
+    elif not resolved.is_dir():
+        problem = "is not a directory"
+    elif not (resolved / "index.html").exists():
+        problem = "contains no index.html (point --dash-dir at a built SPA, e.g. its dist/ folder)"
+    if problem is not None:
+        typer.secho(f"--dash-dir {resolved} {problem}.", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    return resolved
+
+
 @app.command()
 def web(
     host: Annotated[
         str, typer.Option("--host", help="Bind address. Default localhost-only.")
     ] = "127.0.0.1",
     port: Annotated[int, typer.Option("--port", help="HTTP port.")] = 8765,
+    dash_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--dash-dir",
+            help="Serve a static single-page-app build (a folder with index.html) at /dash.",
+        ),
+    ] = None,
 ) -> None:
     """Start the local web dashboard at http://<host>:<port>."""
     try:
+        dash_dir = _validate_dash_dir(dash_dir)
         config = load_config()
         target_db = db_path(config)
         if not target_db.exists():
@@ -208,10 +236,12 @@ def web(
 
             from goetta_finance.web.app import build_app
 
-            web_app = build_app(store)
+            web_app = build_app(store, dash_dir=dash_dir)
             import uvicorn
 
             typer.echo(f"goetta-finance dashboard at http://{host}:{port}")
+            if dash_dir is not None:
+                typer.echo(f"  SPA:       http://{host}:{port}/dash/")
             uvicorn.run(web_app, host=host, port=port, log_level="warning")
         finally:
             store.close()
@@ -247,6 +277,13 @@ def daemon(
             help="Disable the MCP HTTP endpoint (dashboard + scheduler only).",
         ),
     ] = False,
+    dash_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--dash-dir",
+            help="Serve a static single-page-app build (a folder with index.html) at /dash.",
+        ),
+    ] = None,
 ) -> None:
     """Run the long-lived daemon: dashboard + MCP HTTP + scheduled sync.
 
@@ -256,6 +293,7 @@ def daemon(
     The dashboard is at ``http://<host>:<port>/``.
     """
     try:
+        dash_dir = _validate_dash_dir(dash_dir)
         config = load_config()
         if not config.access_url:
             typer.secho(
@@ -296,6 +334,8 @@ def daemon(
             stop_file = db_path(config).parent / "daemon.stop"
             typer.echo(f"goetta-finance daemon: http://{host}:{port}")
             typer.echo(f"  dashboard: http://{host}:{port}/")
+            if dash_dir is not None:
+                typer.echo(f"  SPA:       http://{host}:{port}/dash/")
             typer.echo(f"  MCP:       {mcp_url}")
             typer.echo(f"  schedule:  {'(disabled)' if no_schedule else sync_at + ' local'}")
             typer.echo(f"  stop:      create {stop_file} for a graceful shutdown")
@@ -308,6 +348,7 @@ def daemon(
                 schedule_enabled=not no_schedule,
                 mcp_enabled=not no_mcp,
                 stop_file=stop_file,
+                dash_dir=dash_dir,
             )
         finally:
             store.close()

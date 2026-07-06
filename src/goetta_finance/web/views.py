@@ -17,7 +17,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from goetta_finance.goals import describe_goal, describe_progress, evaluate_goals
 from goetta_finance.models import GoalProgress
 from goetta_finance.tools.accounts import serialize_account
-from goetta_finance.web.aggregations import display_currency, recent_sync_runs
+from goetta_finance.web.aggregations import display_currency, parse_json_list, recent_sync_runs
 from goetta_finance.web.charts import (
     net_worth_figure,
     spending_by_category_figure,
@@ -236,8 +236,8 @@ def register_routes(app: FastAPI) -> None:
         last = store.last_sync_time()
         runs = recent_sync_runs(store, limit=10)
         for r in runs:
-            r["warnings_list"] = _maybe_json_list(r.get("warnings"))
-            r["errors_list"] = _maybe_json_list(r.get("errors"))
+            r["warnings_list"] = parse_json_list(r.get("warnings"))
+            r["errors_list"] = parse_json_list(r.get("errors"))
         return _render(
             request,
             "sync_health.html",
@@ -295,22 +295,6 @@ def _query_transactions(
         }
         for r in rows
     ]
-
-
-def _maybe_json_list(value: Any) -> list[str]:
-    if value in (None, "", "null"):
-        return []
-    if isinstance(value, list):
-        return [str(v) for v in value]
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError:
-            return [value]
-        if isinstance(parsed, list):
-            return [str(v) for v in parsed]
-        return [str(parsed)]
-    return [str(value)]
 
 
 def _json_default(value: Any) -> Any:
