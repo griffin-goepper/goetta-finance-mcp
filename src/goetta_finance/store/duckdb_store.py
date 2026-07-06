@@ -248,6 +248,7 @@ class DuckDBStore:
             sql_files = sorted(
                 entry.name for entry in migrations_dir.iterdir() if entry.name.endswith(".sql")
             )
+            applied_any = False
             for name in sql_files:
                 if name in applied:
                     continue
@@ -260,6 +261,18 @@ class DuckDBStore:
                 except duckdb.Error as exc:
                     self.conn.execute("ROLLBACK")
                     raise StoreError(f"Migration {name} failed: {exc}") from exc
+                applied_any = True
+            if applied_any:
+                # Flush freshly applied DDL out of the WAL immediately.
+                # DuckDB's WAL replay chokes on CREATE OR REPLACE VIEW
+                # entries ("GetDefaultDatabase with no default database
+                # set", observed live 2026-07-05 after migration 0009):
+                # if the process is force-killed before a natural
+                # checkpoint, every subsequent open of the database fails
+                # until the WAL is manually moved aside. Checkpointing
+                # here closes that window — migration DDL never outlives
+                # init() in the WAL.
+                self.conn.execute("CHECKPOINT")
 
     def upsert_accounts(self, accounts: list[Account]) -> None:
         if not accounts:
