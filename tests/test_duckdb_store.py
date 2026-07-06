@@ -1609,3 +1609,34 @@ def test_init_checkpoints_migration_ddl_out_of_wal(tmp_path: Path) -> None:
         )
     finally:
         fresh.close()
+
+
+# --- Drop explicit secondary indexes (migration 0010) -------------------------
+
+
+def test_migration_0010_no_explicit_indexes_remain(store: DuckDBStore) -> None:
+    """Pin the migration filename + that no explicit ART index survives.
+
+    Explicit non-unique ART indexes detonate under DuckDB 1.5.x once their
+    serialized form degrades: any INSERT ... ON CONFLICT DO UPDATE on the
+    table then fails in the index-append revert path with "Failed to delete
+    all rows from index" and invalidates the whole in-process database (the
+    2026-07-02 and 2026-07-06 live incidents). Data is never damaged; the
+    bug is index-only, and the planner never chose these indexes at our
+    scale anyway. Constraint (PK/FK) indexes are unaffected and must
+    survive. Nobody may CREATE INDEX again until the upstream bug is fixed
+    AND EXPLAIN proves the planner uses it — see 0010's header comment.
+    """
+    rows = store.conn.execute("SELECT name FROM schema_migrations").fetchall()
+    assert ("0010_drop_secondary_indexes.sql",) in rows
+    indexes = store.conn.execute("SELECT index_name FROM duckdb_indexes()").fetchall()
+    assert indexes == [], f"explicit indexes present: {indexes}"
+    constraints = {
+        (row[0], tuple(row[1]))
+        for row in store.conn.execute(
+            "SELECT constraint_type, constraint_column_names FROM duckdb_constraints() "
+            "WHERE table_name = 'transactions'"
+        ).fetchall()
+    }
+    assert ("PRIMARY KEY", ("id",)) in constraints
+    assert ("FOREIGN KEY", ("account_id",)) in constraints

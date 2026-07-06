@@ -156,8 +156,11 @@ CREATE TABLE transactions (
     extra JSON,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX idx_transactions_account_posted ON transactions(account_id, posted DESC);
-CREATE INDEX idx_transactions_posted ON transactions(posted DESC);
+-- No explicit secondary indexes: migration 0010 dropped them. DuckDB 1.5.x
+-- explicit non-unique ART indexes detonate on upsert once their serialized
+-- form degrades (the 2026-07-02 / 2026-07-06 incidents), and at this scale
+-- the planner never chose them over scans. Only PK/FK constraint indexes
+-- remain. Don't CREATE INDEX without reading 0010's header comment.
 
 CREATE TABLE balance_snapshots (
     account_id TEXT NOT NULL REFERENCES accounts(id),
