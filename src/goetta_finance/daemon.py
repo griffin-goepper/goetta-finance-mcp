@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import duckdb
 import uvicorn
 from fastapi import FastAPI
 from mcp.server.fastmcp import FastMCP
@@ -34,6 +35,12 @@ from goetta_finance.goals import goal_breach_warnings
 from goetta_finance.server import build_server
 from goetta_finance.simplefin import SimpleFinClient
 from goetta_finance.store import FinanceStore
+
+# Daemon lifecycle is coupled to the concrete backend on purpose: DuckDB's
+# FatalException invalidates the whole in-process database, and "restart the
+# process" is the only recovery. The FinanceStore protocol stays
+# backend-agnostic.
+from goetta_finance.store.duckdb_store import is_database_invalidated
 from goetta_finance.web.app import build_app
 
 logger = logging.getLogger(__name__)
@@ -63,8 +70,17 @@ def _most_recent_past_tick(now: datetime, hour: int, minute: int) -> datetime:
     return target
 
 
-def _run_collect_blocking(store: FinanceStore, client: SimpleFinClient) -> None:
-    """Worker-thread entry. Eats exceptions so the scheduler keeps running."""
+def _run_collect_blocking(
+    store: FinanceStore,
+    client: SimpleFinClient,
+    on_fatal: Callable[[], None] | None = None,
+) -> None:
+    """Worker-thread entry. Eats exceptions so the scheduler keeps running —
+    except a fatal store error, which triggers ``on_fatal``: once DuckDB
+    invalidates the in-process database, every later query on every surface
+    fails until the process reopens the file, so staying alive just serves
+    500s (the 2026-07-06 zombie-daemon incident). Exiting lets the
+    supervisor restart us into a healthy state."""
     try:
         result = collect_under_lock(store, client)
         if result is None:
@@ -80,11 +96,22 @@ def _run_collect_blocking(store: FinanceStore, client: SimpleFinClient) -> None:
                 logger.warning("goal breach: %s", line)
         except GoettaFinanceError:
             logger.exception("goal evaluation after scheduled sync failed")
-    except Exception:
+    except Exception as exc:
         logger.exception("scheduled sync raised")
+        if on_fatal is not None and is_database_invalidated(exc):
+            logger.critical(
+                "database invalidated by a fatal DuckDB error — shutting down "
+                "so the supervisor can restart with a fresh process"
+            )
+            on_fatal()
 
 
-async def _scheduler_loop(store: FinanceStore, client: SimpleFinClient, sync_at: str) -> None:
+async def _scheduler_loop(
+    store: FinanceStore,
+    client: SimpleFinClient,
+    sync_at: str,
+    on_fatal: Callable[[], None] | None = None,
+) -> None:
     """Run a sync at ``sync_at`` local time every day.
 
     On entry, checks whether the most recent scheduled tick was missed
@@ -104,7 +131,7 @@ async def _scheduler_loop(store: FinanceStore, client: SimpleFinClient, sync_at:
                 last_tick.isoformat(timespec="minutes"),
                 last.isoformat(timespec="minutes") if last else "never",
             )
-            await asyncio.to_thread(_run_collect_blocking, store, client)
+            await asyncio.to_thread(_run_collect_blocking, store, client, on_fatal)
             now = datetime.now().astimezone()
         next_tick = _next_tick(now, hour, minute)
         sleep_seconds = max(0.0, (next_tick - now).total_seconds())
@@ -115,7 +142,7 @@ async def _scheduler_loop(store: FinanceStore, client: SimpleFinClient, sync_at:
         )
         await asyncio.sleep(sleep_seconds)
         logger.info("scheduler: running scheduled sync")
-        await asyncio.to_thread(_run_collect_blocking, store, client)
+        await asyncio.to_thread(_run_collect_blocking, store, client, on_fatal)
 
 
 async def _stop_file_watch_loop(
@@ -197,7 +224,11 @@ def _build_lifespan(
             if schedule_enabled:
                 tasks.append(
                     asyncio.create_task(
-                        _scheduler_loop(store, client, sync_at),
+                        # request_shutdown doubles as the fatal-error escape
+                        # hatch: an invalidated database is unrecoverable
+                        # in-process, so the sync loop asks for the same
+                        # graceful exit the stop file would.
+                        _scheduler_loop(store, client, sync_at, on_fatal=request_shutdown),
                         name="goetta-finance-scheduler",
                     )
                 )
@@ -257,7 +288,42 @@ def build_daemon_app(
         request_shutdown=request_shutdown,
         stop_poll_seconds=stop_poll_seconds,
     )
-    return build_app(store, mcp_server=mcp, lifespan=lifespan, dash_dir=dash_dir)
+    app = build_app(store, mcp_server=mcp, lifespan=lifespan, dash_dir=dash_dir)
+    if request_shutdown is not None:
+        _register_fatal_error_handler(app, request_shutdown)
+    return app
+
+
+def _register_fatal_error_handler(app: FastAPI, request_shutdown: Callable[[], None]) -> None:
+    """Turn a FatalException surfacing through any HTTP request (dashboard,
+    ``/api/v1``, MCP mount) into a graceful daemon exit.
+
+    Once DuckDB invalidates the in-process database, every request fails
+    until the process reopens the file; without this the daemon zombies —
+    up, answering, every response a 500 (observed live 2026-07-06, all
+    morning). The supervisor only heals process exits, so exit.
+
+    Best-effort by design: exceptions inside FastMCP tool handlers are
+    converted to MCP error results internally and never propagate here —
+    but any dashboard/JSON-API request after the invalidation does, as does
+    the next scheduled sync (which has its own ``on_fatal`` hook).
+    """
+
+    def _handle(request: Any, exc: Exception) -> Any:
+        from fastapi.responses import JSONResponse
+
+        logger.critical(
+            "database invalidated by a fatal DuckDB error (via %s) — shutting down "
+            "so the supervisor can restart with a fresh process",
+            request.url.path,
+        )
+        request_shutdown()
+        return JSONResponse(
+            status_code=500,
+            content={"error": "database invalidated; daemon is restarting"},
+        )
+
+    app.add_exception_handler(duckdb.FatalException, _handle)
 
 
 def run_daemon(

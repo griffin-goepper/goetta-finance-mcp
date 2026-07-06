@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import re
 import threading
@@ -42,6 +43,8 @@ _LINE_COMMENT = re.compile(r"--[^\n]*")
 _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 _SQL_TIMEOUT_DEFAULT_SECONDS = 30.0
+
+logger = logging.getLogger(__name__)
 
 
 # Explicit two-list separation drives the ON CONFLICT SET clause in
@@ -158,6 +161,21 @@ def _parse_json(value: Any) -> dict[str, Any]:
     return parsed
 
 
+def is_database_invalidated(exc: BaseException) -> bool:
+    """True when ``exc`` means DuckDB has invalidated the whole in-process
+    database (``FatalException``): every subsequent operation on any
+    connection to it fails until the process reopens the file.
+
+    A long-lived server that merely logs this becomes a zombie — alive and
+    answering, every query a 500 (the 2026-07-06 incident: the daemon
+    served errors all morning while the supervisor, which only heals
+    process exits, saw a healthy process). Callers owning a process
+    lifecycle should treat this as "restart me now". Lives here rather
+    than in ``errors.py`` because it is duckdb-backend-specific.
+    """
+    return isinstance(exc, duckdb.FatalException)
+
+
 class DuckDBStore:
     """DuckDB-backed FinanceStore.
 
@@ -227,7 +245,14 @@ class DuckDBStore:
     def close(self) -> None:
         with self._lock:
             if self._conn is not None:
-                self._conn.close()
+                try:
+                    self._conn.close()
+                except duckdb.FatalException:
+                    # An invalidated database refuses even close(); there is
+                    # nothing checkpointable left in this process, and the
+                    # shutdown paths (CLI ``finally``, daemon fail-fast) must
+                    # not die on cleanup.
+                    logger.warning("store close skipped: database already invalidated")
                 self._conn = None
 
     def init(self) -> None:

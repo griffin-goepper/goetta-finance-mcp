@@ -4,6 +4,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+import duckdb
 import pytest
 
 from goetta_finance.errors import StoreError
@@ -1640,3 +1641,19 @@ def test_migration_0010_no_explicit_indexes_remain(store: DuckDBStore) -> None:
     }
     assert ("PRIMARY KEY", ("id",)) in constraints
     assert ("FOREIGN KEY", ("account_id",)) in constraints
+
+
+def test_close_tolerates_invalidated_database(store: DuckDBStore) -> None:
+    """close() must not raise when DuckDB has invalidated the database —
+    the CLI's ``finally: store.close()`` and the daemon's fail-fast exit
+    both run through here, and dying during cleanup would turn a graceful
+    restart into a crash."""
+
+    class _InvalidatedConn:
+        def close(self) -> None:
+            raise duckdb.FatalException("FATAL Error: database has been invalidated")
+
+    assert store.conn is not None  # ensure opened
+    store._conn = _InvalidatedConn()  # type: ignore[assignment]
+    store.close()  # must not raise
+    assert store._conn is None
