@@ -63,6 +63,18 @@ goetta-finance account add --currency EUR ...     # manual accounts in any ISO 4
 
 All three flags survive syncs — SimpleFIN can't overwrite them. `account list` shows hidden accounts with a `[hidden]` tag so you can find them to unhide.
 
+## Transfer links
+
+Pure user-state (nothing is seeded, nothing auto-applies): connect a manual account to matching transfers on a synced account and its balance rolls forward on every sync. `account links` detects candidates (payee == manual account name) and prints the exact command.
+
+```bash
+goetta-finance account links                                    # list + detected candidates
+goetta-finance account link MANUAL-<uuid> --from ACT-<id> --pattern "Apple Savings"
+goetta-finance account unlink <id>
+```
+
+`--match contains` (default, case-insensitive substring) or `--match regex`, applied against payee and description. `set-balance` remains the true-up for interest.
+
 ## Goals
 
 Pure user-state (nothing is seeded): spending caps per category/period and balance targets per account, evaluated at read time.

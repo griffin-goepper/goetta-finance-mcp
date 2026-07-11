@@ -413,3 +413,75 @@ def test_stop_file_present_at_startup_shuts_down_immediately(tmp_path: Path) -> 
         server.should_exit = True
         thread.join(timeout=5.0)
         store.close()
+
+
+# --- Fail-fast on database invalidation ---------------------------------------
+#
+# Once DuckDB raises FatalException the in-process database is invalidated:
+# every later query on every surface fails until the process reopens the
+# file. A daemon that merely logs it becomes a zombie serving 500s (observed
+# live 2026-07-06). These tests pin the two escape hatches: the sync loop's
+# on_fatal hook and the app-level exception handler.
+
+
+class _ExplodingClient:
+    """SimpleFIN client stand-in whose fetch raises a chosen exception."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def fetch_chunked(self, start: Any, end: Any, chunk_days: int = 60) -> Iterator[dict[str, Any]]:
+        raise self._exc
+        yield  # pragma: no cover - makes this a generator
+
+
+def test_sync_fatal_error_triggers_shutdown(tmp_path: Path) -> None:
+    import duckdb
+
+    from goetta_finance.daemon import _run_collect_blocking
+
+    store = DuckDBStore(tmp_path / "fatal.duckdb")
+    store.init()
+    calls: list[bool] = []
+    client = _ExplodingClient(duckdb.FatalException("FATAL Error: boom"))
+    _run_collect_blocking(store, client, on_fatal=lambda: calls.append(True))  # type: ignore[arg-type]
+    assert calls == [True]
+    store.close()
+
+
+def test_sync_ordinary_error_does_not_trigger_shutdown(tmp_path: Path) -> None:
+    from goetta_finance.daemon import _run_collect_blocking
+
+    store = DuckDBStore(tmp_path / "ordinary.duckdb")
+    store.init()
+    calls: list[bool] = []
+    client = _ExplodingClient(ValueError("transient network junk"))
+    _run_collect_blocking(store, client, on_fatal=lambda: calls.append(True))  # type: ignore[arg-type]
+    assert calls == []
+    store.close()
+
+
+def test_http_fatal_error_returns_500_and_triggers_shutdown(tmp_path: Path) -> None:
+    import duckdb
+    from fastapi.testclient import TestClient
+
+    class _InvalidatedStore(DuckDBStore):
+        def last_sync_time(self) -> Any:
+            raise duckdb.FatalException("FATAL Error: Failed: database has been invalidated")
+
+    store = _InvalidatedStore(tmp_path / "invalidated.duckdb")
+    store.init()
+    calls: list[bool] = []
+    app = build_daemon_app(
+        store,
+        _FakeClient(),  # type: ignore[arg-type]
+        schedule_enabled=False,
+        mcp_enabled=False,
+        request_shutdown=lambda: calls.append(True),
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/health")
+    assert response.status_code == 500
+    assert response.json() == {"error": "database invalidated; daemon is restarting"}
+    assert calls == [True]
+    store.close()

@@ -147,6 +147,57 @@ class GoalProgress(BaseModel):
     projected_date: date | None = None
 
 
+class TransferLink(BaseModel):
+    """Roll-forward config for a manual account (migration 0012).
+
+    Matching transactions on ``source_account_id`` posted strictly after
+    ``anchor`` are applied to the manual account's balance by
+    ``transfers.apply_transfer_links`` -- the definition carries no
+    progress state (the applications ledger and balance_snapshots do).
+    ``account_name``/``source_account_name`` are display denormalizations
+    resolved by ``list_transfer_links``'s JOIN, same as ``Goal``.
+    """
+
+    model_config = ConfigDict(frozen=False, extra="forbid")
+
+    id: int
+    account_id: str
+    account_name: str | None = None
+    source_account_id: str
+    source_account_name: str | None = None
+    match_type: str
+    pattern: str
+    anchor: datetime
+    created_at: datetime
+
+
+class TransferLinkSuggestion(BaseModel):
+    """A detected link candidate (like GoalProgress: read-time, frozen).
+
+    Produced by ``transfers.transfer_link_suggestions`` when a synced
+    account's transactions carry a payee that exactly matches a linkless
+    manual account's name (case-insensitive). Never auto-applied --
+    surfaces show it with ``suggested_command`` and the user confirms.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    account_id: str
+    account_name: str
+    source_account_id: str
+    source_account_name: str | None = None
+    payee: str
+    transaction_count: int
+    total: Decimal
+    first_posted: datetime
+    last_posted: datetime
+    # How many of those transactions post-date the account's balance_date
+    # and would roll forward immediately on linking.
+    pending_count: int
+    pending_total: Decimal
+    suggested_command: str
+
+
 class SyncRun(BaseModel):
     model_config = ConfigDict(frozen=False, extra="forbid")
 

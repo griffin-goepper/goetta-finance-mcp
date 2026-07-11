@@ -37,6 +37,15 @@ from goetta_finance.tools.spending_by_category import (
 from goetta_finance.tools.sql_query import sql_query as _sql_query
 from goetta_finance.tools.sync_now import sync_now as _sync_now
 from goetta_finance.tools.transactions import get_transactions as _get_transactions
+from goetta_finance.tools.transfer_links import (
+    link_account_transfers as _link_account_transfers,
+)
+from goetta_finance.tools.transfer_links import (
+    list_transfer_links as _list_transfer_links,
+)
+from goetta_finance.tools.transfer_links import (
+    unlink_account_transfers as _unlink_account_transfers,
+)
 from goetta_finance.tools.uncategorized import (
     top_uncategorized_patterns as _top_uncategorized_patterns,
 )
@@ -100,6 +109,10 @@ Schema:
             transactions_updated, warnings, errors)
   goals(id, name, kind, amount, category_id, period, account_id, direction,
         target_date, created_at)
+  transfer_links(id, account_id, source_account_id, match_type, pattern,
+                 anchor, created_at)
+  transfer_link_applications(transaction_id, account_id, link_id, amount,
+                             posted, applied_at)
 
 Columns is_manual (account was added via CLI, not synced), is_liability
 (account represents debt), and is_hidden (account excluded from default
@@ -187,6 +200,19 @@ absolute balance (amount owed): at_most is a debt ceiling, at_least a
 savings floor. Prefer the list_goals tool over ad-hoc SQL on this
 table — it carries the computed status, pace, and projection fields.
 Goal writes go through set_goal / remove_goal, not sql_query.
+
+The transfer_links table (migration 0012) connects a manual account to
+matching transactions on a synced account (pattern against payee OR
+description) so its balance rolls FORWARD automatically: each sync — and
+each link creation — applies matched settled transactions posted after
+the link's anchor through the same write path as `account set-balance`
+(accounts.balance plus a balance_snapshots row), and records them in
+transfer_link_applications so nothing ever double-counts. This is
+write-time bookkeeping, not read-time resolution: balances and
+snapshots stay authoritative, and a `set-balance` true-up re-anchors
+the links (that's also how interest gets captured — transfer sums
+can't see it). Prefer the list_transfer_links / link_account_transfers
+/ unlink_account_transfers tools over ad-hoc SQL on these tables.
 
 Money columns are DECIMAL(18,2); timestamps are TIMESTAMP in UTC. Transaction
 `amount` is signed (negative = money out). Results are well-suited to be
@@ -622,5 +648,77 @@ def build_server(
         goal_id: Annotated[int, Field(ge=1, description="Goal id from list_goals.")],
     ) -> dict[str, Any]:
         return _remove_goal(store, goal_id)
+
+    @mcp.tool(
+        description=(
+            "Transfer links (manual-account roll-forward config) plus detected "
+            "candidates. A link connects a manual account to matching "
+            "transactions on a synced account so its balance rolls forward "
+            "automatically on every sync — e.g. checking debits with payee "
+            "'Apple Savings' credit the manual 'Apple Savings' account. Each "
+            "suggestion is a synced account whose settled transactions carry a "
+            "payee exactly matching a linkless manual account's name (seen 2+ "
+            "times), with counts, totals, and how much would roll forward "
+            "immediately on linking. Suggestions are never auto-applied: offer "
+            "them to the user and call link_account_transfers once they "
+            "confirm. Use when the user asks why a manual balance looks "
+            "stale, or about tracking contributions to a savings account."
+        )
+    )
+    def list_transfer_links() -> dict[str, Any]:
+        _maybe_trigger_lazy_sync(store, client)
+        return _list_transfer_links(store)
+
+    @mcp.tool(
+        description=(
+            "Link a manual account to matching transfers on a synced account. "
+            "account_id must be a manual, non-liability account (MANUAL-...); "
+            "source_account_id a synced one (from list_accounts); pattern is "
+            "matched against transaction payee and description (match_type "
+            "'contains' = case-insensitive substring, or 'regex'). On success "
+            "the link immediately applies matched settled transactions posted "
+            "after the account's balance date, and every later sync rolls new "
+            "ones forward; `account set-balance` remains the true-up for "
+            "interest. Errors return {ok: false, error} — fix and retry. "
+            "Confirm the account, source, and pattern with the user before "
+            "creating (list_transfer_links suggestions carry ready-made "
+            "parameters)."
+        )
+    )
+    def link_account_transfers(
+        account_id: Annotated[
+            str, Field(description="Manual account id (MANUAL-...) whose balance rolls forward.")
+        ],
+        source_account_id: Annotated[
+            str, Field(description="Synced account id whose transactions fund it.")
+        ],
+        pattern: Annotated[
+            str, Field(description="Pattern matched against payee and description.")
+        ],
+        match_type: Annotated[
+            str, Field(description="'contains' (default) or 'regex'.")
+        ] = "contains",
+    ) -> dict[str, Any]:
+        return _link_account_transfers(
+            store,
+            account_id=account_id,
+            source_account_id=source_account_id,
+            pattern=pattern,
+            match_type=match_type,
+        )
+
+    @mcp.tool(
+        description=(
+            "Delete a transfer link by id (get ids from list_transfer_links). "
+            "Already-applied transfers stay in the balance and can never "
+            "double-count on re-link. Unknown ids return {ok: false, error}. "
+            "Confirm with the user before deleting — links are user-authored "
+            "configuration."
+        )
+    )
+    def unlink_account_transfers(
+        link_id: Annotated[int, Field(ge=1, description="Link id from list_transfer_links.")],
+    ) -> dict[str, Any]:
+        return _unlink_account_transfers(store, link_id)
 
     return mcp

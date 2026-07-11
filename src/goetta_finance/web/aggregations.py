@@ -7,6 +7,7 @@ chart builders downcast to ``float`` for Plotly.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -28,6 +29,13 @@ class NetWorthPoint(NamedTuple):
 
 
 class CategoryTotal(NamedTuple):
+    category: str
+    total: Decimal
+    transaction_count: int
+
+
+class MonthlyCategorySpend(NamedTuple):
+    month: date  # first-of-month, UTC-derived
     category: str
     total: Decimal
     transaction_count: int
@@ -107,6 +115,84 @@ def monthly_income_spending(
         out.append(
             by_month.get(
                 bucket, MonthlyCashflow(month=bucket, income=Decimal("0"), spending=Decimal("0"))
+            )
+        )
+    return out
+
+
+def monthly_spending_by_category(
+    store: FinanceStore,
+    *,
+    months: int = 12,
+    category: str | None = None,
+    now: datetime | None = None,
+) -> list[MonthlyCategorySpend]:
+    """Net spending per (month, category), last ``months`` UTC calendar months.
+
+    Long format, sparse: only (month, category) pairs with activity are
+    returned — callers that chart a single category zero-fill their own
+    buckets (the month window is derivable from ``months``/``now``).
+
+    Semantics deliberately match the spending-cap goal math, NOT the
+    ``monthly_income_spending`` bars:
+
+    - Same net-spending CASE as ``query_spending_by_category`` (refunds
+      reduce; a positive amount in ``Uncategorized`` contributes 0).
+    - Hidden accounts excluded; non-spending categories excluded (an
+      explicit ``category`` filter for a non-spending category returns
+      no rows — the function answers "what did I spend").
+    - **Pending transactions COUNT** — a spending cap is an early-warning
+      device and pending charges are committed money (``goals.py``). So a
+      current-month bucket here agrees with the goal card and the pie to
+      the cent, but can exceed the pending-excluded bars while charges
+      are settling.
+    """
+    end = (now or datetime.now(tz=UTC)).astimezone(UTC)
+    # Start of the (months-1)th-prior month, so we get exactly ``months``
+    # buckets — same window computation as ``monthly_income_spending``.
+    start_year = end.year
+    start_month = end.month - (months - 1)
+    while start_month <= 0:
+        start_month += 12
+        start_year -= 1
+    start = datetime(start_year, start_month, 1, tzinfo=UTC)
+
+    where = (
+        "t.posted >= ? AND COALESCE(t.account_is_hidden, FALSE) = FALSE"
+        " AND COALESCE(c.is_spending, TRUE) = TRUE"
+    )
+    params: list[object] = [start]
+    if category is not None:
+        where += " AND t.category = ?"
+        params.append(category)
+    # ruff S608 / bandit B608: ``where`` is composed entirely of string
+    # literals plus ``?`` placeholders bound via params. No user input is
+    # interpolated (same audited pattern as query_spending_by_category).
+    sql = f"""
+        SELECT
+            date_trunc('month', t.posted) AS month,
+            t.category,
+            SUM(CASE WHEN t.amount > 0 AND t.category = 'Uncategorized'
+                     THEN 0 ELSE -t.amount END) AS total,
+            COUNT(*) AS transaction_count
+        FROM transactions_with_category t
+        LEFT JOIN categories c ON c.name = t.category
+        WHERE {where}
+        GROUP BY 1, 2
+        ORDER BY 1, total DESC
+    """  # noqa: S608  # nosec B608
+    rows = store.query_sql(sql, params)
+
+    out: list[MonthlyCategorySpend] = []
+    for row in rows:
+        m = row["month"]
+        bucket = m.date() if isinstance(m, datetime) else m
+        out.append(
+            MonthlyCategorySpend(
+                month=bucket,
+                category=str(row["category"]),
+                total=_as_decimal(row["total"]),
+                transaction_count=int(row["transaction_count"]),
             )
         )
     return out
@@ -212,9 +298,32 @@ def display_currency(store: FinanceStore) -> str:
     return "mixed"
 
 
+def parse_json_list(value: object) -> list[str]:
+    """Parse a sync_runs ``warnings``/``errors`` cell into a list of strings.
+
+    DuckDB hands the column back as a JSON string (or None); tolerate raw
+    strings and pre-parsed lists too. Shared by the dashboard sync page
+    and the JSON API (moved here from ``views.py`` when the second caller
+    arrived — it belongs next to ``recent_sync_runs``, which produces the
+    values it parses)."""
+    if value in (None, "", "null"):
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return [value]
+        if isinstance(parsed, list):
+            return [str(v) for v in parsed]
+        return [str(parsed)]
+    return [str(value)]
+
+
 def recent_sync_runs(store: FinanceStore, *, limit: int = 10) -> list[dict[str, object]]:
     """Most recent sync_runs rows, newest first. Warnings/errors come back
-    as JSON strings from DuckDB; callers can parse them as needed."""
+    as JSON strings from DuckDB; parse with ``parse_json_list``."""
     rows = store.query_sql(
         """
         SELECT id, started_at, finished_at, accounts_touched,
@@ -239,10 +348,13 @@ def _as_decimal(value: object) -> Decimal:
 __all__: Sequence[str] = (
     "CategoryTotal",
     "MonthlyCashflow",
+    "MonthlyCategorySpend",
     "NetWorthPoint",
     "display_currency",
     "monthly_income_spending",
+    "monthly_spending_by_category",
     "net_worth_series",
+    "parse_json_list",
     "recent_sync_runs",
     "spending_by_category_last_n_days",
 )

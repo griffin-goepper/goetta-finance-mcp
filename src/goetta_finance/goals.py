@@ -3,7 +3,10 @@
 This is the ONE home for goal math. CLI ``goal list``, the MCP
 ``list_goals`` tool, the dashboard ``/goals`` page, and the post-sync
 breach summary all call :func:`evaluate_goals` — never re-derive
-spending or pace math per surface (consistent-metric rule).
+spending or pace math per surface (consistent-metric rule). Historical
+per-period actuals for a cap (:func:`spending_cap_history`) live here
+for the same reason: the JSON API's goal-history endpoint must agree
+with the goal card to the cent.
 
 Spending-cap totals reuse ``query_spending_by_category`` (the pie's
 helper) so caps, the by-category pie, and the monthly bars agree to the
@@ -27,6 +30,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from typing import NamedTuple
 
 from goetta_finance.errors import StoreError
 from goetta_finance.models import (
@@ -125,6 +129,55 @@ def spending_cap_progress(
         period_end=end,
         period_elapsed_percent=elapsed,
     )
+
+
+class SpendingCapPeriod(NamedTuple):
+    """One historical bucket of a spending-cap goal's actuals."""
+
+    period_start: datetime
+    period_end: datetime  # exclusive
+    actual: Decimal
+    over: bool  # actual >= cap — same comparison as GoalStatus.OVER
+
+
+def spending_cap_history(
+    store: FinanceStore, goal: Goal, *, periods: int = 12, now: datetime | None = None
+) -> list[SpendingCapPeriod]:
+    """Per-period net spending vs the cap, oldest first, newest last.
+
+    Buckets are the goal's own period granularity (month or year), walked
+    backwards from the bucket containing ``now``. Each bucket reuses the
+    exact :func:`spending_cap_progress` query (same net-spending CASE,
+    pending included, hidden excluded, microsecond end backoff), so the
+    newest bucket always equals the goal card's ``current`` to the cent.
+    """
+    if goal.period is None or goal.category_name is None:  # pragma: no cover
+        raise StoreError(f"spending_cap goal {goal.id} is missing category or period")
+    now = (now or datetime.now(tz=UTC)).astimezone(UTC)
+    bounds: list[tuple[datetime, datetime]] = []
+    cursor = now
+    for _ in range(periods):
+        start, end = period_bounds(goal.period, cursor)
+        bounds.append((start, end))
+        cursor = start - timedelta(microseconds=1)
+    out: list[SpendingCapPeriod] = []
+    for start, end in reversed(bounds):
+        rows = query_spending_by_category(
+            store, start, end - timedelta(microseconds=1), include_non_spending=True
+        )
+        actual = next(
+            (_as_decimal(r["total"]) for r in rows if r["category"] == goal.category_name),
+            Decimal("0"),
+        )
+        out.append(
+            SpendingCapPeriod(
+                period_start=start,
+                period_end=end,
+                actual=actual,
+                over=actual >= goal.amount,
+            )
+        )
+    return out
 
 
 def balance_goal_progress(
@@ -330,11 +383,13 @@ def describe_progress(progress: GoalProgress) -> str:
 
 
 __all__ = [
+    "SpendingCapPeriod",
     "balance_goal_progress",
     "describe_goal",
     "describe_progress",
     "evaluate_goals",
     "goal_breach_warnings",
     "period_bounds",
+    "spending_cap_history",
     "spending_cap_progress",
 ]

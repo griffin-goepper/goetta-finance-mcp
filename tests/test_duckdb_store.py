@@ -4,6 +4,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+import duckdb
 import pytest
 
 from goetta_finance.errors import StoreError
@@ -1609,3 +1610,224 @@ def test_init_checkpoints_migration_ddl_out_of_wal(tmp_path: Path) -> None:
         )
     finally:
         fresh.close()
+
+
+# --- Drop explicit secondary indexes (migration 0010) -------------------------
+
+
+def test_migration_0010_no_explicit_indexes_remain(store: DuckDBStore) -> None:
+    """Pin the migration filename + that no explicit ART index survives.
+
+    Explicit non-unique ART indexes detonate under DuckDB 1.5.x once their
+    serialized form degrades: any INSERT ... ON CONFLICT DO UPDATE on the
+    table then fails in the index-append revert path with "Failed to delete
+    all rows from index" and invalidates the whole in-process database (the
+    2026-07-02 and 2026-07-06 live incidents). Data is never damaged; the
+    bug is index-only, and the planner never chose these indexes at our
+    scale anyway. Constraint (PK/FK) indexes are unaffected and must
+    survive. Nobody may CREATE INDEX again until the upstream bug is fixed
+    AND EXPLAIN proves the planner uses it — see 0010's header comment.
+    """
+    rows = store.conn.execute("SELECT name FROM schema_migrations").fetchall()
+    assert ("0010_drop_secondary_indexes.sql",) in rows
+    indexes = store.conn.execute("SELECT index_name FROM duckdb_indexes()").fetchall()
+    assert indexes == [], f"explicit indexes present: {indexes}"
+    constraints = {
+        (row[0], tuple(row[1]))
+        for row in store.conn.execute(
+            "SELECT constraint_type, constraint_column_names FROM duckdb_constraints() "
+            "WHERE table_name = 'transactions'"
+        ).fetchall()
+    }
+    assert ("PRIMARY KEY", ("id",)) in constraints
+    assert ("FOREIGN KEY", ("account_id",)) in constraints
+
+
+def test_close_tolerates_invalidated_database(store: DuckDBStore) -> None:
+    """close() must not raise when DuckDB has invalidated the database —
+    the CLI's ``finally: store.close()`` and the daemon's fail-fast exit
+    both run through here, and dying during cleanup would turn a graceful
+    restart into a crash."""
+
+    class _InvalidatedConn:
+        def close(self) -> None:
+            raise duckdb.FatalException("FATAL Error: database has been invalidated")
+
+    assert store.conn is not None  # ensure opened
+    store._conn = _InvalidatedConn()  # type: ignore[assignment]
+    store.close()  # must not raise
+    assert store._conn is None
+
+
+# --- Drop overrides->transactions FK (migration 0011) --------------------------
+
+
+def test_migration_0011_override_fk_to_transactions_gone(store: DuckDBStore) -> None:
+    """Pin the migration filename + the constraint shape it leaves behind."""
+    rows = store.conn.execute("SELECT name FROM schema_migrations").fetchall()
+    assert ("0011_drop_override_transactions_fk.sql",) in rows
+    constraints = {
+        (row[0], tuple(row[1]))
+        for row in store.conn.execute(
+            "SELECT constraint_type, constraint_column_names FROM duckdb_constraints() "
+            "WHERE table_name = 'transaction_overrides'"
+        ).fetchall()
+    }
+    assert ("PRIMARY KEY", ("transaction_id",)) in constraints
+    assert ("FOREIGN KEY", ("category_id",)) in constraints
+    assert ("FOREIGN KEY", ("transaction_id",)) not in constraints
+
+
+def test_sync_reupsert_of_overridden_transaction_succeeds(store: DuckDBStore) -> None:
+    """The armed bug 0011 defuses: DuckDB refuses ON CONFLICT DO UPDATE on a
+    row referenced by a foreign key, so with the old overrides->transactions
+    FK, categorize-overriding any transaction inside the sync re-pull window
+    (~30 days) made every later sync throw ConstraintException on that row's
+    re-upsert until it aged out. Pin the full user story: override, then the
+    row comes back from SimpleFIN both unchanged and changed."""
+    _seed_cat_account(store)
+    txn = _txn("t-override-sync", "SPEEDWAY 44025", amount="-16.30")
+    store.upsert_transactions([txn])
+    store.set_transaction_override("t-override-sync", "Dining")
+
+    # Unchanged re-upsert (every sync re-pulls the window even when the
+    # bank sent nothing new).
+    store.upsert_transactions([txn])
+    # Changed re-upsert (pending flip / re-dated posted — Amex daily churn).
+    changed = txn.model_copy(update={"pending": False, "amount": Decimal("-17.01")})
+    store.upsert_transactions([changed])
+
+    rows = {r["id"]: r for r in store.get_transactions_with_category()}
+    row = rows["t-override-sync"]
+    assert row["category"] == "Dining"  # override survived both upserts
+    assert row["amount"] == Decimal("-17.01")
+
+
+# --- Transfer links (migration 0012) --------------------------------------------
+
+
+def test_migration_0012_applied(store: DuckDBStore) -> None:
+    """Pin the migration filename + both new tables' column shapes."""
+    rows = store.conn.execute("SELECT name FROM schema_migrations").fetchall()
+    assert ("0012_transfer_links.sql",) in rows
+    store.conn.execute(
+        "SELECT id, account_id, source_account_id, match_type, pattern, anchor, created_at "
+        "FROM transfer_links LIMIT 0"
+    )
+    store.conn.execute(
+        "SELECT transaction_id, account_id, link_id, amount, posted, applied_at "
+        "FROM transfer_link_applications LIMIT 0"
+    )
+
+
+def test_migration_0012_no_fk_onto_transactions(store: DuckDBStore) -> None:
+    """The 0011 lesson, pinned forward: the applications ledger must not
+    FK the frequently re-upserted transactions table, or every sync that
+    re-pulls an applied transaction throws ConstraintException."""
+    constraints = {
+        row[0]
+        for row in store.conn.execute(
+            "SELECT constraint_type FROM duckdb_constraints() "
+            "WHERE table_name = 'transfer_link_applications'"
+        ).fetchall()
+    }
+    assert "FOREIGN KEY" not in constraints
+
+
+def test_add_transfer_link_round_trip(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account(id="ACT-chk"), _manual_account(id="MANUAL-sav")])
+    link = store.add_transfer_link(
+        "MANUAL-sav", "ACT-chk", match_type="contains", pattern="Apple Savings"
+    )
+    assert link.account_name == "Apple Savings"
+    assert link.source_account_name == "Checking 1234"
+    # Anchored at the destination's balance_date: that balance already
+    # speaks for everything posted at or before it.
+    assert link.anchor == _utc(2026, 5, 17)
+    assert store.list_transfer_links() == [link]
+    assert store.list_transfer_links(account_id="MANUAL-sav") == [link]
+    assert store.list_transfer_links(account_id="ACT-chk") == []
+
+
+def test_add_transfer_link_refusals(store: DuckDBStore) -> None:
+    store.upsert_accounts(
+        [
+            _account(id="ACT-chk"),
+            _manual_account(id="MANUAL-sav"),
+            _manual_account(id="MANUAL-loan").model_copy(update={"is_liability": True}),
+            _manual_account(id="MANUAL-eur").model_copy(update={"currency": "EUR"}),
+        ]
+    )
+    with pytest.raises(StoreError, match="account not found"):
+        store.add_transfer_link("MANUAL-nope", "ACT-chk", match_type="contains", pattern="x")
+    with pytest.raises(StoreError, match="manual accounts only"):
+        store.add_transfer_link("ACT-chk", "ACT-chk", match_type="contains", pattern="x")
+    with pytest.raises(StoreError, match="liability"):
+        store.add_transfer_link("MANUAL-loan", "ACT-chk", match_type="contains", pattern="x")
+    with pytest.raises(StoreError, match="account not found"):
+        store.add_transfer_link("MANUAL-sav", "ACT-nope", match_type="contains", pattern="x")
+    with pytest.raises(StoreError, match="must be a synced account"):
+        store.add_transfer_link("MANUAL-sav", "MANUAL-loan", match_type="contains", pattern="x")
+    with pytest.raises(StoreError, match="currency mismatch"):
+        store.add_transfer_link("MANUAL-eur", "ACT-chk", match_type="contains", pattern="x")
+    with pytest.raises(StoreError, match="match_type"):
+        store.add_transfer_link("MANUAL-sav", "ACT-chk", match_type="glob", pattern="x")
+    assert store.list_transfer_links() == []
+
+
+def test_remove_transfer_link(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account(id="ACT-chk"), _manual_account(id="MANUAL-sav")])
+    link = store.add_transfer_link("MANUAL-sav", "ACT-chk", match_type="contains", pattern="x")
+    store.remove_transfer_link(link.id)
+    assert store.list_transfer_links() == []
+    with pytest.raises(StoreError, match="transfer link not found"):
+        store.remove_transfer_link(link.id)
+
+
+def test_delete_account_refuses_linked_account_then_cleans_ledger(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account(id="ACT-chk"), _manual_account(id="MANUAL-sav")])
+    link = store.add_transfer_link(
+        "MANUAL-sav", "ACT-chk", match_type="contains", pattern="Apple Savings"
+    )
+    txn = Transaction(
+        id="t-link-del",
+        account_id="ACT-chk",
+        posted=_utc(2026, 6, 12),
+        amount=Decimal("-500.00"),
+        description="Web Authorized Pmt Apple Gs Savings",
+        payee="Apple Savings",
+    )
+    store.upsert_transactions([txn])
+    store.record_transfer_applications("MANUAL-sav", link.id, [txn])
+
+    with pytest.raises(StoreError, match=r"transfer link\(s\) referencing it"):
+        store.delete_account("MANUAL-sav")
+    assert any(a.id == "MANUAL-sav" for a in store.get_accounts())
+
+    store.remove_transfer_link(link.id)
+    store.delete_account("MANUAL-sav")
+    remaining = store.conn.execute(
+        "SELECT COUNT(*) FROM transfer_link_applications WHERE account_id = 'MANUAL-sav'"
+    ).fetchone()
+    assert remaining is not None and remaining[0] == 0
+
+
+def test_sync_reupsert_of_linked_accounts_succeeds(store: DuckDBStore) -> None:
+    """0011-class pin for the transfer_links->accounts FKs: every sync
+    re-upserts accounts with ON CONFLICT DO UPDATE, and the roll-forward
+    itself re-upserts the linked manual account. Both parents of a
+    transfer_links row must tolerate that (the goals->accounts FK is the
+    established precedent; this pins it for the new table)."""
+    checking = _account(id="ACT-chk")
+    savings = _manual_account(id="MANUAL-sav")
+    store.upsert_accounts([checking, savings])
+    store.add_transfer_link("MANUAL-sav", "ACT-chk", match_type="contains", pattern="x")
+
+    # Unchanged re-upsert (sync re-pull) + changed re-upserts on both sides.
+    store.upsert_accounts([checking])
+    store.upsert_accounts([checking.model_copy(update={"balance": Decimal("42.00")})])
+    store.upsert_accounts([savings.model_copy(update={"balance": Decimal("31000.00")})])
+
+    balances = {a.id: a.balance for a in store.get_accounts()}
+    assert balances["ACT-chk"] == Decimal("42.00")
+    assert balances["MANUAL-sav"] == Decimal("31000.00")
