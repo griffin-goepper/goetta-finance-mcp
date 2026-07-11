@@ -332,3 +332,84 @@ def test_run_collect_blocking_logs_goal_breaches(
     assert "Dining cap" in message
     assert "450.00" in message
     assert "daemon goal txn" not in message
+
+
+# --- stop-file graceful shutdown ----------------------------------------------
+
+
+def _start_daemon_with_stop_file(
+    tmp_path: Path, *, precreate_stop_file: bool
+) -> tuple[uvicorn.Server, threading.Thread, Path, DuckDBStore, str]:
+    """Start a daemon thread wired exactly like run_daemon: the stop-file
+    watcher flips the real uvicorn Server's should_exit."""
+    db = tmp_path / "stopfile.duckdb"
+    store = DuckDBStore(db)
+    store.init()
+    stop_file = tmp_path / "daemon.stop"
+    if precreate_stop_file:
+        stop_file.touch()
+
+    server_ref: list[uvicorn.Server] = []
+
+    def request_shutdown() -> None:
+        if server_ref:
+            server_ref[0].should_exit = True
+
+    app = build_daemon_app(
+        store,
+        _FakeClient(),  # type: ignore[arg-type]
+        sync_at="23:59",
+        schedule_enabled=False,
+        mcp_enabled=False,
+        stop_file=stop_file,
+        request_shutdown=request_shutdown,
+        stop_poll_seconds=0.1,
+    )
+    port = _free_port()
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    server_ref.append(server)
+    thread = threading.Thread(target=server.run, name="daemon-stopfile-test", daemon=True)
+    thread.start()
+    return server, thread, stop_file, store, f"http://127.0.0.1:{port}"
+
+
+def test_stop_file_triggers_graceful_shutdown(tmp_path: Path) -> None:
+    """The whole point of the stop file: no kill required. Touching the
+    file makes the daemon exit on its own, releasing the DB lock through
+    a clean close — the anti-WAL-corruption bounce path."""
+    server, thread, stop_file, store, base = _start_daemon_with_stop_file(
+        tmp_path, precreate_stop_file=False
+    )
+    try:
+        _wait_for_health(f"{base}/health", timeout=8.0)
+        assert not server.should_exit
+        stop_file.touch()
+        thread.join(timeout=8.0)
+        assert not thread.is_alive(), "daemon did not shut down after stop file appeared"
+        # The daemon never deletes the file — removing it is the
+        # operator's explicit re-arm step (the supervisor contract).
+        assert stop_file.exists()
+    finally:
+        server.should_exit = True  # no-op if the test already succeeded
+        thread.join(timeout=5.0)
+        store.close()
+    # Clean shutdown released the lock: a fresh writable open succeeds.
+    reopened = DuckDBStore(tmp_path / "stopfile.duckdb")
+    reopened.init()
+    reopened.close()
+
+
+def test_stop_file_present_at_startup_shuts_down_immediately(tmp_path: Path) -> None:
+    """A stale stop file means 'do not run' — mirrors the supervisor,
+    which refuses to relaunch while the file exists. The daemon exiting
+    (loudly) instead of running keeps the two views consistent."""
+    server, thread, _stop_file, store, _base = _start_daemon_with_stop_file(
+        tmp_path, precreate_stop_file=True
+    )
+    try:
+        thread.join(timeout=8.0)
+        assert not thread.is_alive(), "daemon kept running despite a startup stop file"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5.0)
+        store.close()

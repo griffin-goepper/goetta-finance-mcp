@@ -293,10 +293,12 @@ def daemon(
             store.init()
             client = SimpleFinClient(config.access_url)
             mcp_url = f"http://{host}:{port}/api/mcp" if not no_mcp else "(disabled)"
+            stop_file = db_path(config).parent / "daemon.stop"
             typer.echo(f"goetta-finance daemon: http://{host}:{port}")
             typer.echo(f"  dashboard: http://{host}:{port}/")
             typer.echo(f"  MCP:       {mcp_url}")
             typer.echo(f"  schedule:  {'(disabled)' if no_schedule else sync_at + ' local'}")
+            typer.echo(f"  stop:      create {stop_file} for a graceful shutdown")
             run_daemon(
                 store,
                 client,
@@ -305,6 +307,7 @@ def daemon(
                 sync_at=sync_at,
                 schedule_enabled=not no_schedule,
                 mcp_enabled=not no_mcp,
+                stop_file=stop_file,
             )
         finally:
             store.close()

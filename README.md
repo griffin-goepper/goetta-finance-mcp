@@ -264,6 +264,8 @@ claude mcp add goetta-finance --scope user --transport http http://127.0.0.1:876
 
 (Re-run `goetta-finance init` to pick the daemon path interactively — it will also clear any stale stdio registration first.)
 
+**Stopping the daemon gracefully.** Create a file named `daemon.stop` next to `data.duckdb` (the daemon prints the exact path at startup); the daemon notices within a couple of seconds, shuts down cleanly, and releases the DB lock. Prefer this over killing the process: a hard kill can freeze uncheckpointed WAL content, and DuckDB refuses to replay WAL that contains view DDL — a force-kill right after a schema migration can leave the database unopenable until the WAL is moved aside. The daemon never deletes the stop file (a stale one makes it exit at startup, loudly) — remove the file when you want the daemon to run again. This composes with supervisor scripts: have the supervisor skip its restart loop while `daemon.stop` exists, and a bounce becomes "create file, wait for exit, do your maintenance, delete file, relaunch".
+
 **In v1 the daemon does not auto-start.** Keep it running in a separate terminal, or install one of the scheduling snippets below to start it at login.
 
 ## Scheduling

@@ -1589,3 +1589,23 @@ def test_view_bounded_rule_respects_priority(store: DuckDBStore) -> None:
     rows = {r["id"]: r["category"] for r in store.get_transactions_with_category()}
     assert rows["t-in"] == "Dining"
     assert rows["t-out"] == "Gas"
+
+
+def test_init_checkpoints_migration_ddl_out_of_wal(tmp_path: Path) -> None:
+    """Incident pin (2026-07-05): DuckDB's WAL replay fails on CREATE OR
+    REPLACE VIEW entries, so a force-kill after migrations but before a
+    natural checkpoint bricked the database until the WAL was manually
+    moved aside. init() must checkpoint after applying migrations so the
+    DDL never lingers in the WAL — asserted here while the connection is
+    still open, i.e. the state a kill would freeze."""
+    db = tmp_path / "checkpoint-test.duckdb"
+    fresh = DuckDBStore(db)
+    fresh.init()  # applies every migration, including the 0009 view rebuild
+    try:
+        wal = Path(str(db) + ".wal")
+        assert not wal.exists() or wal.stat().st_size == 0, (
+            f"WAL still holds {wal.stat().st_size} bytes of migration DDL "
+            "after init(); a force-kill now would corrupt the database."
+        )
+    finally:
+        fresh.close()

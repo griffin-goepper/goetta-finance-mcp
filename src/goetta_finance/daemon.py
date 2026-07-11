@@ -21,6 +21,7 @@ from contextlib import (
     suppress,
 )
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import uvicorn
@@ -117,12 +118,55 @@ async def _scheduler_loop(store: FinanceStore, client: SimpleFinClient, sync_at:
         await asyncio.to_thread(_run_collect_blocking, store, client)
 
 
+async def _stop_file_watch_loop(
+    stop_file: Path,
+    request_shutdown: Callable[[], None],
+    poll_seconds: float = 2.0,
+) -> None:
+    """Poll for ``stop_file``; request a graceful shutdown when it appears.
+
+    Why a file and not an HTTP endpoint: a ``POST /shutdown`` on an
+    unauthenticated localhost server is reachable by any local process
+    AND by any web page the user visits (``fetch(..., {mode: 'no-cors'})``
+    is not blocked by CORS for fire-and-forget requests) — a drive-by
+    denial of service. A file in the data directory requires local
+    filesystem access, which already implies full control of the DB.
+
+    Why graceful shutdown matters: killing the daemon hard can freeze
+    uncheckpointed WAL content; if that WAL holds DDL, DuckDB's replay
+    fails and the database won't open (the 2026-07-05 incident). A
+    graceful exit closes the store, which checkpoints.
+
+    A stop file that already exists at startup triggers an immediate
+    shutdown — same contract as the supervisor pattern (a launcher that
+    respects the stop file refuses to restart while it exists; the
+    daemon refusing to run mirrors it). The file is never deleted by the
+    daemon: removing it is the operator's re-arm step.
+    """
+    if stop_file.exists():
+        logger.warning(
+            "stop file %s already present at startup — shutting down; delete it to run the daemon",
+            stop_file,
+        )
+        request_shutdown()
+        return
+    while True:
+        await asyncio.sleep(poll_seconds)
+        if stop_file.exists():
+            logger.info("stop file %s present — shutting down gracefully", stop_file)
+            request_shutdown()
+            return
+
+
 def _build_lifespan(
     store: FinanceStore,
     client: SimpleFinClient,
     sync_at: str,
     schedule_enabled: bool,
     mcp_server: FastMCP | None,
+    stop_file: Path | None = None,
+    request_shutdown: Callable[[], None] | None = None,
+    stop_poll_seconds: float = 2.0,
 ) -> Callable[[FastAPI], AbstractAsyncContextManager[Any]]:
     """Build a FastAPI lifespan that owns the scheduler task AND the MCP
     session manager.
@@ -149,16 +193,27 @@ def _build_lifespan(
         async with AsyncExitStack() as stack:
             if mcp_server is not None:
                 await stack.enter_async_context(mcp_server.session_manager.run())
-            task: asyncio.Task[None] | None = None
+            tasks: list[asyncio.Task[None]] = []
             if schedule_enabled:
-                task = asyncio.create_task(
-                    _scheduler_loop(store, client, sync_at),
-                    name="goetta-finance-scheduler",
+                tasks.append(
+                    asyncio.create_task(
+                        _scheduler_loop(store, client, sync_at),
+                        name="goetta-finance-scheduler",
+                    )
+                )
+            if stop_file is not None and request_shutdown is not None:
+                tasks.append(
+                    asyncio.create_task(
+                        _stop_file_watch_loop(
+                            stop_file, request_shutdown, poll_seconds=stop_poll_seconds
+                        ),
+                        name="goetta-finance-stop-watch",
+                    )
                 )
             try:
                 yield
             finally:
-                if task is not None:
+                for task in tasks:
                     task.cancel()
                     with suppress(asyncio.CancelledError):
                         await task
@@ -173,11 +228,17 @@ def build_daemon_app(
     sync_at: str = "06:00",
     schedule_enabled: bool = True,
     mcp_enabled: bool = True,
+    stop_file: Path | None = None,
+    request_shutdown: Callable[[], None] | None = None,
+    stop_poll_seconds: float = 2.0,
 ) -> FastAPI:
     """Construct the daemon's FastAPI app without binding a port.
 
     Split out from ``run_daemon`` so tests can drive uvicorn manually
     (for graceful start/stop) without re-implementing the wiring.
+    ``stop_file`` + ``request_shutdown`` arm the graceful-shutdown watch:
+    when the file appears, ``request_shutdown()`` is called (in
+    ``run_daemon`` it flips uvicorn's ``should_exit``).
     """
     parse_sync_at(sync_at)  # validate early
     mcp = build_server(store, client=client) if mcp_enabled else None
@@ -185,7 +246,16 @@ def build_daemon_app(
     # lazily creates session_manager). _build_lifespan then enters
     # session_manager.run() — must happen *after* the mount so the
     # session manager exists.
-    lifespan = _build_lifespan(store, client, sync_at, schedule_enabled, mcp)
+    lifespan = _build_lifespan(
+        store,
+        client,
+        sync_at,
+        schedule_enabled,
+        mcp,
+        stop_file=stop_file,
+        request_shutdown=request_shutdown,
+        stop_poll_seconds=stop_poll_seconds,
+    )
     return build_app(store, mcp_server=mcp, lifespan=lifespan)
 
 
@@ -198,25 +268,43 @@ def run_daemon(
     sync_at: str = "06:00",
     schedule_enabled: bool = True,
     mcp_enabled: bool = True,
+    stop_file: Path | None = None,
 ) -> None:
     """Run the goetta-finance daemon: dashboard + MCP HTTP + scheduler.
 
-    Blocks until interrupted (Ctrl-C). Releases the scheduler task and
-    closes the store cleanly on shutdown.
+    Blocks until interrupted (Ctrl-C) or, when ``stop_file`` is given,
+    until that file appears — the graceful alternative to killing the
+    process (a hard kill can freeze DDL in the WAL and brick the DB;
+    see the 0009 incident note in duckdb_store.init). Releases the
+    scheduler task and closes the store cleanly on shutdown.
     """
+    # Late-bound so the lifespan (built before the server object exists)
+    # can flip uvicorn's should_exit. uvicorn polls it in its main loop
+    # and runs its full graceful-shutdown sequence.
+    server_ref: list[uvicorn.Server] = []
+
+    def request_shutdown() -> None:
+        if server_ref:
+            server_ref[0].should_exit = True
+
     app = build_daemon_app(
         store,
         client,
         sync_at=sync_at,
         schedule_enabled=schedule_enabled,
         mcp_enabled=mcp_enabled,
+        stop_file=stop_file,
+        request_shutdown=request_shutdown,
     )
     logger.info(
-        "goetta-finance daemon: http://%s:%d  mcp=%s  schedule=%s @ %s",
+        "goetta-finance daemon: http://%s:%d  mcp=%s  schedule=%s @ %s  stop_file=%s",
         host,
         port,
         mcp_enabled,
         schedule_enabled,
         sync_at,
+        stop_file,
     )
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning"))
+    server_ref.append(server)
+    server.run()
