@@ -48,10 +48,11 @@ _LARGE_REPETITION_THRESHOLD = 10
 
 
 class RulePatternError(ValueError):
-    """A rule pattern failed write-time validation.
+    """A rule definition (pattern or amount bounds) failed write-time validation.
 
     ``param_hint`` mirrors typer.BadParameter's concept so the CLI can
-    map it back onto the offending flag (``--pattern`` / ``--match``).
+    map it back onto the offending flag (``--pattern`` / ``--match`` /
+    ``--min-amount`` / ``--max-amount``).
     """
 
     def __init__(self, message: str, *, param_hint: str = "--pattern") -> None:
@@ -279,3 +280,61 @@ def validate_goal_shape(
             f"kind must be 'spending_cap' or 'balance', got {kind!r}",
             param_hint="--kind",
         )
+
+
+# --- Rule amount bounds (migration 0009) ------------------------------------
+
+# Same sanity ceiling as goals; a rule bound past a billion dollars is a typo.
+RULE_AMOUNT_MAX = GOAL_AMOUNT_MAX
+
+
+def validate_rule_amount_bounds(min_amount: Decimal | None, max_amount: Decimal | None) -> None:
+    """Optional refinement bounds on a rule; compared against abs(amount).
+
+    Each bound, when present: finite, > 0, <= RULE_AMOUNT_MAX, no
+    sub-cent precision. When both present: min strictly below max — the
+    view matches the half-open interval [min, max), so equal bounds
+    would match nothing. None = unbounded on that side.
+
+    Raises :class:`RulePatternError` with the offending flag as
+    ``param_hint``.
+    """
+    for value, hint in ((min_amount, "--min-amount"), (max_amount, "--max-amount")):
+        if value is None:
+            continue
+        if not value.is_finite():
+            raise RulePatternError(
+                f"amount bound must be a finite number, got {value}", param_hint=hint
+            )
+        if value <= 0:
+            raise RulePatternError(f"amount bound must be positive, got {value}", param_hint=hint)
+        if value > RULE_AMOUNT_MAX:
+            raise RulePatternError(
+                f"amount bound is implausibly large (>{RULE_AMOUNT_MAX}): {value}",
+                param_hint=hint,
+            )
+        exponent = value.as_tuple().exponent
+        if isinstance(exponent, int) and exponent < -2:
+            raise RulePatternError(f"amount bound has sub-cent precision: {value}", param_hint=hint)
+    if min_amount is not None and max_amount is not None and min_amount >= max_amount:
+        raise RulePatternError(
+            f"min_amount must be strictly below max_amount (the bounds form a "
+            f"half-open interval [min, max)), got {min_amount} >= {max_amount}",
+            param_hint="--min-amount",
+        )
+
+
+def format_rule_bounds(min_amount: Decimal | None, max_amount: Decimal | None) -> str:
+    """Compact ASCII description of a rule's amount bounds; '' when unbounded.
+
+    Lives here (stdlib-only, shared) so the CLI echoes and the MCP tool
+    messages can't drift — the goals ``describe_*`` precedent. ASCII only:
+    CLI output must survive cp1252 consoles.
+    """
+    if min_amount is not None and max_amount is not None:
+        return f"${min_amount:,.2f} <= |amount| < ${max_amount:,.2f}"
+    if min_amount is not None:
+        return f"|amount| >= ${min_amount:,.2f}"
+    if max_amount is not None:
+        return f"|amount| < ${max_amount:,.2f}"
+    return ""

@@ -137,6 +137,71 @@ def test_add_category_rule_normalizes_match_type_case(store: DuckDBStore) -> Non
     assert result["ok"] is True
 
 
+def test_add_category_rule_with_bounds_retroactive(store: DuckDBStore) -> None:
+    """A bounded rule added through the MCP path splits existing
+    transactions by amount: the in-bounds one resolves, the out-of-bounds
+    one stays Uncategorized."""
+    store.upsert_accounts(
+        [
+            Account(
+                id="cur-acc",
+                org_name="Test",
+                name="Checking",
+                balance=Decimal("100.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.CHECKING,
+            )
+        ]
+    )
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="cur-snack",
+                account_id="cur-acc",
+                posted=datetime(2026, 5, 5, tzinfo=UTC),
+                amount=Decimal("-12.75"),
+                description="ZZZ-SPEEDY #1",
+            ),
+            Transaction(
+                id="cur-fill",
+                account_id="cur-acc",
+                posted=datetime(2026, 5, 6, tzinfo=UTC),
+                amount=Decimal("-45.00"),
+                description="ZZZ-SPEEDY #2",
+            ),
+        ]
+    )
+    result = add_category_rule(store, "Dining", "contains", "ZZZ-SPEEDY", max_amount=Decimal("20"))
+    assert result["ok"] is True
+    assert "|amount| < $20.00" in result["message"]
+    rows = {r["id"]: r["category"] for r in store.get_transactions_with_category()}
+    assert rows["cur-snack"] == "Dining"
+    assert rows["cur-fill"] == "Uncategorized"
+
+
+def test_add_category_rule_rejects_inverted_bounds(store: DuckDBStore) -> None:
+    before = store.conn.execute("SELECT COUNT(*) FROM category_rules").fetchone()
+    result = add_category_rule(
+        store,
+        "Dining",
+        "contains",
+        "ZZZ-X",
+        min_amount=Decimal("30"),
+        max_amount=Decimal("20"),
+    )
+    assert result["ok"] is False
+    assert "validation failed" in result["error"]
+    assert "strictly below" in result["error"]
+    after = store.conn.execute("SELECT COUNT(*) FROM category_rules").fetchone()
+    assert before is not None and after is not None and before[0] == after[0]
+
+
+def test_add_category_rule_rejects_nonpositive_bound(store: DuckDBStore) -> None:
+    result = add_category_rule(store, "Dining", "contains", "ZZZ-X", min_amount=Decimal("0"))
+    assert result["ok"] is False
+    assert "positive" in result["error"]
+
+
 # --- remove_category_rule ------------------------------------------------------
 
 

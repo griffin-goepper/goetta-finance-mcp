@@ -1427,3 +1427,165 @@ def test_query_sql_normalizes_tz_aware_datetime_params(store: DuckDBStore) -> No
         [datetime(2026, 5, 31, 23, 59, 59, 999999, tzinfo=UTC)],
     )
     assert rows[0]["n"] == 1
+
+
+# --- Rule amount bounds (migration 0009) -------------------------------------
+
+
+def test_migration_0009_applied(store: DuckDBStore) -> None:
+    """Pin the migration filename + the two new nullable columns."""
+    rows = store.conn.execute("SELECT name FROM schema_migrations").fetchall()
+    assert ("0009_rule_amount_bounds.sql",) in rows
+    # Columns exist and are selectable.
+    store.conn.execute("SELECT min_amount, max_amount FROM category_rules LIMIT 0")
+
+
+def test_migration_0009_existing_rules_unbounded(store: DuckDBStore) -> None:
+    """No-behavior-change contract: every pre-existing rule has NULL bounds
+    and keeps matching at any magnitude, tiny or huge."""
+    bounded = store.conn.execute(
+        "SELECT COUNT(*) FROM category_rules WHERE min_amount IS NOT NULL OR max_amount IS NOT NULL"
+    ).fetchone()
+    assert bounded is not None and bounded[0] == 0
+    _seed_cat_account(store)
+    store.upsert_transactions(
+        [
+            _txn("t-9-tiny", "STARBUCKS STORE #1", amount="-1.00"),
+            _txn("t-9-huge", "STARBUCKS STORE #2", amount="-99999.00"),
+        ]
+    )
+    rows = {r["id"]: r["category"] for r in store.get_transactions_with_category()}
+    assert rows["t-9-tiny"] == "Dining"
+    assert rows["t-9-huge"] == "Dining"
+
+
+def test_add_rule_persists_amount_bounds(store: DuckDBStore) -> None:
+    rule_id = store.add_rule(
+        "Dining",
+        match_type="contains",
+        pattern="ZZZ-BOUNDED",
+        priority=10,
+        min_amount=Decimal("10.00"),
+        max_amount=Decimal("20.00"),
+    )
+    row = store.conn.execute(
+        "SELECT min_amount, max_amount FROM category_rules WHERE id = ?", [rule_id]
+    ).fetchone()
+    assert row is not None
+    assert row[0] == Decimal("10.00")
+    assert row[1] == Decimal("20.00")
+
+
+def test_view_amount_max_bound_is_exclusive(store: DuckDBStore) -> None:
+    """Half-open contract, upper edge: abs(amount) < max_amount."""
+    _seed_cat_account(store)
+    store.add_rule(
+        "Dining",
+        match_type="contains",
+        pattern="ZZZ-SPEEDY",
+        priority=10,
+        max_amount=Decimal("20.00"),
+    )
+    store.upsert_transactions(
+        [
+            _txn("t-under", "ZZZ-SPEEDY #1", amount="-19.99"),
+            _txn("t-at", "ZZZ-SPEEDY #2", amount="-20.00"),
+        ]
+    )
+    rows = {r["id"]: r["category"] for r in store.get_transactions_with_category()}
+    assert rows["t-under"] == "Dining"
+    assert rows["t-at"] == "Uncategorized"
+
+
+def test_view_amount_min_bound_is_inclusive(store: DuckDBStore) -> None:
+    """Half-open contract, lower edge: abs(amount) >= min_amount."""
+    _seed_cat_account(store)
+    store.add_rule(
+        "Gas",
+        match_type="contains",
+        pattern="ZZZ-SPEEDY",
+        priority=10,
+        min_amount=Decimal("20.00"),
+    )
+    store.upsert_transactions(
+        [
+            _txn("t-at", "ZZZ-SPEEDY #1", amount="-20.00"),
+            _txn("t-below", "ZZZ-SPEEDY #2", amount="-19.99"),
+        ]
+    )
+    rows = {r["id"]: r["category"] for r in store.get_transactions_with_category()}
+    assert rows["t-at"] == "Gas"
+    assert rows["t-below"] == "Uncategorized"
+
+
+def test_view_amount_bounds_use_abs_amount(store: DuckDBStore) -> None:
+    """Sign-agnostic: a +12.00 refund matches a max-20 rule so it nets
+    against the same category as the purchase it reverses."""
+    _seed_cat_account(store)
+    store.add_rule(
+        "Dining",
+        match_type="contains",
+        pattern="ZZZ-SPEEDY",
+        priority=10,
+        max_amount=Decimal("20.00"),
+    )
+    store.upsert_transactions([_txn("t-refund", "ZZZ-SPEEDY REFUND", amount="12.00")])
+    rows = {r["id"]: r["category"] for r in store.get_transactions_with_category()}
+    assert rows["t-refund"] == "Dining"
+
+
+def test_view_complementary_bounds_no_gap_no_overlap(store: DuckDBStore) -> None:
+    """The Speedway story: same pattern split at $20 by two rules —
+    under goes one way, exactly-20 and over go the other. No gap, no
+    overlap at the threshold."""
+    _seed_cat_account(store)
+    store.add_rule(
+        "Dining",
+        match_type="contains",
+        pattern="ZZZ-SPEEDY",
+        priority=10,
+        max_amount=Decimal("20.00"),
+    )
+    store.upsert_transactions(
+        [
+            _txn("t-snack", "ZZZ-SPEEDY #1", amount="-12.75"),
+            _txn("t-edge", "ZZZ-SPEEDY #2", amount="-20.00"),
+            _txn("t-fill", "ZZZ-SPEEDY #3", amount="-45.00"),
+        ]
+    )
+    store.add_rule(
+        "Gas",
+        match_type="contains",
+        pattern="ZZZ-SPEEDY",
+        priority=10,
+        min_amount=Decimal("20.00"),
+    )
+    rows = {r["id"]: r["category"] for r in store.get_transactions_with_category()}
+    assert rows["t-snack"] == "Dining"
+    assert rows["t-edge"] == "Gas"
+    assert rows["t-fill"] == "Gas"
+
+
+def test_view_bounded_rule_respects_priority(store: DuckDBStore) -> None:
+    """Bounds compose with the existing priority ordering: an in-bounds
+    bounded rule at priority 5 beats an unbounded rule at 100; out of
+    bounds, the bounded rule simply doesn't match and the unbounded
+    rule catches the transaction."""
+    _seed_cat_account(store)
+    store.add_rule(
+        "Dining",
+        match_type="contains",
+        pattern="ZZZ-SPEEDY",
+        priority=5,
+        max_amount=Decimal("20.00"),
+    )
+    store.add_rule("Gas", match_type="contains", pattern="ZZZ-SPEEDY", priority=100)
+    store.upsert_transactions(
+        [
+            _txn("t-in", "ZZZ-SPEEDY #1", amount="-12.75"),
+            _txn("t-out", "ZZZ-SPEEDY #2", amount="-45.00"),
+        ]
+    )
+    rows = {r["id"]: r["category"] for r in store.get_transactions_with_category()}
+    assert rows["t-in"] == "Dining"
+    assert rows["t-out"] == "Gas"

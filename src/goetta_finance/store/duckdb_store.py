@@ -798,6 +798,8 @@ class DuckDBStore:
         match_type: str,
         pattern: str,
         priority: int = 100,
+        min_amount: Decimal | None = None,
+        max_amount: Decimal | None = None,
     ) -> int:
         """Insert a categorization rule. Returns the new rule's id.
 
@@ -805,7 +807,10 @@ class DuckDBStore:
         by the table's CHECK constraint). ``pattern`` is stored as-is;
         the CLI layer is expected to have run the timeout-bounded
         ``re.compile`` validation before calling — this method does NOT
-        re-validate. See CLAUDE.md for the security rationale.
+        re-validate. See CLAUDE.md for the security rationale. The
+        optional amount bounds (compared against abs(amount) by the
+        view, half-open [min, max)) are likewise expected pre-validated
+        by ``validators.validate_rule_amount_bounds``.
         """
         if match_type not in ("contains", "regex"):
             raise StoreError(f"match_type must be 'contains' or 'regex', got {match_type!r}")
@@ -819,11 +824,19 @@ class DuckDBStore:
                 row = self.conn.execute(
                     """
                     INSERT INTO category_rules
-                        (category_id, match_type, pattern, priority, is_default)
-                    VALUES (?, ?, ?, ?, FALSE)
+                        (category_id, match_type, pattern, priority, is_default,
+                         min_amount, max_amount)
+                    VALUES (?, ?, ?, ?, FALSE, ?, ?)
                     RETURNING id
                     """,
-                    [int(cat_row[0]), match_type, pattern, int(priority)],
+                    [
+                        int(cat_row[0]),
+                        match_type,
+                        pattern,
+                        int(priority),
+                        min_amount,
+                        max_amount,
+                    ],
                 ).fetchone()
             except duckdb.Error as exc:
                 raise StoreError(f"add_rule failed: {exc}") from exc

@@ -15,13 +15,16 @@ both surfaces to be gated identically.
 from __future__ import annotations
 
 import difflib
+from decimal import Decimal
 from typing import Any
 
 from goetta_finance.errors import StoreError
 from goetta_finance.store import FinanceStore
 from goetta_finance.validators import (
     RulePatternError,
+    format_rule_bounds,
     parse_match_type,
+    validate_rule_amount_bounds,
     validate_rule_pattern,
 )
 
@@ -72,32 +75,45 @@ def add_category_rule(
     match_type: str,
     pattern: str,
     priority: int = 100,
+    min_amount: Decimal | None = None,
+    max_amount: Decimal | None = None,
 ) -> dict[str, Any]:
     """Add a categorization rule. Retroactive — applies to all existing
-    transactions through the read-time view."""
+    transactions through the read-time view. Optional amount bounds
+    refine the pattern match by abs(amount), half-open [min, max)."""
     try:
         normalized_match = parse_match_type(match_type)
         validate_rule_pattern(pattern, normalized_match)
+        validate_rule_amount_bounds(min_amount, max_amount)
     except RulePatternError as exc:
-        return {"ok": False, "error": f"pattern validation failed: {exc}"}
+        return {"ok": False, "error": f"rule validation failed: {exc}"}
     try:
         rule_id = store.add_rule(
             category_name,
             match_type=normalized_match,
             pattern=pattern,
             priority=priority,
+            min_amount=min_amount,
+            max_amount=max_amount,
         )
     except StoreError as exc:
         message = str(exc)
         if "category not found" in message.lower():
             message += _suggest_category(store, category_name)
         return {"ok": False, "error": message}
+    bounds = format_rule_bounds(min_amount, max_amount)
+    bounds_clause = (
+        f" Amount bounds: {bounds} (compared against the absolute amount, "
+        "so refunds match too; the max bound is exclusive)."
+        if bounds
+        else ""
+    )
     return {
         "ok": True,
         "rule_id": rule_id,
         "message": f"Added rule {rule_id}: {category_name} {normalized_match} "
         f"{pattern!r} (priority {priority}). Applies retroactively to every "
-        "matching transaction.",
+        f"matching transaction.{bounds_clause}",
     }
 
 

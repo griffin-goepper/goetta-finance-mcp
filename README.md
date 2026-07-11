@@ -135,7 +135,7 @@ Both contribute `-500` and `-22500` respectively to net worth — collapsing the
 Every transaction resolves to a category at *read time* through a SQL view (`transactions_with_category`). Three layers, outermost wins:
 
 1. **Manual override** — a row in `transaction_overrides` for that transaction id.
-2. **Rule match** — the lowest-priority rule in `category_rules` whose pattern matches the transaction's description.
+2. **Rule match** — the lowest-priority rule in `category_rules` whose pattern matches the transaction's description *and* whose optional amount bounds (compared against the absolute amount; min inclusive, max exclusive) are satisfied.
 3. **`Uncategorized`** — the fallback when nothing else matches.
 
 Read-time resolution is the feature, not an optimization: adding or editing a rule applies retroactively to every existing transaction with zero data migration. A `category_id` column on `transactions` would silently break that.
@@ -152,6 +152,12 @@ goetta-finance category default-rules        # the is_default=TRUE rule set
 # Add a rule. Pattern matches case-insensitively against transaction description.
 goetta-finance category set-rule Dining --match contains --pattern 'CHIPOTLE'
 goetta-finance category set-rule Dining --match regex --pattern '(?i)venmo.*lunch'
+
+# Amount bounds refine a pattern match by abs(amount) — dual-use merchants
+# split cleanly (small gas-station buys are snacks, big ones are fuel).
+# min is inclusive, max exclusive: no gap or overlap at exactly $20.
+goetta-finance category set-rule Vice --pattern 'SPEEDWAY' --max-amount 20
+goetta-finance category set-rule Gas  --pattern 'SPEEDWAY' --min-amount 20
 
 # Remove a rule. Defaults require --force AND a typed-pattern confirmation;
 # user-added rules just need the id.
@@ -370,7 +376,7 @@ The MCP server exposes fifteen tools:
 - **`spending_by_category`** — categorized spending totals between two dates. Non-spending categories (Transfers, Income) excluded by default; opt in via `include_non_spending=True`.
 - **`top_uncategorized_patterns`** — the curation entry point: the largest spending patterns sitting in Uncategorized, normalized via your `prefixes.txt`
 - **`categorize_transaction`** / **`uncategorize_transaction`** — per-transaction override and its undo
-- **`add_category_rule`** — add a rule from conversation; retroactive, validator-gated (same ReDoS checks as the CLI)
+- **`add_category_rule`** — add a rule from conversation; retroactive, validator-gated (same ReDoS checks as the CLI). Optional `min_amount`/`max_amount` refine matches by absolute amount (min inclusive, max exclusive).
 - **`remove_category_rule`** — delete a user rule by id, equally retroactive. Default (seeded) rules are refused — those need the CLI's typed-confirmation `remove-rule --force`.
 - **`list_goals`** — every goal with progress, status, and pace computed fresh (spending caps use the same math as `spending_by_category`)
 - **`set_goal`** / **`remove_goal`** — create and delete goals from conversation; validator-gated identically to the CLI

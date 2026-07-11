@@ -85,6 +85,8 @@ class FinanceStore(Protocol):
         match_type: str,
         pattern: str,
         priority: int = 100,
+        min_amount: Decimal | None = None,
+        max_amount: Decimal | None = None,
     ) -> int: ...
 
     def remove_rule(self, rule_id: int, *, force: bool = False) -> None: ...

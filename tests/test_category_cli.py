@@ -374,6 +374,115 @@ def test_category_set_rule_case_insensitive(fresh_home: Path) -> None:
     assert _rule_count(fresh_home) == before + 1
 
 
+# --- category set-rule amount bounds (migration 0009) ------------------------
+
+
+def _rule_bounds(home: Path, rule_id: int) -> tuple[Decimal | None, Decimal | None]:
+    store = DuckDBStore(home / "data.duckdb")
+    try:
+        row = store.conn.execute(
+            "SELECT min_amount, max_amount FROM category_rules WHERE id = ?", [rule_id]
+        ).fetchone()
+        assert row is not None
+        return (
+            row[0] if isinstance(row[0], Decimal) else None,
+            row[1] if isinstance(row[1], Decimal) else None,
+        )
+    finally:
+        store.close()
+
+
+def test_category_set_rule_with_amount_bounds(fresh_home: Path) -> None:
+    before = _rule_count(fresh_home)
+    result = runner.invoke(
+        app,
+        [
+            "category",
+            "set-rule",
+            "Dining",
+            "--pattern",
+            "ZZZ-SPEEDY",
+            "--max-amount",
+            "20",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Added rule" in result.output
+    assert "|amount| < $20.00" in result.output
+    assert _rule_count(fresh_home) == before + 1
+    # The bound round-trips as an exact Decimal.
+    rule_id = int(result.output.split("Added rule ")[1].split(":")[0])
+    assert _rule_bounds(fresh_home, rule_id) == (None, Decimal("20.00"))
+
+
+def test_category_set_rule_rejects_non_numeric_bound(fresh_home: Path) -> None:
+    """Bad bound fails at _parse_decimal, before the store is opened."""
+    before = _rule_count(fresh_home)
+    result = runner.invoke(
+        app,
+        ["category", "set-rule", "Dining", "--pattern", "ZZZ-X", "--max-amount", "abc"],
+    )
+    assert result.exit_code != 0
+    assert _rule_count(fresh_home) == before
+
+
+def test_category_set_rule_rejects_inverted_bounds(fresh_home: Path) -> None:
+    before = _rule_count(fresh_home)
+    result = runner.invoke(
+        app,
+        [
+            "category",
+            "set-rule",
+            "Dining",
+            "--pattern",
+            "ZZZ-X",
+            "--min-amount",
+            "30",
+            "--max-amount",
+            "20",
+        ],
+    )
+    assert result.exit_code != 0
+    assert _rule_count(fresh_home) == before
+
+
+def test_category_set_rule_rejects_subcent_bound(fresh_home: Path) -> None:
+    before = _rule_count(fresh_home)
+    result = runner.invoke(
+        app,
+        [
+            "category",
+            "set-rule",
+            "Dining",
+            "--pattern",
+            "ZZZ-X",
+            "--max-amount",
+            "19.999",
+        ],
+    )
+    assert result.exit_code != 0
+    assert _rule_count(fresh_home) == before
+
+
+def test_category_remove_rule_echo_includes_bounds(fresh_home: Path) -> None:
+    """The remove confirmation names the bounds so the user can tell
+    complementary same-pattern rules apart."""
+    store = DuckDBStore(fresh_home / "data.duckdb")
+    try:
+        rule_id = store.add_rule(
+            "Dining",
+            match_type="contains",
+            pattern="ZZZ-BOUNDED",
+            priority=10,
+            max_amount=Decimal("20.00"),
+        )
+    finally:
+        store.close()
+    result = runner.invoke(app, ["category", "remove-rule", str(rule_id)])
+    assert result.exit_code == 0, result.output
+    assert "|amount| < $20.00" in result.output
+
+
 # --- category remove-rule ---------------------------------------------------
 
 

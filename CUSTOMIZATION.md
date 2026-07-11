@@ -15,6 +15,13 @@ goetta-finance category list                 # everything, with txn + rule count
 goetta-finance category set-rule Utilities --match contains --pattern "Dukeenergy"
 goetta-finance category set-rule Transfers --match regex --pattern "^contribution$" --priority 5
 
+# Amount bounds: refine a pattern by abs(amount), so dual-use merchants split.
+# Small Speedway purchases are snacks; $20+ is fuel. min is inclusive, max
+# exclusive — the two rules below have no gap or overlap at exactly $20.
+# Bounds never match on their own; the pattern is always required.
+goetta-finance category set-rule Vice --pattern "SPEEDWAY" --max-amount 20
+goetta-finance category set-rule Gas  --pattern "SPEEDWAY" --min-amount 20
+
 # Remove one (defaults need --force + typed-pattern confirmation)
 goetta-finance category remove-rule <rule_id>
 ```
