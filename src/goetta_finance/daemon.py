@@ -41,6 +41,7 @@ from goetta_finance.store import FinanceStore
 # process" is the only recovery. The FinanceStore protocol stays
 # backend-agnostic.
 from goetta_finance.store.duckdb_store import is_database_invalidated
+from goetta_finance.transfers import apply_transfer_links
 from goetta_finance.web.app import build_app
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,16 @@ def _run_collect_blocking(
         if result is None:
             logger.info("scheduled sync skipped — another sync in flight")
             return
+        # Roll linked manual balances forward BEFORE evaluating goals so
+        # balance goals see the fresh numbers. INFO because it's routine
+        # bookkeeping; lines carry account names and amounts only, never
+        # transaction text. Failures must not make a successful sync
+        # look failed.
+        try:
+            for line in apply_transfer_links(store):
+                logger.info("transfer roll-forward: %s", line)
+        except GoettaFinanceError:
+            logger.exception("transfer roll-forward after scheduled sync failed")
         # Post-sync goal breach summary. WARNING because a breached
         # threshold is the one thing the user asked to be told about;
         # messages carry goal/category/account names and amounts only,

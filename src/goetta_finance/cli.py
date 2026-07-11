@@ -47,6 +47,12 @@ from goetta_finance.models import Account, AccountType, BalanceSnapshot
 from goetta_finance.server import build_server
 from goetta_finance.simplefin import SimpleFinClient
 from goetta_finance.store.duckdb_store import DuckDBStore
+from goetta_finance.transfers import (
+    apply_transfer_links,
+    describe_link,
+    describe_suggestion,
+    transfer_link_suggestions,
+)
 from goetta_finance.validators import (
     GoalValidationError,
     RulePatternError,
@@ -110,14 +116,27 @@ def sync() -> None:
         store = DuckDBStore(db_path(config))
         store.init()
         breach_lines: list[str] = []
+        rollforward_lines: list[str] = []
+        hint_lines: list[str] = []
         try:
             client = SimpleFinClient(config.access_url)
             run = collect(store, client)
+            # Roll linked manual balances forward BEFORE evaluating goals
+            # so balance goals see the fresh numbers. Neither step may
+            # make a successful sync look failed — log and move on.
+            try:
+                rollforward_lines = apply_transfer_links(store)
+                hint_lines = [
+                    f"{describe_suggestion(s)}\n         {s.suggested_command}"
+                    for s in transfer_link_suggestions(store)
+                ]
+            except GoettaFinanceError as exc:
+                logging.getLogger(__name__).warning(
+                    "transfer roll-forward after sync failed: %s", exc
+                )
             try:
                 breach_lines = goal_breach_warnings(store)
             except GoettaFinanceError as exc:
-                # A goal-math failure must never make a successful sync
-                # look failed — log it and move on.
                 logging.getLogger(__name__).warning("goal evaluation after sync failed: %s", exc)
         finally:
             store.close()
@@ -128,6 +147,10 @@ def sync() -> None:
         )
         for warning in run.warnings:
             typer.secho(f"  warning: {warning}", fg=typer.colors.YELLOW)
+        for line in rollforward_lines:
+            typer.echo(f"  transfer: {line}")
+        for line in hint_lines:
+            typer.secho(f"  hint: {line}", fg=typer.colors.YELLOW)
         for line in breach_lines:
             typer.secho(f"  goal: {line}", fg=typer.colors.YELLOW)
     except GoettaFinanceError as exc:
@@ -1016,8 +1039,122 @@ def account_set_balance(
             f"Updated {account_id}: {balance_value:.2f} {existing.currency} as of "
             f"{balance_date.astimezone().isoformat(timespec='seconds')}"
         )
+        # A true-up on a linked account re-anchors its links: the new
+        # balance speaks for everything posted at or before --as-of, and
+        # matched transfers posted after it re-apply against the new
+        # base immediately (so the echoed final balance is honest).
+        if store.reset_transfer_link_anchors(account_id, balance_date):
+            for line in apply_transfer_links(store):
+                typer.echo(f"  transfer: {line}")
     except GoettaFinanceError as exc:
         typer.secho(f"account set-balance failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+@account_app.command("link")
+def account_link(
+    account_id: Annotated[
+        str, typer.Argument(help="Manual account id (MANUAL-<uuid>) to roll forward.")
+    ],
+    source_account_id: Annotated[
+        str,
+        typer.Option(
+            "--from",
+            help="Synced account id (ACT-...) whose transactions fund the manual account.",
+        ),
+    ],
+    pattern: Annotated[
+        str,
+        typer.Option("--pattern", help="Pattern matched against transaction payee/description."),
+    ],
+    match: Annotated[
+        str, typer.Option("--match", help="Match type: 'contains' or 'regex'.")
+    ] = "contains",
+) -> None:
+    """Link a manual account to matching transfers on a synced account.
+
+    From then on, every sync rolls the manual balance forward by the
+    matched transactions (a debit out of the source credits the manual
+    account; money moving back debits it). Transactions posted at or
+    before the account's current balance date are assumed to already be
+    in the balance; linking immediately applies everything newer.
+    ``account set-balance`` keeps working as the occasional true-up —
+    interest and anything the pattern misses.
+    """
+    match_type = _parse_match_type(match)
+    _validate_rule_pattern(pattern, match_type)
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"account link failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        link = store.add_transfer_link(
+            account_id, source_account_id, match_type=match_type, pattern=pattern
+        )
+        typer.echo(f"Linked: {describe_link(link)}")
+        applied = apply_transfer_links(store)
+        for line in applied:
+            typer.echo(f"  transfer: {line}")
+        if not applied:
+            typer.echo("  nothing to roll forward yet — new matches apply on each sync.")
+    except GoettaFinanceError as exc:
+        typer.secho(f"account link failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+@account_app.command("links")
+def account_links() -> None:
+    """List transfer links, plus detected candidates for linkless accounts."""
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"account links failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        links = store.list_transfer_links()
+        if links:
+            typer.echo("Transfer links:")
+            for link in links:
+                typer.echo(f"  {describe_link(link)}")
+        else:
+            typer.echo("No transfer links yet.")
+        suggestions = transfer_link_suggestions(store)
+        if suggestions:
+            typer.echo("Detected candidates (create with the command shown):")
+            for suggestion in suggestions:
+                typer.echo(f"  {describe_suggestion(suggestion)}")
+                typer.echo(f"    {suggestion.suggested_command}")
+    except GoettaFinanceError as exc:
+        typer.secho(f"account links failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+@account_app.command("unlink")
+def account_unlink(
+    link_id: Annotated[int, typer.Argument(help="Transfer link id (see `account links`).")],
+) -> None:
+    """Remove a transfer link.
+
+    Already-applied transfers stay applied — the balance keeps them, and
+    the application ledger ensures a later re-link can't double-count.
+    """
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"account unlink failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        store.remove_transfer_link(link_id)
+        typer.echo(f"Removed transfer link {link_id}.")
+    except GoettaFinanceError as exc:
+        typer.secho(f"account unlink failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
     finally:
         store.close()

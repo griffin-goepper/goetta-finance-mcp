@@ -72,6 +72,7 @@ Re-running `init` is safe — each step detects existing state and offers to ski
 | `goetta-finance web` | Start the local web dashboard. `--port 8765` and `--host 127.0.0.1` by default. |
 | `goetta-finance daemon` | Long-lived process: dashboard + MCP HTTP endpoint + daily scheduled sync, from one process. See "Daemon mode" below. |
 | `goetta-finance account add\|list\|set-balance\|set-liability\|remove` | Manage manual accounts and liability flags. See "Manual accounts and liabilities" below. |
+| `goetta-finance account link\|links\|unlink` | Roll a manual account's balance forward from matching transfers on a synced account. See "Linked transfers" below. |
 | `goetta-finance category list\|add\|set-rule\|remove-rule\|default-rules` | Manage categories and the rules that map descriptions to them. See "Transaction categorization" below. |
 | `goetta-finance transaction categorize\|uncategorize` | Manual per-transaction category overrides. See "Transaction categorization" below. |
 | `goetta-finance goal add-spending\|add-balance\|list\|remove` | Spending caps and balance targets, evaluated at read time. See "Goals" below. |
@@ -124,11 +125,38 @@ Both contribute `-500` and `-22500` respectively to net worth — collapsing the
 
 `is_liability` is independent of `type` on purpose — `type` describes what kind of account it is (`loan`, `credit`, `investment`), while `is_liability` controls how net-worth math treats it. A margin account is `type=investment` but functionally a liability; you can flip the flag without changing the type.
 
+### Linked transfers
+
+Manual balances go stale the moment money actually moves — but the contributions are usually already in your data, as the transfer legs on a synced checking account. A **transfer link** connects the two so the manual balance rolls forward automatically:
+
+```bash
+# See what looks linkable. Candidates are detected when a synced account's
+# transactions carry a payee exactly matching a manual account's name —
+# each comes with the ready-made link command.
+goetta-finance account links
+
+# Link it: from then on, matching transactions on the synced account roll
+# the manual balance forward on every sync (and immediately at link time).
+goetta-finance account link MANUAL-<uuid> --from ACT-<simplefin-id> \
+  --pattern "Apple Savings" [--match contains|regex]
+
+# Remove a link by id. Already-applied transfers stay in the balance.
+goetta-finance account unlink <id>
+```
+
+How it behaves:
+
+- **A debit out of the source credits the manual account** (and money moving back debits it). The pattern is matched against the transaction's payee *and* description; pending transactions wait until they settle.
+- **Everything posted at or before the account's balance date is assumed to already be in that balance** — linking never double-counts history, and an applications ledger guarantees each transaction applies at most once ever, across re-syncs and re-links.
+- **`set-balance` stays the true-up.** Transfer sums can't see interest, so update the balance from a real statement occasionally: the true-up re-anchors the link at its `--as-of` date and re-applies anything posted after it against your fresh number.
+- **Every consumer updates for free.** The roll-forward writes a genuine balance + snapshot through the same path as `set-balance`, so net worth, the over-time chart, balance goals, and the goal pace math all follow without special cases.
+- **Liability accounts can't be linked yet** — a manual loan's stored sign is ambiguous (everything reads it through `ABS()`), so paydown tracking still goes through `set-balance` true-ups.
+
 ### Heads-up
 
 - **Retroactive flag.** Toggling `is_liability` re-treats all historical `balance_snapshots` for that account under the new value in net-worth-over-time charts. This is almost always what you want; if it isn't, flip the flag back.
 - **CC-credit edge case.** A credit card with `is_liability=true` and a *positive* balance (you overpaid and now have a credit) computes as `-balance` instead of `+balance`. Rare; `set-liability false` while the credit exists, then re-enable, is the workaround.
-- **Balance is authoritative.** Payments to a manual loan don't auto-decrement the balance — re-run `set-balance` from your servicer's monthly statement.
+- **Balance is authoritative.** Payments to a manual loan don't auto-decrement the balance — re-run `set-balance` from your servicer's monthly statement. For asset accounts fed by visible transfers, a linked transfer (above) automates exactly that.
 
 ## Transaction categorization
 
@@ -370,7 +398,7 @@ Once registered, restart your Claude client and try things like:
 - *"Is the data current?"* → `sync_status` reports last sync + freshness
 - *"Am I on track with my dining budget?"* → `list_goals` reports progress, pace, and status per goal
 
-The MCP server exposes fifteen tools:
+The MCP server exposes eighteen tools:
 
 - **`list_accounts`** — all accounts with current balances (hidden accounts excluded by default)
 - **`get_transactions`** — filter by account, date range, category, text search; up to 1000 rows. Every row carries a resolved `category` field.
@@ -382,6 +410,8 @@ The MCP server exposes fifteen tools:
 - **`remove_category_rule`** — delete a user rule by id, equally retroactive. Default (seeded) rules are refused — those need the CLI's typed-confirmation `remove-rule --force`.
 - **`list_goals`** — every goal with progress, status, and pace computed fresh (spending caps use the same math as `spending_by_category`)
 - **`set_goal`** / **`remove_goal`** — create and delete goals from conversation; validator-gated identically to the CLI
+- **`list_transfer_links`** — manual-account roll-forward links plus detected candidates (payee matching a linkless manual account's name), each with a ready-made link command
+- **`link_account_transfers`** / **`unlink_account_transfers`** — create and delete transfer links from conversation; pattern-validated identically to the CLI, applies eligible transfers immediately
 - **`sql_query`** — read-only SQL against the local DuckDB store (see security notes below). Prefer `transactions_with_category` over the bare `transactions` table when you want category info.
 - **`sync_status`** — report when the SimpleFIN data was last synced and whether it's stale
 - **`sync_now`** — trigger a fresh pull from SimpleFIN

@@ -13,6 +13,7 @@ from goetta_finance.models import (
     SyncResult,
     SyncRun,
     Transaction,
+    TransferLink,
 )
 
 
@@ -114,3 +115,27 @@ class FinanceStore(Protocol):
     def list_goals(self) -> list[Goal]: ...
 
     def remove_goal(self, goal_id: int) -> None: ...
+
+    # Transfer links (migration 0012). Roll-forward application is NOT a
+    # store concern — transfers.py orchestrates it through these plus
+    # upsert_accounts/record_balance_snapshot (the set-balance write path).
+    def add_transfer_link(
+        self,
+        account_id: str,
+        source_account_id: str,
+        *,
+        match_type: str,
+        pattern: str,
+    ) -> TransferLink: ...
+
+    def list_transfer_links(self, *, account_id: str | None = None) -> list[TransferLink]: ...
+
+    def remove_transfer_link(self, link_id: int) -> None: ...
+
+    def reset_transfer_link_anchors(self, account_id: str, anchor: datetime) -> int: ...
+
+    def eligible_transfer_transactions(self, link: TransferLink) -> list[Transaction]: ...
+
+    def record_transfer_applications(
+        self, account_id: str, link_id: int, txns: list[Transaction]
+    ) -> None: ...

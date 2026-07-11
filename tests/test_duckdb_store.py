@@ -1701,3 +1701,133 @@ def test_sync_reupsert_of_overridden_transaction_succeeds(store: DuckDBStore) ->
     row = rows["t-override-sync"]
     assert row["category"] == "Dining"  # override survived both upserts
     assert row["amount"] == Decimal("-17.01")
+
+
+# --- Transfer links (migration 0012) --------------------------------------------
+
+
+def test_migration_0012_applied(store: DuckDBStore) -> None:
+    """Pin the migration filename + both new tables' column shapes."""
+    rows = store.conn.execute("SELECT name FROM schema_migrations").fetchall()
+    assert ("0012_transfer_links.sql",) in rows
+    store.conn.execute(
+        "SELECT id, account_id, source_account_id, match_type, pattern, anchor, created_at "
+        "FROM transfer_links LIMIT 0"
+    )
+    store.conn.execute(
+        "SELECT transaction_id, account_id, link_id, amount, posted, applied_at "
+        "FROM transfer_link_applications LIMIT 0"
+    )
+
+
+def test_migration_0012_no_fk_onto_transactions(store: DuckDBStore) -> None:
+    """The 0011 lesson, pinned forward: the applications ledger must not
+    FK the frequently re-upserted transactions table, or every sync that
+    re-pulls an applied transaction throws ConstraintException."""
+    constraints = {
+        row[0]
+        for row in store.conn.execute(
+            "SELECT constraint_type FROM duckdb_constraints() "
+            "WHERE table_name = 'transfer_link_applications'"
+        ).fetchall()
+    }
+    assert "FOREIGN KEY" not in constraints
+
+
+def test_add_transfer_link_round_trip(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account(id="ACT-chk"), _manual_account(id="MANUAL-sav")])
+    link = store.add_transfer_link(
+        "MANUAL-sav", "ACT-chk", match_type="contains", pattern="Apple Savings"
+    )
+    assert link.account_name == "Apple Savings"
+    assert link.source_account_name == "Checking 1234"
+    # Anchored at the destination's balance_date: that balance already
+    # speaks for everything posted at or before it.
+    assert link.anchor == _utc(2026, 5, 17)
+    assert store.list_transfer_links() == [link]
+    assert store.list_transfer_links(account_id="MANUAL-sav") == [link]
+    assert store.list_transfer_links(account_id="ACT-chk") == []
+
+
+def test_add_transfer_link_refusals(store: DuckDBStore) -> None:
+    store.upsert_accounts(
+        [
+            _account(id="ACT-chk"),
+            _manual_account(id="MANUAL-sav"),
+            _manual_account(id="MANUAL-loan").model_copy(update={"is_liability": True}),
+            _manual_account(id="MANUAL-eur").model_copy(update={"currency": "EUR"}),
+        ]
+    )
+    with pytest.raises(StoreError, match="account not found"):
+        store.add_transfer_link("MANUAL-nope", "ACT-chk", match_type="contains", pattern="x")
+    with pytest.raises(StoreError, match="manual accounts only"):
+        store.add_transfer_link("ACT-chk", "ACT-chk", match_type="contains", pattern="x")
+    with pytest.raises(StoreError, match="liability"):
+        store.add_transfer_link("MANUAL-loan", "ACT-chk", match_type="contains", pattern="x")
+    with pytest.raises(StoreError, match="account not found"):
+        store.add_transfer_link("MANUAL-sav", "ACT-nope", match_type="contains", pattern="x")
+    with pytest.raises(StoreError, match="must be a synced account"):
+        store.add_transfer_link("MANUAL-sav", "MANUAL-loan", match_type="contains", pattern="x")
+    with pytest.raises(StoreError, match="currency mismatch"):
+        store.add_transfer_link("MANUAL-eur", "ACT-chk", match_type="contains", pattern="x")
+    with pytest.raises(StoreError, match="match_type"):
+        store.add_transfer_link("MANUAL-sav", "ACT-chk", match_type="glob", pattern="x")
+    assert store.list_transfer_links() == []
+
+
+def test_remove_transfer_link(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account(id="ACT-chk"), _manual_account(id="MANUAL-sav")])
+    link = store.add_transfer_link("MANUAL-sav", "ACT-chk", match_type="contains", pattern="x")
+    store.remove_transfer_link(link.id)
+    assert store.list_transfer_links() == []
+    with pytest.raises(StoreError, match="transfer link not found"):
+        store.remove_transfer_link(link.id)
+
+
+def test_delete_account_refuses_linked_account_then_cleans_ledger(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account(id="ACT-chk"), _manual_account(id="MANUAL-sav")])
+    link = store.add_transfer_link(
+        "MANUAL-sav", "ACT-chk", match_type="contains", pattern="Apple Savings"
+    )
+    txn = Transaction(
+        id="t-link-del",
+        account_id="ACT-chk",
+        posted=_utc(2026, 6, 12),
+        amount=Decimal("-500.00"),
+        description="Web Authorized Pmt Apple Gs Savings",
+        payee="Apple Savings",
+    )
+    store.upsert_transactions([txn])
+    store.record_transfer_applications("MANUAL-sav", link.id, [txn])
+
+    with pytest.raises(StoreError, match=r"transfer link\(s\) referencing it"):
+        store.delete_account("MANUAL-sav")
+    assert any(a.id == "MANUAL-sav" for a in store.get_accounts())
+
+    store.remove_transfer_link(link.id)
+    store.delete_account("MANUAL-sav")
+    remaining = store.conn.execute(
+        "SELECT COUNT(*) FROM transfer_link_applications WHERE account_id = 'MANUAL-sav'"
+    ).fetchone()
+    assert remaining is not None and remaining[0] == 0
+
+
+def test_sync_reupsert_of_linked_accounts_succeeds(store: DuckDBStore) -> None:
+    """0011-class pin for the transfer_links->accounts FKs: every sync
+    re-upserts accounts with ON CONFLICT DO UPDATE, and the roll-forward
+    itself re-upserts the linked manual account. Both parents of a
+    transfer_links row must tolerate that (the goals->accounts FK is the
+    established precedent; this pins it for the new table)."""
+    checking = _account(id="ACT-chk")
+    savings = _manual_account(id="MANUAL-sav")
+    store.upsert_accounts([checking, savings])
+    store.add_transfer_link("MANUAL-sav", "ACT-chk", match_type="contains", pattern="x")
+
+    # Unchanged re-upsert (sync re-pull) + changed re-upserts on both sides.
+    store.upsert_accounts([checking])
+    store.upsert_accounts([checking.model_copy(update={"balance": Decimal("42.00")})])
+    store.upsert_accounts([savings.model_copy(update={"balance": Decimal("31000.00")})])
+
+    balances = {a.id: a.balance for a in store.get_accounts()}
+    assert balances["ACT-chk"] == Decimal("42.00")
+    assert balances["MANUAL-sav"] == Decimal("31000.00")

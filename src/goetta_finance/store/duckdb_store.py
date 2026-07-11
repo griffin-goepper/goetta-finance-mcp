@@ -28,6 +28,7 @@ from goetta_finance.models import (
     SyncResult,
     SyncRun,
     Transaction,
+    TransferLink,
 )
 
 # Intentionally excludes ``explain``. ``EXPLAIN ANALYZE`` *executes* its
@@ -446,6 +447,21 @@ class DuckDBStore:
                     "first with `goetta-finance goal remove <id>` "
                     "(see `goetta-finance goal list`)"
                 )
+            # Transfer links are user-authored config too — same refusal
+            # shape as goals. Only account_id can reference a manual
+            # account (link creation refuses manual sources), but check
+            # both columns so a future relaxation fails loudly here.
+            link_row = self.conn.execute(
+                "SELECT COUNT(*) FROM transfer_links WHERE account_id = ? OR source_account_id = ?",
+                [account_id, account_id],
+            ).fetchone()
+            link_count = int(link_row[0]) if link_row else 0
+            if link_count > 0:
+                raise StoreError(
+                    f"account has {link_count} transfer link(s) referencing it; remove "
+                    "them first with `goetta-finance account unlink <id>` "
+                    "(see `goetta-finance account links`)"
+                )
             # DuckDB enforces FK constraints per-statement, so wrapping
             # both deletes in BEGIN/COMMIT raises FK violation on the
             # accounts DELETE even though the snapshots DELETE precedes
@@ -463,6 +479,13 @@ class DuckDBStore:
                         "DELETE FROM balance_snapshots WHERE account_id = ?",
                         [account_id],
                     )
+                # Application-ledger rows are derived bookkeeping (unlike
+                # links/goals, which are user config) — clean them up
+                # without ceremony. They can exist after an unlink.
+                self.conn.execute(
+                    "DELETE FROM transfer_link_applications WHERE account_id = ?",
+                    [account_id],
+                )
                 self.conn.execute("DELETE FROM accounts WHERE id = ?", [account_id])
             except duckdb.Error as exc:
                 raise StoreError(f"delete_account failed: {exc}") from exc
@@ -1065,6 +1088,231 @@ class DuckDBStore:
             account_name=row[8],
             direction=GoalDirection(row[9]) if row[9] is not None else None,
             target_date=row[10],
+            created_at=created_at,
+        )
+
+    def add_transfer_link(
+        self,
+        account_id: str,
+        source_account_id: str,
+        *,
+        match_type: str,
+        pattern: str,
+    ) -> TransferLink:
+        """Insert a transfer link (migration 0012). Returns the stored link.
+
+        Shape checks with friendly errors: the destination must be a
+        manual, non-liability account (liability roll-forward is refused
+        in v1 — the stored sign of a manual liability balance is
+        unspecified, everything reads it through abs(), so a signed
+        delta is ambiguous); the source must be a non-manual account;
+        both must share a currency (summing transfers across currencies
+        would corrupt the balance). ``pattern`` is stored as-is; the
+        surface layer runs ``validators.validate_rule_pattern`` first,
+        same contract as ``add_rule``.
+
+        The anchor starts at the destination's ``balance_date``: that
+        balance is trusted to include everything posted at or before it.
+        """
+        if match_type not in ("contains", "regex"):
+            raise StoreError(f"match_type must be 'contains' or 'regex', got {match_type!r}")
+        with self._lock:
+            dest_row = self.conn.execute(
+                "SELECT is_manual, is_liability, currency, balance_date FROM accounts WHERE id = ?",
+                [account_id],
+            ).fetchone()
+            if dest_row is None:
+                raise StoreError(f"account not found: {account_id}")
+            if not dest_row[0]:
+                raise StoreError(
+                    f"transfer links roll forward manual accounts only; {account_id} is synced "
+                    "(its balance already updates on every sync)"
+                )
+            if dest_row[1]:
+                raise StoreError(
+                    f"transfer links are not supported on liability accounts yet; track "
+                    f"paydown on {account_id} with `account set-balance` true-ups"
+                )
+            source_row = self.conn.execute(
+                "SELECT is_manual, currency FROM accounts WHERE id = ?",
+                [source_account_id],
+            ).fetchone()
+            if source_row is None:
+                raise StoreError(f"account not found: {source_account_id}")
+            if source_row[0]:
+                raise StoreError(
+                    f"the source of a transfer link must be a synced account; "
+                    f"{source_account_id} is manual and has no transaction feed"
+                )
+            if dest_row[2] != source_row[1]:
+                raise StoreError(
+                    f"currency mismatch: {account_id} is {dest_row[2]} but "
+                    f"{source_account_id} is {source_row[1]}"
+                )
+            try:
+                row = self.conn.execute(
+                    """
+                    INSERT INTO transfer_links
+                        (account_id, source_account_id, match_type, pattern, anchor)
+                    VALUES (?, ?, ?, ?, ?)
+                    RETURNING id
+                    """,
+                    [account_id, source_account_id, match_type, pattern, dest_row[3]],
+                ).fetchone()
+            except duckdb.Error as exc:
+                raise StoreError(f"add_transfer_link failed: {exc}") from exc
+        if row is None:
+            raise StoreError("add_transfer_link did not return a row")
+        links = self.list_transfer_links(account_id=account_id)
+        for link in links:
+            if link.id == int(row[0]):
+                return link
+        raise StoreError("add_transfer_link could not read back the inserted row")
+
+    def list_transfer_links(self, *, account_id: str | None = None) -> list[TransferLink]:
+        """All transfer links with display names resolved, ordered by id."""
+        where = "WHERE l.account_id = ?" if account_id is not None else ""
+        params = [account_id] if account_id is not None else []
+        with self._lock:
+            # ruff S608 / bandit B608: ``where`` is one of two hard-coded
+            # strings; the value binds via ``params``. Audited 2026-07.
+            rows = self.conn.execute(
+                f"""
+                SELECT l.id, l.account_id, d.name, l.source_account_id, s.name,
+                       l.match_type, l.pattern, l.anchor, l.created_at
+                FROM transfer_links l
+                LEFT JOIN accounts d ON d.id = l.account_id
+                LEFT JOIN accounts s ON s.id = l.source_account_id
+                {where}
+                ORDER BY l.id
+                """,  # noqa: S608  # nosec B608
+                params,
+            ).fetchall()
+        return [self._row_to_transfer_link(row) for row in rows]
+
+    def remove_transfer_link(self, link_id: int) -> None:
+        """Remove a transfer link. The applications ledger is kept on
+        purpose: already-applied transactions stay applied (the balance
+        reflects them), and a later re-link must not double-count them."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM transfer_links WHERE id = ?", [int(link_id)]
+            ).fetchone()
+            if row is None:
+                raise StoreError(f"transfer link not found: {link_id}")
+            self.conn.execute("DELETE FROM transfer_links WHERE id = ?", [int(link_id)])
+
+    def reset_transfer_link_anchors(self, account_id: str, anchor: datetime) -> int:
+        """Re-anchor an account's links after a manual true-up.
+
+        A ``set-balance`` declares the balance as of its ``--as-of``
+        moment, absorbing every transfer posted at or before it — so the
+        anchors move there, and ledger rows for transactions posted
+        *after* it are released to re-apply against the new base (the
+        backdated-true-up case). Returns the number of links touched.
+        """
+        naive = _to_naive_utc(anchor)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id FROM transfer_links WHERE account_id = ?", [account_id]
+            ).fetchall()
+            if not rows:
+                return 0
+            self.conn.execute(
+                "UPDATE transfer_links SET anchor = ? WHERE account_id = ?",
+                [naive, account_id],
+            )
+            self.conn.execute(
+                "DELETE FROM transfer_link_applications WHERE account_id = ? AND posted > ?",
+                [account_id, naive],
+            )
+            return len(rows)
+
+    def eligible_transfer_transactions(self, link: TransferLink) -> list[Transaction]:
+        """Matched source transactions not yet applied to the link's account.
+
+        Eligible = on the source account, settled (pending transactions
+        wait — their ids and posted times are not stable), posted
+        strictly after the anchor, pattern-matched against payee OR
+        description, and absent from the applications ledger. Ordered by
+        posted so the roll-forward advances chronologically.
+        """
+        if link.match_type == "contains":
+            match_clause = (
+                "(lower(t.description) LIKE '%' || lower(?) || '%' "
+                "OR lower(COALESCE(t.payee, '')) LIKE '%' || lower(?) || '%')"
+            )
+        else:
+            match_clause = (
+                "(regexp_matches(t.description, ?) OR regexp_matches(COALESCE(t.payee, ''), ?))"
+            )
+        with self._lock:
+            # ruff S608 / bandit B608: ``match_clause`` is one of two
+            # hard-coded strings; the pattern binds via parameters.
+            # Audited 2026-07.
+            rows = self.conn.execute(
+                f"""
+                SELECT t.id, t.account_id, t.posted, t.transacted_at, t.amount,
+                       t.description, t.payee, t.memo, t.pending, t.extra
+                FROM transactions t
+                WHERE t.account_id = ?
+                  AND t.pending = FALSE
+                  AND t.posted > ?
+                  AND {match_clause}
+                  AND NOT EXISTS (
+                      SELECT 1 FROM transfer_link_applications a
+                      WHERE a.transaction_id = t.id AND a.account_id = ?
+                  )
+                ORDER BY t.posted
+                """,  # noqa: S608  # nosec B608
+                [
+                    link.source_account_id,
+                    _to_naive_utc(link.anchor),
+                    link.pattern,
+                    link.pattern,
+                    link.account_id,
+                ],
+            ).fetchall()
+        return [self._row_to_transaction(row) for row in rows]
+
+    def record_transfer_applications(
+        self, account_id: str, link_id: int, txns: list[Transaction]
+    ) -> None:
+        """Ledger the transactions just applied to a manual account.
+
+        ``ON CONFLICT DO NOTHING`` keeps a concurrent double-apply
+        harmless at the ledger level; the caller applies the balance
+        delta under the collect lock so the balances can't race.
+        """
+        if not txns:
+            return
+        rows = [(t.id, account_id, int(link_id), -t.amount, _to_naive_utc(t.posted)) for t in txns]
+        with self._lock:
+            self.conn.executemany(
+                """
+                INSERT INTO transfer_link_applications
+                    (transaction_id, account_id, link_id, amount, posted)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (transaction_id, account_id) DO NOTHING
+                """,
+                rows,
+            )
+
+    @staticmethod
+    def _row_to_transfer_link(row: tuple[Any, ...]) -> TransferLink:
+        anchor = _from_naive_utc(row[7])
+        created_at = _from_naive_utc(row[8])
+        if anchor is None or created_at is None:  # pragma: no cover - NOT NULL columns
+            raise StoreError("transfer link row is missing anchor or created_at")
+        return TransferLink(
+            id=int(row[0]),
+            account_id=row[1],
+            account_name=row[2],
+            source_account_id=row[3],
+            source_account_name=row[4],
+            match_type=row[5],
+            pattern=row[6],
+            anchor=anchor,
             created_at=created_at,
         )
 

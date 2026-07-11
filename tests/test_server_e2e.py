@@ -79,6 +79,9 @@ async def test_server_lists_expected_tools(store: DuckDBStore) -> None:
             "list_goals",
             "set_goal",
             "remove_goal",
+            "list_transfer_links",
+            "link_account_transfers",
+            "unlink_account_transfers",
         }
 
 
@@ -400,6 +403,8 @@ def test_schema_hint_mentions_categorization_tables() -> None:
         "target_date",
         "min_amount",
         "max_amount",
+        "transfer_links",
+        "transfer_link_applications",
     ):
         assert marker in SQL_SCHEMA_HINT, f"SQL_SCHEMA_HINT missing {marker!r}"
 
@@ -430,6 +435,9 @@ def test_schema_hint_communicates_categorization_semantics() -> None:
         "amount owed",  # liability abs rule
         "absolute value",  # amount bounds compare against abs(amount) (0009)
         "exclusive",  # max bound is exclusive — half-open interval (0009)
+        "rolls FORWARD",  # transfer links are write-time bookkeeping (0012)
+        "link_account_transfers",  # link write path (NOT sql_query)
+        "true-up",  # set-balance stays authoritative; captures interest
     ]
     for phrase in expected_phrases:
         assert phrase in SQL_SCHEMA_HINT, (
