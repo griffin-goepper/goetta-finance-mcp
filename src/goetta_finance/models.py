@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any
@@ -66,6 +66,85 @@ class Category(BaseModel):
     display_color: str | None = None
     is_default: bool = False
     is_spending: bool = True
+
+
+class GoalKind(StrEnum):
+    SPENDING_CAP = "spending_cap"
+    BALANCE = "balance"
+
+
+class GoalPeriod(StrEnum):
+    MONTH = "month"
+    YEAR = "year"
+
+
+class GoalDirection(StrEnum):
+    AT_LEAST = "at_least"
+    AT_MOST = "at_most"
+
+
+class GoalStatus(StrEnum):
+    """Computed goal state, never persisted.
+
+    Spending caps use ON_TRACK | AT_RISK | OVER. Balance goals use
+    MET | ON_TRACK | AT_RISK, plus OVER for a breached at_most goal
+    (owing more than the ceiling). An unmet at_least goal is not a
+    failure state -- it's ON_TRACK or AT_RISK depending on pace.
+    """
+
+    ON_TRACK = "on_track"
+    AT_RISK = "at_risk"
+    OVER = "over"
+    MET = "met"
+
+
+class Goal(BaseModel):
+    """A user-defined threshold (migration 0008). Progress is computed
+    at read time by ``goals.py`` -- this model carries only the
+    definition. ``category_name``/``account_name`` are display
+    denormalizations resolved by ``list_goals``'s JOIN."""
+
+    model_config = ConfigDict(frozen=False, extra="forbid")
+
+    id: int
+    name: str
+    kind: GoalKind
+    amount: Decimal
+    # spending_cap
+    category_id: int | None = None
+    category_name: str | None = None
+    period: GoalPeriod | None = None
+    # balance
+    account_id: str | None = None
+    account_name: str | None = None
+    direction: GoalDirection | None = None
+    target_date: date | None = None
+    created_at: datetime
+
+
+class GoalProgress(BaseModel):
+    """Snapshot of a read-time goal evaluation (like SyncResult, frozen).
+
+    ``percent`` may be negative (refunds exceeding spending) or over
+    100 (cap breached / target passed). Spending-cap fields are None on
+    balance goals and vice versa.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    goal: Goal
+    status: GoalStatus
+    current: Decimal
+    target: Decimal
+    percent: Decimal
+    # spending caps only
+    period_start: datetime | None = None
+    period_end: datetime | None = None
+    period_elapsed_percent: Decimal | None = None
+    # balance goals only
+    monthly_delta: Decimal | None = None
+    required_monthly: Decimal | None = None
+    projected_date: date | None = None
 
 
 class SyncRun(BaseModel):

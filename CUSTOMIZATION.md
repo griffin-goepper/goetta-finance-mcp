@@ -56,6 +56,19 @@ goetta-finance account add --currency EUR ...     # manual accounts in any ISO 4
 
 All three flags survive syncs — SimpleFIN can't overwrite them. `account list` shows hidden accounts with a `[hidden]` tag so you can find them to unhide.
 
+## Goals
+
+Pure user-state (nothing is seeded): spending caps per category/period and balance targets per account, evaluated at read time.
+
+```bash
+goetta-finance goal add-spending Groceries --limit 400 --period month
+goetta-finance goal add-balance <account-id> --target 10000 --direction at_least --by 2027-06-01
+goetta-finance goal list
+goetta-finance goal remove <id>
+```
+
+Goals live in the `goals` table in `data.duckdb` and travel with the database. Deleting an account that a goal references is refused until you remove the goal.
+
 ## Dashboard colors
 
 Category badge colors come from each category's `display_color` (set at `category add --color`, or update via `sql_query`-visible `categories.display_color`). Page-level styling lives in `src/goetta_finance/web/static/styles.css` — the badge/table/nav classes are plain CSS, no build step.
@@ -73,4 +86,4 @@ Aggregate labels (net worth, chart axes) derive from your accounts automatically
 └── data.duckdb        # all data: accounts, transactions, categories, rules, overrides
 ```
 
-Override the directory with `GOETTA_FINANCE_HOME`. Back up by copying the directory; everything is in those three files. Your rules, categories, overrides, and account flags are rows in `data.duckdb` — they travel with the database.
+Override the directory with `GOETTA_FINANCE_HOME`. Back up by copying the directory; everything is in those three files. Your rules, categories, overrides, account flags, and goals are rows in `data.duckdb` — they travel with the database.

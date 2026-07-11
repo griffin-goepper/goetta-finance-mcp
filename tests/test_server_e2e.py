@@ -75,6 +75,9 @@ async def test_server_lists_expected_tools(store: DuckDBStore) -> None:
             "uncategorize_transaction",
             "add_category_rule",
             "top_uncategorized_patterns",
+            "list_goals",
+            "set_goal",
+            "remove_goal",
         }
 
 
@@ -202,6 +205,121 @@ async def test_server_curation_tools_e2e(store: DuckDBStore) -> None:
 
 
 @pytest.mark.anyio
+async def test_server_goal_tools_e2e(store: DuckDBStore) -> None:
+    """Full MCP round-trip for the goals surface: create a cap and a
+    balance goal → list with computed progress → remove → gone."""
+    store.upsert_accounts(
+        [
+            Account(
+                id="goal-e2e",
+                org_name="Test",
+                name="Savings",
+                balance=Decimal("6500.00"),
+                balance_date=datetime.now(tz=UTC),
+                type=AccountType.SAVINGS,
+            )
+        ]
+    )
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="goal-e2e-t1",
+                account_id="goal-e2e",
+                posted=datetime.now(tz=UTC),
+                amount=Decimal("-450.00"),
+                description="GOAL E2E SPEND",
+            )
+        ]
+    )
+    store.set_transaction_override("goal-e2e-t1", "Dining")
+    mcp = build_server(store)
+    async with create_connected_server_and_client_session(mcp) as session:
+        await session.initialize()
+
+        result = await session.call_tool(
+            "set_goal",
+            {
+                "name": "Dining cap",
+                "kind": "spending_cap",
+                "amount": 400.00,
+                "category": "dining",  # case-insensitive
+                "period": "month",
+            },
+        )
+        payload = _decode(result)
+        assert payload["ok"] is True, payload
+        cap_id = payload["goal_id"]
+
+        result = await session.call_tool(
+            "set_goal",
+            {
+                "name": "Emergency fund",
+                "kind": "balance",
+                "amount": 10000,
+                "account_id": "goal-e2e",
+                "direction": "at_least",
+                "target_date": "2999-01-01",
+            },
+        )
+        assert _decode(result)["ok"] is True
+
+        result = await session.call_tool("list_goals", {})
+        goals = _decode(result)
+        assert isinstance(goals, list)
+        by_name = {g["name"]: g for g in goals}
+        cap = by_name["Dining cap"]
+        assert cap["status"] == "over"
+        assert cap["current"] == "450.00"
+        assert cap["target"] == "400.00"
+        assert isinstance(cap["percent"], str)
+        assert cap["period_start"].endswith("00:00:00+00:00")
+        fund = by_name["Emergency fund"]
+        assert fund["status"] == "on_track"
+        assert fund["current"] == "6500.00"
+        assert fund["direction"] == "at_least"
+        assert fund["target_date"] == "2999-01-01"
+
+        # Money fields are strings, never JSON numbers.
+        assert all(isinstance(g["amount"], str) for g in goals)
+
+        result = await session.call_tool("remove_goal", {"goal_id": cap_id})
+        assert _decode(result)["ok"] is True
+        result = await session.call_tool("list_goals", {})
+        assert [g["name"] for g in _decode(result)] == ["Emergency fund"]
+
+
+@pytest.mark.anyio
+async def test_server_set_goal_rejects_bad_shape_e2e(store: DuckDBStore) -> None:
+    """The MCP write surface refuses cross-field shape violations —
+    same validator as the CLI, through the real FastMCP path."""
+    mcp = build_server(store)
+    async with create_connected_server_and_client_session(mcp) as session:
+        await session.initialize()
+        result = await session.call_tool(
+            "set_goal",
+            {"name": "shapeless", "kind": "spending_cap", "amount": 100},
+        )
+        payload = _decode(result)
+        assert payload["ok"] is False
+        assert "validation failed" in payload["error"]
+
+        result = await session.call_tool(
+            "set_goal",
+            {
+                "name": "typo cap",
+                "kind": "spending_cap",
+                "amount": 100,
+                "category": "Gorceries",
+                "period": "month",
+            },
+        )
+        payload = _decode(result)
+        assert payload["ok"] is False
+        assert "category not found" in payload["error"]
+        assert "Did you mean" in payload["error"]
+
+
+@pytest.mark.anyio
 async def test_server_add_category_rule_rejects_redos_e2e(store: DuckDBStore) -> None:
     """The MCP write surface refuses ReDoS patterns — same validator as
     the CLI, exercised through the real FastMCP parameter path."""
@@ -232,6 +350,8 @@ def test_schema_hint_mentions_categorization_tables() -> None:
         "transaction_overrides",
         "transactions_with_category",
         "account_is_hidden",
+        "goals",
+        "target_date",
     ):
         assert marker in SQL_SCHEMA_HINT, f"SQL_SCHEMA_HINT missing {marker!r}"
 
@@ -255,6 +375,10 @@ def test_schema_hint_communicates_categorization_semantics() -> None:
         "top_uncategorized_patterns",  # curation discovery entry point
         "add_category_rule",  # curation write path (NOT sql_query)
         "categorize_transaction",  # one-off override path
+        "list_goals",  # goal read path carries computed status/pace
+        "set_goal",  # goal write path (NOT sql_query)
+        "at_most",  # balance-goal direction semantics
+        "amount owed",  # liability abs rule
     ]
     for phrase in expected_phrases:
         assert phrase in SQL_SCHEMA_HINT, (

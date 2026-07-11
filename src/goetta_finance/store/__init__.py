@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Protocol
 
 from goetta_finance.models import (
     Account,
     BalanceSnapshot,
     Category,
+    Goal,
     SyncResult,
     SyncRun,
     Transaction,
@@ -90,3 +92,23 @@ class FinanceStore(Protocol):
     def set_transaction_override(self, transaction_id: str, category_name: str) -> None: ...
 
     def clear_transaction_override(self, transaction_id: str) -> None: ...
+
+    # Goals (migration 0008). Progress/status is NOT a store concern —
+    # it's computed read-time by goals.py from these definitions plus
+    # the existing read methods.
+    def add_goal(
+        self,
+        name: str,
+        *,
+        kind: str,
+        amount: Decimal,
+        category_name: str | None = None,
+        period: str | None = None,
+        account_id: str | None = None,
+        direction: str | None = None,
+        target_date: date | None = None,
+    ) -> Goal: ...
+
+    def list_goals(self) -> list[Goal]: ...
+
+    def remove_goal(self, goal_id: int) -> None: ...

@@ -6,7 +6,7 @@ import os
 import re
 import threading
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from importlib.resources import files
 from pathlib import Path
@@ -20,6 +20,10 @@ from goetta_finance.models import (
     AccountType,
     BalanceSnapshot,
     Category,
+    Goal,
+    GoalDirection,
+    GoalKind,
+    GoalPeriod,
     SyncResult,
     SyncRun,
     Transaction,
@@ -115,6 +119,26 @@ def _from_naive_utc(dt: datetime | None) -> datetime | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC)
+
+
+def _normalize_query_param(value: Any) -> Any:
+    """Bind tz-aware datetimes as naive UTC, matching on-disk storage.
+
+    A tz-aware datetime param binds as TIMESTAMP WITH TIME ZONE, and
+    DuckDB resolves a TIMESTAMP-vs-TIMESTAMPTZ comparison by casting
+    the naive *column* through the session (local) time zone — which
+    silently shifts every date-window comparison by the machine's UTC
+    offset. Measured: a row stored at naive 2026-05-31T23:59:59.999999
+    compared ``<=`` tz-aware 2026-05-31T23:59:59.999999+00:00 returns
+    FALSE on an America/New_York machine (the column casts to
+    2026-06-01T03:59:59Z). Normalizing at the bind boundary keeps
+    query windows identical on every machine and matches the
+    ``_to_naive_utc`` convention the typed read methods use.
+    ``date`` values are not datetimes and pass through untouched.
+    """
+    if isinstance(value, datetime):
+        return _to_naive_utc(value)
+    return value
 
 
 def _json_or_none(value: dict[str, Any]) -> str | None:
@@ -370,6 +394,19 @@ class DuckDBStore:
                 raise StoreError(
                     f"account has {snapshot_count} balance snapshots; "
                     "pass cascade_snapshots=True to remove them"
+                )
+            # Goals are user-authored config — never silently cascade
+            # them away with the account (the 0007 lesson). Refuse with
+            # the fix spelled out.
+            goal_row = self.conn.execute(
+                "SELECT COUNT(*) FROM goals WHERE account_id = ?", [account_id]
+            ).fetchone()
+            goal_count = int(goal_row[0]) if goal_row else 0
+            if goal_count > 0:
+                raise StoreError(
+                    f"account has {goal_count} goal(s) referencing it; remove them "
+                    "first with `goetta-finance goal remove <id>` "
+                    "(see `goetta-finance goal list`)"
                 )
             # DuckDB enforces FK constraints per-statement, so wrapping
             # both deletes in BEGIN/COMMIT raises FK violation on the
@@ -842,6 +879,144 @@ class DuckDBStore:
                 [transaction_id],
             )
 
+    def add_goal(
+        self,
+        name: str,
+        *,
+        kind: str,
+        amount: Decimal,
+        category_name: str | None = None,
+        period: str | None = None,
+        account_id: str | None = None,
+        direction: str | None = None,
+        target_date: date | None = None,
+    ) -> Goal:
+        """Insert a goal (migration 0008). Returns the stored Goal.
+
+        Re-checks the per-kind column shape with friendly errors before
+        the table CHECK constraint gets a chance to produce raw SQL
+        text. Category lookup is case-insensitive; the "category not
+        found: X" message shape is load-bearing (the CLI and MCP
+        did-you-mean helpers key off it).
+        """
+        name = name.strip()
+        if not name:
+            raise StoreError("goal name cannot be empty")
+        if kind == "spending_cap":
+            if category_name is None or period is None:
+                raise StoreError("spending_cap goals require a category and a period")
+            if account_id is not None or direction is not None or target_date is not None:
+                raise StoreError(
+                    "spending_cap goals do not take account_id, direction, or target_date"
+                )
+        elif kind == "balance":
+            if account_id is None or direction is None:
+                raise StoreError("balance goals require an account_id and a direction")
+            if category_name is not None or period is not None:
+                raise StoreError("balance goals do not take a category or period")
+        else:
+            raise StoreError(f"kind must be 'spending_cap' or 'balance', got {kind!r}")
+        with self._lock:
+            dup_row = self.conn.execute(
+                "SELECT 1 FROM goals WHERE lower(name) = lower(?)", [name]
+            ).fetchone()
+            if dup_row is not None:
+                raise StoreError(f"goal already exists: {name}")
+            category_id: int | None = None
+            resolved_category: str | None = None
+            if category_name is not None:
+                cat_row = self.conn.execute(
+                    "SELECT id, name FROM categories WHERE lower(name) = lower(?)",
+                    [category_name],
+                ).fetchone()
+                if cat_row is None:
+                    raise StoreError(f"category not found: {category_name}")
+                category_id = int(cat_row[0])
+                resolved_category = cat_row[1]
+            resolved_account: str | None = None
+            if account_id is not None:
+                acct_row = self.conn.execute(
+                    "SELECT name FROM accounts WHERE id = ?", [account_id]
+                ).fetchone()
+                if acct_row is None:
+                    raise StoreError(f"account not found: {account_id}")
+                resolved_account = acct_row[0]
+            try:
+                row = self.conn.execute(
+                    """
+                    INSERT INTO goals
+                        (name, kind, amount, category_id, period,
+                         account_id, direction, target_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    RETURNING id, created_at
+                    """,
+                    [name, kind, amount, category_id, period, account_id, direction, target_date],
+                ).fetchone()
+            except duckdb.Error as exc:
+                raise StoreError(f"add_goal failed: {exc}") from exc
+        if row is None:
+            raise StoreError("add_goal did not return a row")
+        created_at = _from_naive_utc(row[1])
+        if created_at is None:  # pragma: no cover - NOT NULL column
+            raise StoreError("add_goal returned no created_at")
+        return Goal(
+            id=int(row[0]),
+            name=name,
+            kind=GoalKind(kind),
+            amount=amount,
+            category_id=category_id,
+            category_name=resolved_category,
+            period=GoalPeriod(period) if period is not None else None,
+            account_id=account_id,
+            account_name=resolved_account,
+            direction=GoalDirection(direction) if direction is not None else None,
+            target_date=target_date,
+            created_at=created_at,
+        )
+
+    def list_goals(self) -> list[Goal]:
+        """All goals with display names resolved, ordered by name."""
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT g.id, g.name, g.kind, g.amount, g.category_id, c.name,
+                       g.period, g.account_id, a.name, g.direction,
+                       g.target_date, g.created_at
+                FROM goals g
+                LEFT JOIN categories c ON c.id = g.category_id
+                LEFT JOIN accounts a ON a.id = g.account_id
+                ORDER BY g.name
+                """
+            ).fetchall()
+        return [self._row_to_goal(row) for row in rows]
+
+    def remove_goal(self, goal_id: int) -> None:
+        with self._lock:
+            row = self.conn.execute("SELECT 1 FROM goals WHERE id = ?", [int(goal_id)]).fetchone()
+            if row is None:
+                raise StoreError(f"goal not found: {goal_id}")
+            self.conn.execute("DELETE FROM goals WHERE id = ?", [int(goal_id)])
+
+    @staticmethod
+    def _row_to_goal(row: tuple[Any, ...]) -> Goal:
+        created_at = _from_naive_utc(row[11])
+        if created_at is None:  # pragma: no cover - NOT NULL column
+            raise StoreError("goal row has no created_at")
+        return Goal(
+            id=int(row[0]),
+            name=row[1],
+            kind=GoalKind(row[2]),
+            amount=row[3],
+            category_id=int(row[4]) if row[4] is not None else None,
+            category_name=row[5],
+            period=GoalPeriod(row[6]) if row[6] is not None else None,
+            account_id=row[7],
+            account_name=row[8],
+            direction=GoalDirection(row[9]) if row[9] is not None else None,
+            target_date=row[10],
+            created_at=created_at,
+        )
+
     def query_sql(self, sql: str, params: Sequence[Any] | None = None) -> list[dict[str, Any]]:
         """Run a single read-only SQL statement and return rows as dicts.
 
@@ -907,7 +1082,9 @@ class DuckDBStore:
                     if params is None:
                         cur = conn.execute(statements[0])
                     else:
-                        cur = conn.execute(statements[0], list(params))
+                        cur = conn.execute(
+                            statements[0], [_normalize_query_param(p) for p in params]
+                        )
                 except duckdb.Error as exc:
                     raise StoreError(f"query_sql rejected by read-only transaction: {exc}") from exc
                 columns = [d[0] for d in cur.description] if cur.description else []
