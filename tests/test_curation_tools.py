@@ -1,5 +1,6 @@
 """Tests for the MCP curation surface: categorize_transaction,
-uncategorize_transaction, add_category_rule, top_uncategorized_patterns.
+uncategorize_transaction, add_category_rule, remove_category_rule,
+top_uncategorized_patterns.
 
 Outcome-pinning: every test asserts on what the view returns (or what
 rows exist) after the call, not on internal mechanics. The ReDoS tests
@@ -20,6 +21,7 @@ from goetta_finance.store.duckdb_store import DuckDBStore
 from goetta_finance.tools.categorize import (
     add_category_rule,
     categorize_transaction,
+    remove_category_rule,
     uncategorize_transaction,
 )
 from goetta_finance.tools.uncategorized import top_uncategorized_patterns
@@ -133,6 +135,55 @@ def test_add_category_rule_unknown_category_suggests(store: DuckDBStore) -> None
 def test_add_category_rule_normalizes_match_type_case(store: DuckDBStore) -> None:
     result = add_category_rule(store, "Dining", "CONTAINS", "ZZZ-CASE-TEST")
     assert result["ok"] is True
+
+
+# --- remove_category_rule ------------------------------------------------------
+
+
+def test_remove_category_rule_round_trip_retroactive(store: DuckDBStore) -> None:
+    """Removing a rule un-categorizes its matches on the next read — the
+    read-time-resolution contract, exercised through the MCP write path."""
+    _seed_one(store, desc="DUKEENERGY PAYMENT")
+    added = add_category_rule(store, "Utilities", "contains", "Dukeenergy")
+    assert store.get_transactions_with_category()[0]["category"] == "Utilities"
+    result = remove_category_rule(store, added["rule_id"])
+    assert result["ok"] is True
+    assert store.get_transactions_with_category()[0]["category"] == "Uncategorized"
+
+
+def test_remove_category_rule_falls_back_to_remaining_rule(store: DuckDBStore) -> None:
+    """When two rules match, removing the winner (lower priority number)
+    re-resolves through the survivor rather than to Uncategorized."""
+    _seed_one(store, desc="WALGREENS #123")
+    winner = add_category_rule(store, "Healthcare", "contains", "WALGREENS", priority=15)
+    add_category_rule(store, "Shopping", "contains", "WALGREENS", priority=20)
+    assert store.get_transactions_with_category()[0]["category"] == "Healthcare"
+    result = remove_category_rule(store, winner["rule_id"])
+    assert result["ok"] is True
+    assert store.get_transactions_with_category()[0]["category"] == "Shopping"
+
+
+def test_remove_category_rule_refuses_default(store: DuckDBStore) -> None:
+    """Defaults are CLI-only (typed --force confirmation); the MCP surface
+    has no force parameter by design — prompt-injection threat model."""
+    default_row = store.conn.execute(
+        "SELECT id FROM category_rules WHERE is_default = TRUE LIMIT 1"
+    ).fetchone()
+    assert default_row is not None
+    rule_id = int(default_row[0])
+    result = remove_category_rule(store, rule_id)
+    assert result["ok"] is False
+    assert "--force" in result["error"]  # points the user at the CLI path
+    still = store.conn.execute(
+        "SELECT COUNT(*) FROM category_rules WHERE id = ?", [rule_id]
+    ).fetchone()
+    assert still is not None and still[0] == 1
+
+
+def test_remove_category_rule_unknown_id(store: DuckDBStore) -> None:
+    result = remove_category_rule(store, 999999)
+    assert result["ok"] is False
+    assert "not found" in result["error"].lower()
 
 
 # --- top_uncategorized_patterns ----------------------------------------------

@@ -19,7 +19,7 @@ goetta-finance category set-rule Transfers --match regex --pattern "^contributio
 goetta-finance category remove-rule <rule_id>
 ```
 
-Or skip the CLI entirely: ask Claude *"what's still uncategorized?"* — the `top_uncategorized_patterns` MCP tool surfaces the biggest gaps, and `add_category_rule` / `categorize_transaction` apply your decisions from the conversation.
+Or skip the CLI entirely: ask Claude *"what's still uncategorized?"* — the `top_uncategorized_patterns` MCP tool surfaces the biggest gaps, and `add_category_rule` / `remove_category_rule` / `categorize_transaction` apply your decisions from the conversation (default seeded rules can only be removed via the CLI's `--force` path above).
 
 **Finding what needs a rule:** the dashboard's "By category" page shows the Uncategorized share; `top_uncategorized_patterns` (via Claude) or the suggested commands in its output close the loop.
 

@@ -74,6 +74,7 @@ async def test_server_lists_expected_tools(store: DuckDBStore) -> None:
             "categorize_transaction",
             "uncategorize_transaction",
             "add_category_rule",
+            "remove_category_rule",
             "top_uncategorized_patterns",
             "list_goals",
             "set_goal",
@@ -139,7 +140,7 @@ async def test_server_spending_by_category_e2e(store: DuckDBStore) -> None:
 async def test_server_curation_tools_e2e(store: DuckDBStore) -> None:
     """Full MCP round-trip for the curation surface: surface an
     uncategorized pattern → add a rule → verify resolution; then
-    override one transaction and clear it."""
+    override one transaction and clear it; finally remove the rule."""
     store.upsert_accounts(
         [
             Account(
@@ -181,6 +182,7 @@ async def test_server_curation_tools_e2e(store: DuckDBStore) -> None:
         )
         payload = _decode(result)
         assert payload["ok"] is True
+        rule_id = payload["rule_id"]
 
         # 3. The transaction now resolves through the rule.
         result = await session.call_tool("get_transactions", {"search": "GYM"})
@@ -202,6 +204,12 @@ async def test_server_curation_tools_e2e(store: DuckDBStore) -> None:
         assert _decode(result)["ok"] is True
         result = await session.call_tool("get_transactions", {"search": "GYM"})
         assert _decode(result)[0]["category"] == "Healthcare"
+
+        # 5. Removing the rule un-categorizes the transaction again.
+        result = await session.call_tool("remove_category_rule", {"rule_id": rule_id})
+        assert _decode(result)["ok"] is True
+        result = await session.call_tool("get_transactions", {"search": "GYM"})
+        assert _decode(result)[0]["category"] == "Uncategorized"
 
 
 @pytest.mark.anyio
@@ -374,6 +382,7 @@ def test_schema_hint_communicates_categorization_semantics() -> None:
         "non-spending",  # is_spending semantic guarantee (0006)
         "top_uncategorized_patterns",  # curation discovery entry point
         "add_category_rule",  # curation write path (NOT sql_query)
+        "remove_category_rule",  # rule deletion path (defaults → CLI)
         "categorize_transaction",  # one-off override path
         "list_goals",  # goal read path carries computed status/pace
         "set_goal",  # goal write path (NOT sql_query)

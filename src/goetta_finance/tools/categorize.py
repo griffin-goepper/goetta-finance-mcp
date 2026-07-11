@@ -1,6 +1,6 @@
 """MCP write surface for categorization curation.
 
-Three pure functions wrapping store methods with structured
+Four pure functions wrapping store methods with structured
 ``{ok: bool, ...}`` results instead of exceptions — MCP tool results
 should be model-readable outcomes, not stack traces. The difflib
 "did you mean?" suggestion from the CLI carries over so Claude can
@@ -98,4 +98,33 @@ def add_category_rule(
         "message": f"Added rule {rule_id}: {category_name} {normalized_match} "
         f"{pattern!r} (priority {priority}). Applies retroactively to every "
         "matching transaction.",
+    }
+
+
+def remove_category_rule(store: FinanceStore, rule_id: int) -> dict[str, Any]:
+    """Remove a user-added categorization rule. Retroactive — transactions
+    it matched immediately resolve through the remaining rules.
+
+    Default (seeded) rules are refused: the MCP surface deliberately has
+    no ``force`` parameter, because a prompt-injected call could pass it
+    as easily as it could call the tool. The CLI's ``remove-rule --force``
+    path exists for defaults, with its typed-pattern confirmation.
+    """
+    try:
+        store.remove_rule(rule_id, force=False)
+    except StoreError as exc:
+        message = str(exc)
+        if "default rule" in message:
+            message = (
+                f"rule {rule_id} is a default (seeded) rule; this tool refuses "
+                "to remove those. The user can remove it via the CLI, which "
+                "requires a typed confirmation: "
+                f"goetta-finance category remove-rule {rule_id} --force"
+            )
+        return {"ok": False, "error": message}
+    return {
+        "ok": True,
+        "message": f"Removed rule {rule_id}. Transactions it matched now "
+        "resolve through the remaining rules (or 'Uncategorized') — "
+        "retroactive, no backfill.",
     }

@@ -362,7 +362,7 @@ Once registered, restart your Claude client and try things like:
 - *"Is the data current?"* → `sync_status` reports last sync + freshness
 - *"Am I on track with my dining budget?"* → `list_goals` reports progress, pace, and status per goal
 
-The MCP server exposes fourteen tools:
+The MCP server exposes fifteen tools:
 
 - **`list_accounts`** — all accounts with current balances (hidden accounts excluded by default)
 - **`get_transactions`** — filter by account, date range, category, text search; up to 1000 rows. Every row carries a resolved `category` field.
@@ -371,6 +371,7 @@ The MCP server exposes fourteen tools:
 - **`top_uncategorized_patterns`** — the curation entry point: the largest spending patterns sitting in Uncategorized, normalized via your `prefixes.txt`
 - **`categorize_transaction`** / **`uncategorize_transaction`** — per-transaction override and its undo
 - **`add_category_rule`** — add a rule from conversation; retroactive, validator-gated (same ReDoS checks as the CLI)
+- **`remove_category_rule`** — delete a user rule by id, equally retroactive. Default (seeded) rules are refused — those need the CLI's typed-confirmation `remove-rule --force`.
 - **`list_goals`** — every goal with progress, status, and pace computed fresh (spending caps use the same math as `spending_by_category`)
 - **`set_goal`** / **`remove_goal`** — create and delete goals from conversation; validator-gated identically to the CLI
 - **`sql_query`** — read-only SQL against the local DuckDB store (see security notes below). Prefer `transactions_with_category` over the bare `transactions` table when you want category info.
