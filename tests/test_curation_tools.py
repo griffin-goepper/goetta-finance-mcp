@@ -80,6 +80,37 @@ def test_categorize_transaction_unknown_transaction_errors(store: DuckDBStore) -
     assert "transaction not found" in result["error"].lower()
 
 
+def test_categorize_pending_transaction_warns_about_id_instability(
+    store: DuckDBStore,
+) -> None:
+    """The override is applied, but the response carries the durability
+    caveat: a pending id may be reissued at settlement, dropping the
+    override. Settled rows must NOT get the caveat."""
+    _seed_one(store)
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="cur-pending",
+                account_id="cur-acc",
+                posted=datetime(2026, 5, 6, tzinfo=UTC),
+                amount=Decimal("-5.00"),
+                description="Auth hold",
+                pending=True,
+            )
+        ]
+    )
+    result = categorize_transaction(store, "cur-pending", "Dining")
+    assert result["ok"] is True
+    assert "still pending" in result["message"]
+    assert "add_category_rule" in result["message"]
+    rows = {r["id"]: r for r in store.get_transactions_with_category()}
+    assert rows["cur-pending"]["category"] == "Dining"
+
+    settled = categorize_transaction(store, "cur-1", "Dining")
+    assert settled["ok"] is True
+    assert "still pending" not in settled["message"]
+
+
 def test_uncategorize_transaction_falls_back_to_rule(store: DuckDBStore) -> None:
     _seed_one(store, desc="STARBUCKS STORE #1")  # legacy rule: Dining
     categorize_transaction(store, "cur-1", "Shopping")

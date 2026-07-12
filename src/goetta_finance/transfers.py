@@ -132,6 +132,35 @@ def apply_transfer_links(store: FinanceStore) -> list[str]:
     return lines
 
 
+def pending_transfer_delta(store: FinanceStore, account_id: str) -> Decimal | None:
+    """Signed sum the account's links WOULD apply from still-pending
+    source transactions — a read-time preview of the next roll-forward.
+
+    Same signs as ``apply_transfer_links`` (an outflow from the source
+    credits the manual account, an inflow debits it) and the same
+    cross-link dedup (a transaction matched by two links counts once).
+    Nothing is ledgered or applied here; the money moves when the row
+    settles and ``apply_transfer_links`` picks it up. Returns ``None``
+    when the account has no links (the concept doesn't apply) and
+    ``Decimal("0")`` when links exist but nothing matching is pending.
+
+    A ``set-balance`` true-up re-anchors the links, so pending rows
+    posted at or before the new anchor silently leave the preview —
+    correct, the declared balance already speaks for them.
+    """
+    links = store.list_transfer_links(account_id=account_id)
+    if not links:
+        return None
+    seen: set[str] = set()
+    total = Decimal("0")
+    for link in links:
+        for txn in store.pending_transfer_transactions(link):
+            if txn.id not in seen:
+                seen.add(txn.id)
+                total += -txn.amount
+    return total
+
+
 def transfer_link_suggestions(store: FinanceStore) -> list[TransferLinkSuggestion]:
     """Detect likely transfer links for manual accounts that have none.
 
@@ -207,5 +236,6 @@ __all__ = [
     "apply_transfer_links",
     "describe_link",
     "describe_suggestion",
+    "pending_transfer_delta",
     "transfer_link_suggestions",
 ]

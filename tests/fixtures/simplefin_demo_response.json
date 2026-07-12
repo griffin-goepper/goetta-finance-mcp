@@ -39,6 +39,14 @@
           "amount": "-15.99",
           "description": "Pending hold",
           "pending": true
+        },
+        {
+          "id": "TX-4-PENDING-UNPOSTED",
+          "posted": 0,
+          "transacted_at": 1747926000,
+          "amount": "-8.50",
+          "description": "Card auth hold",
+          "pending": true
         }
       ],
       "extra": {}

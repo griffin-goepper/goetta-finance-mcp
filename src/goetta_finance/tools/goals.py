@@ -62,6 +62,7 @@ def list_goals(store: FinanceStore) -> list[dict[str, Any]]:
                 "monthly_delta": serialize_value(progress.monthly_delta),
                 "required_monthly": serialize_value(progress.required_monthly),
                 "projected_date": serialize_value(progress.projected_date),
+                "pending_delta": serialize_value(progress.pending_delta),
             }
         )
     return out

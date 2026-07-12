@@ -32,7 +32,11 @@ def fresh_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def _seed_acct_and_txn(
-    home: Path, *, txn_id: str = "ACT-tx-1", description: str = "STARBUCKS STORE #1"
+    home: Path,
+    *,
+    txn_id: str = "ACT-tx-1",
+    description: str = "STARBUCKS STORE #1",
+    pending: bool = False,
 ) -> None:
     """Add one account + one transaction so override / categorize commands
     have a target. Closes the store before returning so the CLI can reopen."""
@@ -58,6 +62,7 @@ def _seed_acct_and_txn(
                     posted=datetime(2026, 5, 10, tzinfo=UTC),
                     amount=Decimal("-10.00"),
                     description=description,
+                    pending=pending,
                 )
             ]
         )
@@ -587,6 +592,22 @@ def test_transaction_categorize_case_insensitive(fresh_home: Path) -> None:
     result = runner.invoke(app, ["transaction", "categorize", "ACT-tx-ci", "dining"])
     assert result.exit_code == 0, result.output
     assert _resolved_category(fresh_home, "ACT-tx-ci") == "Dining"
+
+
+def test_transaction_categorize_pending_warns(fresh_home: Path) -> None:
+    """Categorizing a pending row succeeds but prints the durability
+    caveat (pending ids may be reissued at settlement). Settled rows
+    must not get the caveat."""
+    _seed_acct_and_txn(fresh_home, txn_id="ACT-tx-pend", description="ZZZ hold", pending=True)
+    result = runner.invoke(app, ["transaction", "categorize", "ACT-tx-pend", "Dining"])
+    assert result.exit_code == 0, result.output
+    assert "still pending" in result.output
+    assert _resolved_category(fresh_home, "ACT-tx-pend") == "Dining"
+
+    _seed_acct_and_txn(fresh_home, txn_id="ACT-tx-settled", description="ZZZ unmatched")
+    result = runner.invoke(app, ["transaction", "categorize", "ACT-tx-settled", "Dining"])
+    assert result.exit_code == 0, result.output
+    assert "still pending" not in result.output
 
 
 def test_transaction_categorize_unknown_category(fresh_home: Path) -> None:

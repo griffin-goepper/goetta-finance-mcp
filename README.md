@@ -76,7 +76,6 @@ Re-running `init` is safe — each step detects existing state and offers to ski
 | `goetta-finance category list\|add\|set-rule\|remove-rule\|default-rules` | Manage categories and the rules that map descriptions to them. See "Transaction categorization" below. |
 | `goetta-finance transaction categorize\|uncategorize` | Manual per-transaction category overrides. See "Transaction categorization" below. |
 | `goetta-finance goal add-spending\|add-balance\|list\|remove` | Spending caps and balance targets, evaluated at read time. See "Goals" below. |
-
 ## Manual accounts and liabilities
 
 SimpleFIN can't reach every account — 401(k) providers, HSAs, brokerages outside its bank list, and student-loan servicers all sit outside. `goetta-finance account` lets you track those by hand so they show up in MCP queries and the dashboard alongside synced accounts.
@@ -241,6 +240,18 @@ Inline categorize-from-dashboard (HTMX dropdown + write endpoint) is deliberatel
 - **Default rules don't re-seed if you delete them.** Migrations run once per database; the slate stays where you leave it. New defaults arrive only via new migration files — never edits to shipped ones.
 
 See [`CUSTOMIZATION.md`](./CUSTOMIZATION.md) for the full map of user-tunable surfaces (rules, prefix list, categories, flags, colors).
+
+## Pending transactions
+
+Unsettled ("pending") transactions from SimpleFIN are stored alongside posted ones with `pending = TRUE`. They're a **snapshot of the bank's in-flight state, not history**: each sync replaces the pending set with what the feed currently reports, so a pending row disappears when its hold is released, and settles in place (or under a **new id** — banks reissue ids at settlement, in which case the old pending row is removed and the posted row arrives fresh).
+
+What that means in practice:
+
+- **Spending caps, `spending_by_category`, and the by-month matrix count pending charges** — they're committed money, and a cap is an early-warning device. The monthly income/spending bars exclude them; transfer roll-forward waits for settlement.
+- **The dashboard marks pending rows** with a `pending` badge and muted styling on the Transactions page; `get_transactions` and `/api/v1/transactions` carry a `pending` field per row.
+- **Prefer rules over per-transaction overrides for pending rows.** A rule matches the settled transaction whatever id it arrives under. A `categorize_transaction` override is keyed to the id, so it's dropped if the bank reissues the id at settlement — both the CLI and the MCP tool warn when you categorize a pending row.
+- **Dates can shift at settlement.** A pending row missing a posted timestamp is dated by its transaction time; the real settlement time replaces it when it posts, which can move a transaction across month buckets.
+- **A hold that stays pending longer than the sync window may temporarily vanish** from the store and reappear when it settles — temporary under-counting beats permanently double-counting a hold that settled under a new id.
 
 ## Goals
 
@@ -487,7 +498,7 @@ The SimpleFIN access URL is sensitive — it grants read access to your bank dat
 
 - **Microsoft Store install of Claude Desktop**: see the Claude clients table above. Use Claude Code or the direct-download Claude Desktop until `init` learns the MSIX-sandboxed config path.
 - **On Windows, `serve` and `web` cannot run simultaneously as separate processes.** DuckDB takes an exclusive OS file lock on the database even for a read-only handle. Use `goetta-finance daemon` (one process, both surfaces) to avoid the conflict, or stop one before starting the other. macOS/Linux use advisory POSIX locks so concurrent read-only + read-write *may* work, but it isn't relied upon.
-- **Pending transactions are dropped.** Only `posted` transactions are stored in v1. SimpleFIN's pending feed will be supported in a later phase.
+- **Pending transactions are a snapshot, not history.** They're stored and counted (see "Pending transactions" above), but ids are bank-unstable: per-transaction category overrides on pending rows may not survive settlement, and a long-lived hold can temporarily vanish between syncs.
 - **No cross-currency arithmetic.** Each account row displays its own currency, and aggregate labels (net worth, chart axes) derive from your accounts — a GBP-only install shows GBP, mixed-currency installs show "mixed". But cross-account totals still sum raw numbers without FX conversion, so a mixed-currency net worth is not meaningful. Manual accounts default to USD; pass `--currency EUR` to `account add` to override.
 - **Categorization is flat and rule-based.** No hierarchy, no transaction splits, no LLM auto-categorization, no transfer dedup (transfers between your own accounts show up in both balances). The default rules are USA-merchant biased; you'll add your own — see "Transaction categorization" above.
 - **No inline category editing in the dashboard.** Recategorize via the `goetta-finance transaction categorize` CLI; the transactions page surfaces the exact command in each badge's tooltip.

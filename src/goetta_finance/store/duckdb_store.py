@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import threading
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from importlib.resources import files
@@ -548,6 +548,51 @@ class DuckDBStore:
             )
             return SyncResult(new=new_count, updated=updated_count)
 
+    def delete_stale_pending(self, account_ids: Collection[str], keep_ids: Collection[str]) -> int:
+        """Remove pending rows the feed no longer reports.
+
+        Pending rows are a snapshot of the feed, not history: one that
+        vanished either settled under a new id (its posted row was just
+        upserted) or evaporated (auth hold released). Scoped to
+        ``account_ids`` — accounts absent from the response (or whose
+        entry carried no transactions list) are untouched. Deliberately
+        NOT scoped by date: a hold pending longer than the fetch window
+        disappears temporarily and reappears at settlement, whereas a
+        date-scoped delete would leave it double-counting forever.
+
+        Also removes ``transaction_overrides`` rows for the deleted ids —
+        there is no FK (migration 0011), and an orphaned override would
+        silently resurrect if the id ever reappeared.
+
+        Returns the number of transactions deleted.
+        """
+        if not account_ids:
+            return 0
+        accounts = list(account_ids)
+        keep = set(keep_ids)
+        with self._lock:
+            # ruff S608 / bandit B608: interpolation is ``"?, ?, ..."``
+            # parameter markers only, matching the audited pattern in
+            # ``upsert_transactions``. Real values bind as parameters.
+            account_ph = ", ".join(["?"] * len(accounts))
+            rows = self.conn.execute(
+                f"SELECT id FROM transactions WHERE pending = TRUE AND account_id IN ({account_ph})",  # noqa: S608  # nosec B608
+                accounts,
+            ).fetchall()
+            stale = [row[0] for row in rows if row[0] not in keep]
+            if not stale:
+                return 0
+            stale_ph = ", ".join(["?"] * len(stale))
+            self.conn.execute(
+                f"DELETE FROM transaction_overrides WHERE transaction_id IN ({stale_ph})",  # noqa: S608  # nosec B608
+                stale,
+            )
+            self.conn.execute(
+                f"DELETE FROM transactions WHERE id IN ({stale_ph})",  # noqa: S608  # nosec B608
+                stale,
+            )
+            return len(stale)
+
     def record_balance_snapshot(self, snap: BalanceSnapshot) -> None:
         with self._lock:
             self.conn.execute(
@@ -923,7 +968,14 @@ class DuckDBStore:
                 raise StoreError(f"refusing to remove default rule {rule_id} without force=True")
             self.conn.execute("DELETE FROM category_rules WHERE id = ?", [int(rule_id)])
 
-    def set_transaction_override(self, transaction_id: str, category_name: str) -> None:
+    def set_transaction_override(self, transaction_id: str, category_name: str) -> bool:
+        """Apply a per-transaction category override.
+
+        Returns whether the transaction is currently pending, so the
+        write surfaces can warn: pending ids are unstable, and an
+        override on one is dropped if the bank reissues the id at
+        settlement (``delete_stale_pending`` cleans it up with the row).
+        """
         with self._lock:
             cat_row = self.conn.execute(
                 "SELECT id FROM categories WHERE lower(name) = lower(?)", [category_name]
@@ -931,7 +983,7 @@ class DuckDBStore:
             if cat_row is None:
                 raise StoreError(f"category not found: {category_name}")
             txn_row = self.conn.execute(
-                "SELECT 1 FROM transactions WHERE id = ?", [transaction_id]
+                "SELECT pending FROM transactions WHERE id = ?", [transaction_id]
             ).fetchone()
             if txn_row is None:
                 raise StoreError(f"transaction not found: {transaction_id}")
@@ -945,6 +997,7 @@ class DuckDBStore:
                 """,
                 [transaction_id, int(cat_row[0])],
             )
+            return bool(txn_row[0])
 
     def clear_transaction_override(self, transaction_id: str) -> None:
         with self._lock:
@@ -1237,6 +1290,19 @@ class DuckDBStore:
         description, and absent from the applications ledger. Ordered by
         posted so the roll-forward advances chronologically.
         """
+        return self._link_matched_transactions(link, pending=False)
+
+    def pending_transfer_transactions(self, link: TransferLink) -> list[Transaction]:
+        """Matched still-PENDING source transactions — a read-time preview
+        of what the roll-forward will apply once they settle.
+
+        Same anchor/pattern/ledger semantics as
+        :meth:`eligible_transfer_transactions`; only the pending flag
+        differs. Nothing here is ever applied or ledgered.
+        """
+        return self._link_matched_transactions(link, pending=True)
+
+    def _link_matched_transactions(self, link: TransferLink, *, pending: bool) -> list[Transaction]:
         if link.match_type == "contains":
             match_clause = (
                 "(lower(t.description) LIKE '%' || lower(?) || '%' "
@@ -1256,7 +1322,7 @@ class DuckDBStore:
                        t.description, t.payee, t.memo, t.pending, t.extra
                 FROM transactions t
                 WHERE t.account_id = ?
-                  AND t.pending = FALSE
+                  AND t.pending = ?
                   AND t.posted > ?
                   AND {match_clause}
                   AND NOT EXISTS (
@@ -1267,6 +1333,7 @@ class DuckDBStore:
                 """,  # noqa: S608  # nosec B608
                 [
                     link.source_account_id,
+                    pending,
                     _to_naive_utc(link.anchor),
                     link.pattern,
                     link.pattern,

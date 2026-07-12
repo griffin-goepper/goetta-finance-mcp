@@ -16,6 +16,7 @@ from goetta_finance.transfers import (
     apply_transfer_links,
     describe_link,
     describe_suggestion,
+    pending_transfer_delta,
     transfer_link_suggestions,
 )
 
@@ -216,6 +217,82 @@ def test_true_up_absorbs_past_and_releases_future(store: DuckDBStore) -> None:
 def test_apply_without_links_is_a_noop(store: DuckDBStore) -> None:
     _seed(store)
     assert apply_transfer_links(store) == []
+
+
+def test_pending_delta_previews_unsettled_transfers(store: DuckDBStore) -> None:
+    _seed(store)
+    store.upsert_transactions([_txn("t-pend", month=7, day=10, amount="-800.00", pending=True)])
+    store.add_transfer_link("MANUAL-sav", "ACT-chk", match_type="contains", pattern="Apple Savings")
+    assert pending_transfer_delta(store, "MANUAL-sav") == Decimal("800.00")
+    # Preview only: nothing applies, nothing moves.
+    assert apply_transfer_links(store) == []
+    assert _balance(store) == Decimal("10000.00")
+
+
+def test_pending_delta_none_without_links(store: DuckDBStore) -> None:
+    _seed(store)
+    assert pending_transfer_delta(store, "MANUAL-sav") is None
+
+
+def test_pending_delta_zero_with_links_and_no_pending(store: DuckDBStore) -> None:
+    _seed(store)
+    store.upsert_transactions([_txn("t-settled", day=12, amount="-500.00")])
+    store.add_transfer_link("MANUAL-sav", "ACT-chk", match_type="contains", pattern="Apple Savings")
+    assert pending_transfer_delta(store, "MANUAL-sav") == Decimal("0")
+
+
+def test_pending_delta_excludes_pre_anchor_pending(store: DuckDBStore) -> None:
+    _seed(store)
+    store.upsert_transactions([_txn("t-old-pend", month=5, day=15, amount="-500.00", pending=True)])
+    store.add_transfer_link("MANUAL-sav", "ACT-chk", match_type="contains", pattern="Apple Savings")
+    assert pending_transfer_delta(store, "MANUAL-sav") == Decimal("0")
+
+
+def test_pending_delta_counts_overlapping_links_once(store: DuckDBStore) -> None:
+    _seed(store)
+    store.upsert_transactions([_txn("t-pend", day=20, amount="-800.00", pending=True)])
+    store.add_transfer_link("MANUAL-sav", "ACT-chk", match_type="contains", pattern="Apple")
+    store.add_transfer_link("MANUAL-sav", "ACT-chk", match_type="contains", pattern="Savings")
+    assert pending_transfer_delta(store, "MANUAL-sav") == Decimal("800.00")
+
+
+def test_pending_delta_ignores_already_applied_ids(store: DuckDBStore) -> None:
+    """The sync-overlap race: a row settles, applies, then a later chunk
+    re-upserts it flagged pending. The ledger row must keep it out of the
+    preview or the same money counts twice."""
+    _seed(store)
+    txn = _txn("t-race", day=12, amount="-500.00")
+    store.upsert_transactions([txn])
+    store.add_transfer_link("MANUAL-sav", "ACT-chk", match_type="contains", pattern="Apple Savings")
+    apply_transfer_links(store)
+    assert _balance(store) == Decimal("10500.00")
+
+    store.upsert_transactions([txn.model_copy(update={"pending": True})])
+    assert pending_transfer_delta(store, "MANUAL-sav") == Decimal("0")
+
+
+def test_pending_delta_debits_pending_money_moving_back(store: DuckDBStore) -> None:
+    _seed(store)
+    store.upsert_transactions([_txn("t-back", day=15, amount="200.00", pending=True)])
+    store.add_transfer_link("MANUAL-sav", "ACT-chk", match_type="contains", pattern="Apple Savings")
+    assert pending_transfer_delta(store, "MANUAL-sav") == Decimal("-200.00")
+
+
+def test_pending_delta_hands_off_to_roll_forward_on_settle(store: DuckDBStore) -> None:
+    """The full lifecycle: previewed while pending, applied once settled —
+    never both at once."""
+    _seed(store)
+    pending = _txn("t-cycle", month=7, day=10, amount="-800.00", pending=True)
+    store.upsert_transactions([pending])
+    store.add_transfer_link("MANUAL-sav", "ACT-chk", match_type="contains", pattern="Apple Savings")
+    assert pending_transfer_delta(store, "MANUAL-sav") == Decimal("800.00")
+    assert _balance(store) == Decimal("10000.00")
+
+    store.upsert_transactions([pending.model_copy(update={"pending": False})])
+    [line] = apply_transfer_links(store)
+    assert "+800.00" in line
+    assert _balance(store) == Decimal("10800.00")
+    assert pending_transfer_delta(store, "MANUAL-sav") == Decimal("0")
 
 
 def test_suggestions_detect_exact_payee_name_match(store: DuckDBStore) -> None:

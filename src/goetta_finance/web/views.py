@@ -290,6 +290,7 @@ def _query_transactions(
             "description": r["description"],
             "payee": r.get("payee"),
             "amount": str(r["amount"]),
+            "pending": bool(r["pending"]),
             "category": r["category"],
             "category_color": r.get("category_color"),
         }

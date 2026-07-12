@@ -45,6 +45,7 @@ from goetta_finance.models import (
 )
 from goetta_finance.store import FinanceStore
 from goetta_finance.tools.spending_by_category import query_spending_by_category
+from goetta_finance.transfers import pending_transfer_delta
 
 _DAYS_PER_MONTH = Decimal("30.44")  # mean Gregorian month
 _TREND_LOOKBACK_DAYS = 90
@@ -185,6 +186,7 @@ def balance_goal_progress(
     account: Account,
     snapshots: list[BalanceSnapshot],
     *,
+    pending_raw: Decimal | None = None,
     now: datetime | None = None,
 ) -> GoalProgress:
     """Evaluate a balance goal. Pure — the caller fetches the account
@@ -202,7 +204,10 @@ def balance_goal_progress(
         trend — insufficient data is not risk).
 
     ``monthly_delta`` is oriented toward the goal: positive means
-    approaching the target regardless of direction.
+    approaching the target regardless of direction. ``pending_raw``
+    (the account's raw pending-transfer preview, from
+    :func:`goetta_finance.transfers.pending_transfer_delta`) gets the
+    same orientation on its way into ``pending_delta``.
     """
     now = (now or datetime.now(tz=UTC)).astimezone(UTC)
     current = abs(account.balance) if account.is_liability else account.balance
@@ -263,6 +268,11 @@ def balance_goal_progress(
     else:
         status = GoalStatus.ON_TRACK
 
+    pending_delta: Decimal | None = None
+    if pending_raw is not None:
+        toward_pending = pending_raw if goal.direction is GoalDirection.AT_LEAST else -pending_raw
+        pending_delta = toward_pending.quantize(_MONEY_Q)
+
     return GoalProgress(
         goal=goal,
         status=status,
@@ -272,6 +282,7 @@ def balance_goal_progress(
         monthly_delta=monthly_delta,
         required_monthly=required_monthly,
         projected_date=projected_date,
+        pending_delta=pending_delta,
     )
 
 
@@ -303,7 +314,10 @@ def evaluate_goals(store: FinanceStore, *, now: datetime | None = None) -> list[
             snapshots = store.get_balance_history(
                 goal.account_id, since=now - timedelta(days=_TREND_LOOKBACK_DAYS)
             )
-            out.append(balance_goal_progress(goal, account, snapshots, now=now))
+            pending_raw = pending_transfer_delta(store, goal.account_id)
+            out.append(
+                balance_goal_progress(goal, account, snapshots, pending_raw=pending_raw, now=now)
+            )
     return out
 
 
@@ -372,6 +386,8 @@ def describe_progress(progress: GoalProgress) -> str:
         line = f"{progress.current} of {progress.target} ({progress.percent}%)"
     if progress.monthly_delta is not None:
         line += f" — {progress.monthly_delta:+}/mo avg"
+    if progress.pending_delta:
+        line += f" ({progress.pending_delta:+} pending)"
     if progress.projected_date is not None:
         line += f", projected {progress.projected_date.isoformat()}"
     if goal.target_date is not None:
