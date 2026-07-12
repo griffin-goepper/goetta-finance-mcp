@@ -43,6 +43,7 @@ goetta-finance/
 │       ├── daemon.py            # one-process host: MCP HTTP + dashboard + scheduler
 │       ├── errors.py            # GoettaFinanceError hierarchy
 │       ├── goals.py             # ALL goal progress/pace math (one home)
+│       ├── importer.py          # normalized-CSV historical import (CLI `import` group)
 │       ├── mcp_config.py        # Claude Desktop/Code registration helpers
 │       ├── models.py            # pydantic models
 │       ├── simplefin.py         # SimpleFinClient
