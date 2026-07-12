@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Protocol
@@ -23,6 +23,10 @@ class FinanceStore(Protocol):
     def upsert_accounts(self, accounts: list[Account]) -> None: ...
 
     def upsert_transactions(self, txns: list[Transaction]) -> SyncResult: ...
+
+    def delete_stale_pending(
+        self, account_ids: Collection[str], keep_ids: Collection[str]
+    ) -> int: ...
 
     def record_balance_snapshot(self, snap: BalanceSnapshot) -> None: ...
 
@@ -92,7 +96,7 @@ class FinanceStore(Protocol):
 
     def remove_rule(self, rule_id: int, *, force: bool = False) -> None: ...
 
-    def set_transaction_override(self, transaction_id: str, category_name: str) -> None: ...
+    def set_transaction_override(self, transaction_id: str, category_name: str) -> bool: ...
 
     def clear_transaction_override(self, transaction_id: str) -> None: ...
 
@@ -135,6 +139,8 @@ class FinanceStore(Protocol):
     def reset_transfer_link_anchors(self, account_id: str, anchor: datetime) -> int: ...
 
     def eligible_transfer_transactions(self, link: TransferLink) -> list[Transaction]: ...
+
+    def pending_transfer_transactions(self, link: TransferLink) -> list[Transaction]: ...
 
     def record_transfer_applications(
         self, account_id: str, link_id: int, txns: list[Transaction]

@@ -106,6 +106,25 @@ def test_get_transactions_amount_is_string(store: DuckDBStore) -> None:
     assert isinstance(txn["amount"], str)
 
 
+def test_get_transactions_carries_pending_flag(store: DuckDBStore) -> None:
+    _seed(store)
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="t-pending",
+                account_id="a1",
+                posted=datetime(2026, 5, 12, tzinfo=UTC),
+                amount=Decimal("-15.99"),
+                description="Pending hold",
+                pending=True,
+            )
+        ]
+    )
+    by_id = {t["id"]: t for t in get_transactions(store)}
+    assert by_id["t-pending"]["pending"] is True
+    assert by_id["t1"]["pending"] is False
+
+
 @pytest.mark.parametrize("days,expected", [(365, 5), (1, 1)])
 def test_account_balance_history_respects_days(
     store: DuckDBStore,

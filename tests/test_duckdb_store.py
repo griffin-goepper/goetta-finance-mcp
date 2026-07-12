@@ -1831,3 +1831,128 @@ def test_sync_reupsert_of_linked_accounts_succeeds(store: DuckDBStore) -> None:
     balances = {a.id: a.balance for a in store.get_accounts()}
     assert balances["ACT-chk"] == Decimal("42.00")
     assert balances["MANUAL-sav"] == Decimal("31000.00")
+
+
+# --- delete_stale_pending (pending snapshot reconciliation) ----------------------
+
+
+def _pending_txn(id: str, account_id: str = "acc-1", amount: str = "-15.99") -> Transaction:
+    return Transaction(
+        id=id,
+        account_id=account_id,
+        posted=_utc(2026, 5, 12),
+        amount=Decimal(amount),
+        description="Pending hold",
+        pending=True,
+    )
+
+
+def test_delete_stale_pending_removes_unlisted_pending_row(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account()])
+    store.upsert_transactions([_pending_txn("p-stale"), _pending_txn("p-kept")])
+
+    removed = store.delete_stale_pending({"acc-1"}, {"p-kept"})
+
+    assert removed == 1
+    ids = {t.id for t in store.get_transactions()}
+    assert "p-stale" not in ids
+    assert "p-kept" in ids
+
+
+def test_delete_stale_pending_never_touches_settled_rows(store: DuckDBStore) -> None:
+    """A settled (non-pending) row absent from keep_ids must survive —
+    only pending rows are snapshot data; posted history is permanent."""
+    store.upsert_accounts([_account()])
+    store.upsert_transactions([_transaction("t-settled")])
+
+    removed = store.delete_stale_pending({"acc-1"}, set())
+
+    assert removed == 0
+    assert {t.id for t in store.get_transactions()} == {"t-settled"}
+
+
+def test_delete_stale_pending_scopes_to_given_accounts(store: DuckDBStore) -> None:
+    """A pending row on an account outside the reconcile scope survives —
+    that account didn't report transactions this sync (institution
+    hiccup or omitted from the response)."""
+    store.upsert_accounts([_account(id="acc-1"), _account(id="acc-2")])
+    store.upsert_transactions(
+        [
+            _pending_txn("p-in-scope", account_id="acc-1"),
+            _pending_txn("p-out-of-scope", account_id="acc-2"),
+        ]
+    )
+
+    removed = store.delete_stale_pending({"acc-1"}, set())
+
+    assert removed == 1
+    assert {t.id for t in store.get_transactions()} == {"p-out-of-scope"}
+
+
+def test_delete_stale_pending_empty_account_ids_is_noop(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account()])
+    store.upsert_transactions([_pending_txn("p-1")])
+
+    assert store.delete_stale_pending(set(), set()) == 0
+    assert {t.id for t in store.get_transactions()} == {"p-1"}
+
+
+def test_delete_stale_pending_removes_orphaned_override(store: DuckDBStore) -> None:
+    """An override on a reconciled-away pending id must go with it — no FK
+    exists (migration 0011), and a leftover override would silently
+    resurrect if the id ever reappeared on a different transaction."""
+    store.upsert_accounts([_account()])
+    store.upsert_transactions([_pending_txn("p-overridden")])
+    store.set_transaction_override("p-overridden", "Dining")
+
+    removed = store.delete_stale_pending({"acc-1"}, set())
+
+    assert removed == 1
+    leftover = store.conn.execute(
+        "SELECT COUNT(*) FROM transaction_overrides WHERE transaction_id = 'p-overridden'"
+    ).fetchone()
+    assert leftover is not None and leftover[0] == 0
+
+
+def test_delete_stale_pending_keeps_override_of_kept_row(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account()])
+    store.upsert_transactions([_pending_txn("p-kept")])
+    store.set_transaction_override("p-kept", "Dining")
+
+    assert store.delete_stale_pending({"acc-1"}, {"p-kept"}) == 0
+    rows = {r["id"]: r for r in store.get_transactions_with_category()}
+    assert rows["p-kept"]["category"] == "Dining"
+
+
+def test_same_id_settlement_flips_pending_and_preserves_row(store: DuckDBStore) -> None:
+    """Lifecycle (b): the bank keeps the id at settlement. The ordinary
+    ON CONFLICT upsert flips pending FALSE and re-dates posted; created_at
+    and any override survive, and the row is not a reconcile candidate."""
+    store.upsert_accounts([_account()])
+    store.upsert_transactions([_pending_txn("t-settles-in-place")])
+    store.set_transaction_override("t-settles-in-place", "Dining")
+    created_before = store.conn.execute(
+        "SELECT created_at FROM transactions WHERE id = 't-settles-in-place'"
+    ).fetchone()
+
+    settled = Transaction(
+        id="t-settles-in-place",
+        account_id="acc-1",
+        posted=_utc(2026, 5, 14),
+        amount=Decimal("-15.99"),
+        description="Pending hold",
+        pending=False,
+    )
+    store.upsert_transactions([settled])
+    removed = store.delete_stale_pending({"acc-1"}, {"t-settles-in-place"})
+
+    assert removed == 0
+    created_after = store.conn.execute(
+        "SELECT created_at FROM transactions WHERE id = 't-settles-in-place'"
+    ).fetchone()
+    assert created_before == created_after
+    rows = {r["id"]: r for r in store.get_transactions_with_category()}
+    row = rows["t-settles-in-place"]
+    assert row["pending"] is False
+    assert row["posted"] == _utc(2026, 5, 14)
+    assert row["category"] == "Dining"

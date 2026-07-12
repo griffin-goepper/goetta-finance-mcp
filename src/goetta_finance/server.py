@@ -134,6 +134,21 @@ WHERE NOT is_hidden (or COALESCE(is_hidden, FALSE) = FALSE) — the MCP
 tools and the dashboard apply this by default; raw sql_query callers
 opt in explicitly.
 
+The transactions `pending` flag marks the bank's in-flight snapshot, not
+history: each sync replaces the pending set with what the feed currently
+reports, so a pending row can disappear (hold released) or settle. Banks
+may reissue the id when a pending transaction settles — the pending row
+vanishes and a NEW posted row appears — and `posted` on a pending row
+may be the transaction time, not the settlement time, so a transaction
+can shift between month buckets when it settles. Aggregation semantics:
+spending caps, spending_by_category, and the by-month matrix all COUNT
+pending rows (pending charges are committed money — early warning beats
+precision); the dashboard's monthly income/spending bars EXCLUDE them;
+transfer roll-forward waits for settlement. Because pending ids are
+unstable, prefer add_category_rule over categorize_transaction for
+pending rows — a rule matches the settled row no matter what id it
+arrives under, while a per-id override is dropped if the id changes.
+
 Categorization tables (migration 0004):
   categories(id, name, display_color, is_default)
   category_rules(id, category_id, match_type, pattern, priority, is_default,
@@ -567,8 +582,11 @@ def build_server(
             "2000' regardless of sign convention. Balance goals also carry "
             "monthly_delta (average movement toward the goal from the last "
             "90 days of history; positive = approaching), projected_date "
-            "(trend extrapolation), and required_monthly (when a "
-            "target_date is set). status is one of on_track / at_risk / "
+            "(trend extrapolation), required_monthly (when a "
+            "target_date is set), and pending_delta (sum of still-pending "
+            "linked transfers, counted into the balance when they settle; "
+            "positive = approaching; null when the account has no transfer "
+            "links). status is one of on_track / at_risk / "
             "over / met, evaluated at read time — recategorizing "
             "transactions retroactively changes progress. Use when the "
             "user asks about budgets, caps, savings targets, or debt "

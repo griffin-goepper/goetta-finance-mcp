@@ -290,7 +290,7 @@ Non-obvious requirements:
 1. **Overlap window** — always re-pull the last 5 days. Banks post transactions late.
 2. **Balance snapshot every sync**, even when balance is unchanged.
 3. **Idempotent** — dedup on SimpleFIN's IDs. Never generate your own.
-4. **Pending transactions** — v1 ignores them (`pending=True` rows are dropped). v2 stores them separately.
+4. **Pending transactions** — stored in the same `transactions` table with `pending=TRUE`, as an ephemeral snapshot of the feed: each successful sync reconciles the pending set for every account that reported transactions (`delete_stale_pending`), so rows that settled under a new id or evaporated are removed, and same-id settlements flip in place via the ordinary upsert. Never reconcile per-chunk or after a failed sync. (Superseded the original "v2 stores them separately" note — the read side was already built on same-table `pending` semantics.)
 5. **Quota awareness** — log a warning if Bridge returns a rate-limit warning. Don't auto-retry tight loops.
 
 ## 10. CLI
@@ -407,7 +407,7 @@ The dashboard is part of v1 because it's where rich, persistent visualization li
 ### Phase 5 — v2 features (later)
 
 - [ ] SQLite and JSONL storage backends
-- [ ] Pending transaction handling
+- [x] Pending transaction handling (same-table snapshot semantics; see §9 requirement 4)
 - [ ] SQLCipher encryption-at-rest option
 - [ ] Manual account support (for assets SimpleFIN can't reach: 401k providers, home equity, etc.)
 - [ ] Transaction categorization with feedback loop

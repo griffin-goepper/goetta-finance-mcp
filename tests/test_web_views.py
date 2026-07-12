@@ -201,6 +201,28 @@ def test_transactions_page_renders_category_badge(client: TestClient) -> None:
     assert "Subscriptions" in body
 
 
+def test_transactions_page_renders_pending_badge(client: TestClient, store: DuckDBStore) -> None:
+    """A pending row gets the badge + muted row class; settled rows don't."""
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="tx-pending-hold",
+                account_id="acc-checking",
+                posted=datetime.now(tz=UTC) - timedelta(days=1),
+                amount=Decimal("-15.99"),
+                description="Coffee auth hold",
+                pending=True,
+            )
+        ]
+    )
+    resp = client.get("/transactions")
+    assert resp.status_code == 200
+    body = resp.text
+    # Exactly one row is pending — the badge and row class appear once.
+    assert body.count("badge-pending") == 1
+    assert body.count("pending-row") == 1
+
+
 def test_transactions_page_badge_tooltip_has_cli_command_with_txn_id(
     client: TestClient,
 ) -> None:

@@ -145,6 +145,9 @@ class GoalProgress(BaseModel):
     monthly_delta: Decimal | None = None
     required_monthly: Decimal | None = None
     projected_date: date | None = None
+    # still-pending linked transfers, counted into the balance when they
+    # settle; positive = approaching. None when the account has no links.
+    pending_delta: Decimal | None = None
 
 
 class TransferLink(BaseModel):
