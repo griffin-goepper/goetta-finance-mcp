@@ -76,6 +76,41 @@ Re-running `init` is safe — each step detects existing state and offers to ski
 | `goetta-finance category list\|add\|set-rule\|remove-rule\|default-rules` | Manage categories and the rules that map descriptions to them. See "Transaction categorization" below. |
 | `goetta-finance transaction categorize\|uncategorize` | Manual per-transaction category overrides. See "Transaction categorization" below. |
 | `goetta-finance goal add-spending\|add-balance\|list\|remove` | Spending caps and balance targets, evaluated at read time. See "Goals" below. |
+| `goetta-finance import transactions\|balances` | Import historical data from normalized CSVs (e.g. parsed bank statements). See "Importing historical data" below. |
+
+## Importing historical data
+
+SimpleFIN typically returns ~90 days of history when you first connect. If your bank offers statements or CSV exports going back further, you can backfill:
+
+1. Convert your bank's export into a normalized CSV (any tool you like — the format is deliberately bank-agnostic):
+
+   ```csv
+   posted,amount,description,transacted_at,ref_number,memo,source_file
+   2019-07-15,-12.34,Debit Purchase VISA Coffee Shop,2019-07-13,1000000001,,2019-08 statement.pdf
+   2019-07-26,1250.00,Deposit,,2000000002,,2019-08 statement.pdf
+   ```
+
+   Amounts are signed the way the store expects: spending negative, deposits/credits positive. `transacted_at`, `ref_number`, `memo`, and `source_file` may be empty.
+
+2. Import into an existing account (find ids with `goetta-finance account list`):
+
+   ```bash
+   goetta-finance import transactions history.csv --account ACT-<id> --dry-run   # inspect first
+   goetta-finance import transactions history.csv --account ACT-<id>
+   ```
+
+   Rows get deterministic `IMP-` ids, so re-running the same file updates instead of duplicating. By default, rows posted on/after the account's earliest synced transaction are skipped — the live feed owns that region (`--before`/`--allow-overlap` override). Category rules apply to imported history retroactively, like everything else.
+
+3. Optionally import end-of-day balance history (header `date,balance,source_file`; liability balances negative when owed):
+
+   ```bash
+   goetta-finance import balances balances.csv --account ACT-<id>
+   ```
+
+   Imported snapshots land at 23:59:59 UTC on each date; that timestamp fingerprint is how you'd identify (or delete) them later, since snapshots carry no source column.
+
+On Windows, stop the daemon first (create `daemon.stop` next to `data.duckdb`) — the import CLI needs the DuckDB write lock.
+
 ## Manual accounts and liabilities
 
 SimpleFIN can't reach every account — 401(k) providers, HSAs, brokerages outside its bank list, and student-loan servicers all sit outside. `goetta-finance account` lets you track those by hand so they show up in MCP queries and the dashboard alongside synced accounts.

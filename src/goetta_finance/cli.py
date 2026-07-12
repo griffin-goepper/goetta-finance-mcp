@@ -6,7 +6,7 @@ import logging
 import re
 import sys
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated
@@ -30,6 +30,16 @@ from goetta_finance.goals import (
     describe_progress,
     evaluate_goals,
     goal_breach_warnings,
+)
+from goetta_finance.importer import (
+    UPSERT_BATCH_SIZE,
+    build_snapshots,
+    build_transactions,
+    plan_balance_import,
+    plan_import,
+    read_balances_csv,
+    read_transactions_csv,
+    resolve_cutoff,
 )
 from goetta_finance.mcp_config import (
     SERVER_KEY,
@@ -713,7 +723,7 @@ app.add_typer(account_app, name="account")
 
 
 def _open_writable_store() -> DuckDBStore:
-    """Open the configured DuckDBStore in write mode for an `account` command."""
+    """Open the configured DuckDBStore in write mode for a write command."""
     config = load_config()
     target = db_path(config)
     if not target.exists():
@@ -1839,6 +1849,253 @@ def goal_remove(
         typer.echo(f'Removed goal {goal_id} "{goal.name}".')
     except GoettaFinanceError as exc:
         typer.secho(f"goal remove failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+import_app = typer.Typer(
+    help="Import historical data from normalized CSV files (offline maintenance).",
+    no_args_is_help=True,
+)
+app.add_typer(import_app, name="import")
+
+
+def _parse_before(value: str | None) -> date | None:
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise typer.BadParameter(
+            f"--before must be YYYY-MM-DD, got {value!r}", param_hint="--before"
+        ) from exc
+
+
+def _resolve_import_account(store: DuckDBStore, account_id: str) -> Account:
+    accounts = {a.id: a for a in store.get_accounts(include_hidden=True)}
+    found = accounts.get(account_id)
+    if found is None:
+        typer.secho(f"Unknown account id: {account_id}", fg=typer.colors.RED, err=True)
+        typer.secho("Known accounts:", err=True)
+        for acc in sorted(accounts.values(), key=lambda a: a.id):
+            typer.secho(f"  {acc.id}  {acc.org_name or '-'} / {acc.name}", err=True)
+        raise typer.Exit(code=1)
+    return found
+
+
+def _import_cutoff(
+    store: DuckDBStore, account_id: str, before: date | None, allow_overlap: bool
+) -> date | None:
+    if allow_overlap:
+        return None
+    if before is not None:
+        return before
+    return resolve_cutoff(store, account_id)
+
+
+def _describe_cutoff(cutoff: date | None, before: date | None, allow_overlap: bool) -> str:
+    if allow_overlap:
+        return "Cutoff: none (--allow-overlap; importing every row)"
+    if before is not None:
+        return f"Cutoff: {before.isoformat()} (--before; rows dated on/after are skipped)"
+    if cutoff is None:
+        return "Cutoff: none (account has no synced rows; importing every row)"
+    return (
+        f"Cutoff: {cutoff.isoformat()} (earliest synced transaction; "
+        "rows dated on/after are skipped)"
+    )
+
+
+@import_app.command("transactions")
+def import_transactions(
+    csv_path: Annotated[
+        Path,
+        typer.Argument(
+            help="Normalized CSV with header: posted,amount,description,"
+            "transacted_at,ref_number,memo,source_file."
+        ),
+    ],
+    account: Annotated[
+        str,
+        typer.Option("--account", help="Target account id (see `goetta-finance account list`)."),
+    ],
+    before: Annotated[
+        str | None,
+        typer.Option(
+            "--before",
+            help="Only import rows posted strictly before this date (YYYY-MM-DD). "
+            "Default: the account's earliest synced transaction.",
+        ),
+    ] = None,
+    allow_overlap: Annotated[
+        bool,
+        typer.Option(
+            "--allow-overlap",
+            help="Disable the cutoff and import every row, even where synced data exists.",
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Validate and report without writing."),
+    ] = False,
+) -> None:
+    """Import historical transactions from a normalized CSV.
+
+    Amounts are signed in store convention (spending negative, credits
+    positive). Rows receive deterministic `IMP-` ids, so re-running the same
+    file updates rather than duplicates — on a re-run, a non-zero "new" count
+    means the file's content changed since the last import. By default, rows
+    posted on/after the account's earliest synced transaction are skipped
+    (the SimpleFIN feed owns that region).
+    """
+    if before is not None and allow_overlap:
+        raise typer.BadParameter(
+            "--before and --allow-overlap are mutually exclusive", param_hint="--allow-overlap"
+        )
+    before_date = _parse_before(before)
+    try:
+        rows = read_transactions_csv(csv_path)
+    except GoettaFinanceError as exc:
+        typer.secho(f"import transactions failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"import transactions failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        target = _resolve_import_account(store, account)
+        cutoff = _import_cutoff(store, account, before_date, allow_overlap)
+        plan = plan_import(build_transactions(account, rows), cutoff)
+        existing_ids = {
+            row["id"]
+            for row in store.query_sql(
+                "SELECT id FROM transactions WHERE account_id = ?", [account]
+            )
+        }
+        would_update = sum(1 for t in plan.to_import if t.id in existing_ids)
+        would_new = len(plan.to_import) - would_update
+
+        typer.echo(f"Account: {target.id} ({target.org_name or '-'} / {target.name})")
+        typer.echo(_describe_cutoff(cutoff, before_date, allow_overlap))
+        typer.echo(f"Parsed {len(rows)} rows from {csv_path.name}")
+        typer.echo(f"  to import: {len(plan.to_import)} (new: {would_new}, update: {would_update})")
+        typer.echo(f"  skipped (overlap): {plan.skipped_overlap}")
+        typer.echo(f"  amount sum: {plan.amount_sum:.2f}")
+        if plan.per_year:
+            per_year = "  ".join(f"{year}: {count}" for year, count in plan.per_year.items())
+            typer.echo(f"  per year: {per_year}")
+
+        if dry_run:
+            typer.echo("Dry run: nothing written.")
+            return
+        if not plan.to_import:
+            typer.echo("Nothing to import.")
+            return
+        total_new = 0
+        total_updated = 0
+        for start in range(0, len(plan.to_import), UPSERT_BATCH_SIZE):
+            result = store.upsert_transactions(plan.to_import[start : start + UPSERT_BATCH_SIZE])
+            total_new += result.new
+            total_updated += result.updated
+        typer.echo(
+            f"Imported {len(plan.to_import)} transactions "
+            f"(new: {total_new}, updated: {total_updated})."
+        )
+    except GoettaFinanceError as exc:
+        typer.secho(f"import transactions failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+@import_app.command("balances")
+def import_balances(
+    csv_path: Annotated[
+        Path,
+        typer.Argument(help="Normalized CSV with header: date,balance,source_file."),
+    ],
+    account: Annotated[
+        str,
+        typer.Option("--account", help="Target account id (see `goetta-finance account list`)."),
+    ],
+    before: Annotated[
+        str | None,
+        typer.Option(
+            "--before",
+            help="Only import balances dated strictly before this date (YYYY-MM-DD). "
+            "Default: the account's earliest synced transaction.",
+        ),
+    ] = None,
+    allow_overlap: Annotated[
+        bool,
+        typer.Option(
+            "--allow-overlap",
+            help="Disable the cutoff and import every row, even where synced data exists.",
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Validate and report without writing."),
+    ] = False,
+) -> None:
+    """Import historical end-of-day balance snapshots from a normalized CSV.
+
+    Balances are in store convention (liability balances negative when money
+    is owed). Snapshots land at 23:59:59 UTC on each date — that time-of-day
+    is the provenance marker (balance_snapshots has no source column), so
+    imported snapshots are identifiable via `timestamp::TIME = '23:59:59'`.
+    Existing (account, timestamp) rows always win: re-runs are no-ops, and
+    correcting a bad imported balance means deleting the row and re-importing.
+    """
+    if before is not None and allow_overlap:
+        raise typer.BadParameter(
+            "--before and --allow-overlap are mutually exclusive", param_hint="--allow-overlap"
+        )
+    before_date = _parse_before(before)
+    try:
+        rows = read_balances_csv(csv_path)
+    except GoettaFinanceError as exc:
+        typer.secho(f"import balances failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"import balances failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        target = _resolve_import_account(store, account)
+        cutoff = _import_cutoff(store, account, before_date, allow_overlap)
+        plan = plan_balance_import(build_snapshots(account, rows), cutoff)
+
+        typer.echo(f"Account: {target.id} ({target.org_name or '-'} / {target.name})")
+        typer.echo(_describe_cutoff(cutoff, before_date, allow_overlap))
+        typer.echo(f"Parsed {len(rows)} rows from {csv_path.name}")
+        typer.echo(f"  to import: {len(plan.to_import)}")
+        typer.echo(f"  skipped (overlap): {plan.skipped_overlap}")
+        if plan.to_import:
+            first = min(snap.timestamp for snap in plan.to_import).date().isoformat()
+            last = max(snap.timestamp for snap in plan.to_import).date().isoformat()
+            typer.echo(f"  date range: {first} .. {last}")
+
+        if dry_run:
+            typer.echo("Dry run: nothing written.")
+            return
+        if not plan.to_import:
+            typer.echo("Nothing to import.")
+            return
+        count_sql = "SELECT COUNT(*) AS n FROM balance_snapshots WHERE account_id = ?"
+        count_before = int(store.query_sql(count_sql, [account])[0]["n"])
+        for snap in plan.to_import:
+            store.record_balance_snapshot(snap)
+        count_after = int(store.query_sql(count_sql, [account])[0]["n"])
+        recorded = count_after - count_before
+        typer.echo(
+            f"Recorded {recorded} snapshot(s) ({len(plan.to_import) - recorded} already existed)."
+        )
+    except GoettaFinanceError as exc:
+        typer.secho(f"import balances failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
     finally:
         store.close()

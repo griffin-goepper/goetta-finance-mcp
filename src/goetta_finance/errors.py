@@ -29,3 +29,11 @@ class BridgeUnavailableError(SimpleFinError):
 
 class StoreError(GoettaFinanceError):
     """Storage backend failure (schema, query, or connection)."""
+
+
+class CsvImportError(GoettaFinanceError):
+    """A normalized-CSV import file is malformed or fails validation.
+
+    The message carries the 1-based row number where relevant. Named
+    ``CsvImportError`` (not ``ImportError``) to avoid shadowing the builtin.
+    """
