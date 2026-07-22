@@ -1046,6 +1046,85 @@ def test_remove_rule_unknown_id_raises(store: DuckDBStore) -> None:
         store.remove_rule(999999)
 
 
+# --- category_match_cache (migration 0013) ----------------------------------
+#
+# The view no longer re-matches rules on every read; matches live in a
+# cache maintained write-through by the store. The retroactivity contract
+# is unchanged and pinned above (test_add_rule_is_retroactive passes
+# through the rebuild); these tests pin the cache-specific mechanics.
+
+
+def test_migration_0013_applied(store: DuckDBStore) -> None:
+    """Pin the migration filename, same shape as the other markers."""
+    rows = store.conn.execute("SELECT name FROM schema_migrations").fetchall()
+    assert ("0013_category_match_cache.sql",) in rows
+
+
+def test_match_cache_row_written_by_upsert(store: DuckDBStore) -> None:
+    """upsert_transactions maintains the cache in the same call — no
+    separate rebuild step between a sync and a correct dashboard."""
+    _seed_cat_account(store)
+    store.upsert_transactions([_txn("t-mc-sbux", "STARBUCKS STORE #1234")])
+    dining = next(c for c in store.get_categories() if c.name == "Dining")
+    row = store.conn.execute(
+        "SELECT category_id FROM category_match_cache WHERE transaction_id = ?",
+        ["t-mc-sbux"],
+    ).fetchone()
+    assert row is not None
+    assert int(row[0]) == dining.id
+
+
+def test_upsert_update_recategorizes(store: DuckDBStore) -> None:
+    """The pending-settlement case: a re-upsert that changes the
+    description (bank finalizes the payee text) must move the matched
+    rule with it — pins the targeted refresh on ON CONFLICT UPDATE."""
+    _seed_cat_account(store)
+    store.upsert_transactions([_txn("t-settle", "ZZZ AUTH HOLD")])
+    assert store.get_transactions_with_category()[0]["category"] == "Uncategorized"
+    store.upsert_transactions([_txn("t-settle", "STARBUCKS STORE #1234")])
+    assert store.get_transactions_with_category()[0]["category"] == "Dining"
+
+
+def test_remove_rule_is_retroactive(store: DuckDBStore) -> None:
+    """The removal counterpart of test_add_rule_is_retroactive: dropping
+    a rule reverts every transaction it was categorizing on the next
+    read."""
+    _seed_cat_account(store)
+    rule_id = store.add_rule("Dining", match_type="contains", pattern="ZZZ-EPHEMERAL", priority=10)
+    store.upsert_transactions([_txn("t-eph", "ZZZ-EPHEMERAL PAYEE")])
+    assert store.get_transactions_with_category()[0]["category"] == "Dining"
+    store.remove_rule(rule_id)
+    assert store.get_transactions_with_category()[0]["category"] == "Uncategorized"
+
+
+def test_delete_stale_pending_cleans_match_cache(store: DuckDBStore) -> None:
+    """Stale pending rows take their cache rows with them, same as their
+    overrides — no orphaned bookkeeping left behind."""
+    _seed_cat_account(store)
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="p-mc-stale",
+                account_id="acc-cat",
+                posted=_utc(2026, 5, 12),
+                amount=Decimal("-4.50"),
+                description="STARBUCKS PENDING HOLD",
+                pending=True,
+            )
+        ]
+    )
+    before = store.conn.execute(
+        "SELECT COUNT(*) FROM category_match_cache WHERE transaction_id = ?", ["p-mc-stale"]
+    ).fetchone()
+    assert before is not None and int(before[0]) == 1
+    removed = store.delete_stale_pending({"acc-cat"}, set())
+    assert removed == 1
+    after = store.conn.execute(
+        "SELECT COUNT(*) FROM category_match_cache WHERE transaction_id = ?", ["p-mc-stale"]
+    ).fetchone()
+    assert after is not None and int(after[0]) == 0
+
+
 def test_add_rule_case_insensitive_category_name(store: DuckDBStore) -> None:
     """User-supplied category names resolve case-insensitively to the
     canonical row. The FK on the new rule still points at the canonical
@@ -1215,6 +1294,10 @@ def test_view_planner_under_10k_transactions(store: DuckDBStore) -> None:
         FROM range(0, 10000) AS t(i)
         """
     )
+    # The raw in-engine INSERT bypasses upsert_transactions' write-through
+    # cache maintenance (migration 0013), so rebuild explicitly — exactly
+    # the documented use of the public rebuild method.
+    store.rebuild_category_match_cache()
 
     durations_ms: list[float] = []
     for _ in range(10):

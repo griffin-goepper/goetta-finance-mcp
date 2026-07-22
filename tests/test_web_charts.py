@@ -66,8 +66,12 @@ def test_net_worth_figure_shape(store: DuckDBStore) -> None:
     assert len(fig["data"]) == 1
     trace = fig["data"][0]
     assert trace["type"] == "scatter"
-    assert len(trace["x"]) == 2  # two snapshot days
-    assert list(trace["y"]) == [100.0, 150.0]
+    # Window-boundary seed first (accounts with no snapshot at the window
+    # start carry their oldest one there, so the line starts at the window
+    # edge instead of mid-air), then the two snapshot days.
+    assert len(trace["x"]) == 3
+    assert trace["x"][0] == "2026-04-16"
+    assert list(trace["y"]) == [100.0, 100.0, 150.0]
 
 
 def test_spending_figure_has_income_and_spending_traces(store: DuckDBStore) -> None:

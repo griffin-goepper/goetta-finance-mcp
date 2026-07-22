@@ -149,21 +149,23 @@ unstable, prefer add_category_rule over categorize_transaction for
 pending rows — a rule matches the settled row no matter what id it
 arrives under, while a per-id override is dropped if the id changes.
 
-Categorization tables (migration 0004):
+Categorization tables (migrations 0004/0013):
   categories(id, name, display_color, is_default)
   category_rules(id, category_id, match_type, pattern, priority, is_default,
                  min_amount, max_amount)
   transaction_overrides(transaction_id, category_id, created_at)
+  category_match_cache(transaction_id, category_id)
 
-Per-transaction category resolves at read time through the
+Per-transaction category resolves through the
 transactions_with_category view, which exposes every transactions column
 plus `category`, `category_color`, and `account_is_hidden` (sourced from
 the JOINed accounts row — filter on it to exclude transactions belonging
 to hidden accounts). Resolution order: if a row in
 transaction_overrides exists for the transaction, that override wins;
-otherwise the lowest-priority matching rule in category_rules wins
+otherwise the transaction's matched rule wins
 (match_type 'contains' is a case-insensitive substring on description,
-match_type 'regex' is a DuckDB regexp_matches call); otherwise the
+match_type 'regex' is a DuckDB regexp_matches call; the lowest-priority
+matching rule is the match); otherwise the
 fallback literal 'Uncategorized' is returned. Rules may carry optional
 min_amount/max_amount bounds compared against the absolute value of the
 transaction amount (a rule matches when abs(amount) >= min_amount AND
@@ -172,8 +174,12 @@ refine a pattern match — a rule never matches on amount alone — and the
 max bound is exclusive, so complementary rules at the same threshold
 (e.g. SPEEDWAY under/over 20) have no gap or overlap. Rule and override
 changes apply retroactively to every existing transaction without
-backfill — this is the whole point of read-time resolution; do not
-write a category_id column on transactions.
+manual backfill; do not write a category_id column on transactions.
+category_match_cache is derived bookkeeping behind that contract: it
+holds each transaction's matched rule's category_id and is rebuilt
+automatically inside every rule/transaction write, so treat it as an
+implementation detail — query the view, never the cache, for category
+answers.
 
 For category-aware queries prefer transactions_with_category over the
 bare transactions table. For "what did I spend on X" questions prefer
