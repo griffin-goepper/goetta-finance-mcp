@@ -8,6 +8,7 @@ from goetta_finance.store.duckdb_store import DuckDBStore
 from goetta_finance.web.aggregations import (
     display_currency,
     monthly_income_spending,
+    net_worth_coverage_start,
     net_worth_series,
     recent_sync_runs,
     spending_by_category_last_n_days,
@@ -280,9 +281,10 @@ def test_net_worth_series_sums_latest_per_account(store: DuckDBStore) -> None:
 
     series = net_worth_series(store, days=30, now=datetime(2026, 5, 16, tzinfo=UTC))
     by_day = {p.day: p.balance for p in series}
-    # Day 1: a1=100. a2 hasn't appeared yet.
-    assert by_day[date(2026, 5, 1)] == Decimal("100.00")
-    # Day 2: a1=100 (latest still), a2=1000 → 1100
+    # a2's first observation is an existing balance, not a $1000 gain.
+    # It is therefore part of the opening-window baseline.
+    assert by_day[date(2026, 5, 1)] == Decimal("1100.00")
+    # Day 2 repeats a2's seeded first observation — no artificial jump.
     assert by_day[date(2026, 5, 2)] == Decimal("1100.00")
     # Day 3: a1=150 (new), a2=1000 (carried) → 1150
     assert by_day[date(2026, 5, 3)] == Decimal("1150.00")
@@ -308,6 +310,32 @@ def test_net_worth_series_respects_window(store: DuckDBStore) -> None:
     days = {p.day for p in series}
     assert old.timestamp.date() not in days
     assert recent.timestamp.date() in days
+    # The latest older snapshot seeds a synthetic opening-window point;
+    # otherwise quiet/manual accounts vanish from short-range charts.
+    assert series[0].day == (now - timedelta(days=30)).date()
+    assert series[0].balance == Decimal("999.00")
+
+
+def test_net_worth_coverage_start_is_latest_visible_first_snapshot(
+    store: DuckDBStore,
+) -> None:
+    _seed_accounts(store)
+    store.record_balance_snapshot(
+        BalanceSnapshot(
+            account_id="a1",
+            timestamp=datetime(2026, 5, 1, tzinfo=UTC),
+            balance=Decimal("100.00"),
+        )
+    )
+    store.record_balance_snapshot(
+        BalanceSnapshot(
+            account_id="a2",
+            timestamp=datetime(2026, 5, 3, tzinfo=UTC),
+            balance=Decimal("1000.00"),
+        )
+    )
+
+    assert net_worth_coverage_start(store) == date(2026, 5, 3)
 
 
 def test_net_worth_series_liability_negative_balance(store: DuckDBStore) -> None:

@@ -189,6 +189,7 @@ def test_api_summary_signed_net_worth(client: TestClient) -> None:
 def test_api_net_worth_points(client: TestClient) -> None:
     body = client.get("/api/v1/net-worth?days=90").json()
     assert body["days"] == 90
+    datetime.fromisoformat(body["complete_from"])
     assert body["points"], "expected at least one net-worth point"
     last = body["points"][-1]
     # Latest snapshots: 2500 checking + (-abs(-400)) card = 2100.
