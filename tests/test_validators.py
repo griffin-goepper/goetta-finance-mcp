@@ -26,9 +26,12 @@ from goetta_finance.validators import (
     parse_goal_period,
     parse_goal_target_date,
     parse_match_type,
+    parse_recurring_anchor,
+    parse_recurring_interval,
     validate_goal_amount,
     validate_goal_baseline,
     validate_goal_name,
+    validate_goal_recurring,
     validate_goal_shape,
     validate_rule_amount_bounds,
     validate_rule_pattern,
@@ -367,6 +370,83 @@ def test_validate_goal_baseline_pair_rules() -> None:
         validate_goal_baseline(Decimal("-5"), datetime(2026, 3, 1, tzinfo=UTC))
     with pytest.raises(GoalValidationError, match="sub-cent"):
         validate_goal_baseline(Decimal("9.999"), datetime(2026, 3, 1, tzinfo=UTC))
+
+
+def test_parse_recurring_interval_normalizes_and_rejects() -> None:
+    assert parse_recurring_interval("  Biweekly ") == "biweekly"
+    assert parse_recurring_interval("WEEKLY") == "weekly"
+    assert parse_recurring_interval("monthly") == "monthly"
+    with pytest.raises(GoalValidationError, match="'weekly', 'biweekly', or 'monthly'") as exc_info:
+        parse_recurring_interval("fortnightly")
+    assert exc_info.value.param_hint == "--recurring-interval"
+
+
+def test_parse_recurring_anchor_past_allowed() -> None:
+    """Unlike target dates, anchors in the past are the NORMAL case —
+    the payday series extends both directions from the anchor."""
+    assert parse_recurring_anchor(None) is None
+    assert parse_recurring_anchor("2026-01-09") == date(2026, 1, 9)
+    assert parse_recurring_anchor("2000-01-01") == date(2000, 1, 1)  # no future check
+    with pytest.raises(GoalValidationError, match="YYYY-MM-DD") as exc_info:
+        parse_recurring_anchor("Jan 9th")
+    assert exc_info.value.param_hint == "--recurring-anchor"
+
+
+def test_validate_goal_recurring_triple_rules() -> None:
+    validate_goal_recurring(None, None, None)  # no raise
+    validate_goal_recurring(Decimal("150.00"), "biweekly", date(2026, 1, 9))  # no raise
+    for partial in (
+        (Decimal("150.00"), None, None),
+        (None, "biweekly", None),
+        (None, None, date(2026, 1, 9)),
+        (Decimal("150.00"), "biweekly", None),
+    ):
+        with pytest.raises(GoalValidationError, match="provided together") as exc_info:
+            validate_goal_recurring(*partial)
+        assert exc_info.value.param_hint == "--recurring"
+    with pytest.raises(GoalValidationError, match="positive"):
+        validate_goal_recurring(Decimal("-5"), "biweekly", date(2026, 1, 9))
+    with pytest.raises(GoalValidationError, match="sub-cent"):
+        validate_goal_recurring(Decimal("9.999"), "biweekly", date(2026, 1, 9))
+    with pytest.raises(GoalValidationError, match="'weekly', 'biweekly', or 'monthly'"):
+        validate_goal_recurring(Decimal("50"), "fortnightly", date(2026, 1, 9))
+
+
+def test_validate_goal_shape_recurring_only_on_contribution() -> None:
+    with pytest.raises(GoalValidationError, match="only apply to contribution"):
+        validate_goal_shape(
+            "balance",
+            category=None,
+            period=None,
+            account_id="a1",
+            direction="at_least",
+            target_date=None,
+            recurring_amount=Decimal("50"),
+            recurring_interval="biweekly",
+            recurring_anchor=date(2026, 1, 9),
+        )
+    # Contribution accepts the full triple.
+    validate_goal_shape(
+        "contribution",
+        category=None,
+        period="year",
+        account_id="a1",
+        direction=None,
+        target_date=None,
+        recurring_amount=Decimal("150.00"),
+        recurring_interval="biweekly",
+        recurring_anchor=date(2026, 1, 9),
+    )  # no raise
+    with pytest.raises(GoalValidationError, match="provided together"):
+        validate_goal_shape(
+            "contribution",
+            category=None,
+            period="year",
+            account_id="a1",
+            direction=None,
+            target_date=None,
+            recurring_amount=Decimal("150.00"),
+        )
 
 
 def test_parse_goal_baseline_date_parses_and_bounds() -> None:

@@ -1176,8 +1176,11 @@ class DuckDBStore:
         match_pattern: str | None = None,
         baseline_amount: Decimal | None = None,
         baseline_date: datetime | None = None,
+        recurring_amount: Decimal | None = None,
+        recurring_interval: str | None = None,
+        recurring_anchor: date | None = None,
     ) -> Goal:
-        """Insert a goal (migrations 0008/0014). Returns the stored Goal.
+        """Insert a goal (migrations 0008/0014/0015). Returns the stored Goal.
 
         Re-checks the per-kind column shape with friendly errors before
         the table CHECK constraint gets a chance to produce raw SQL
@@ -1219,17 +1222,41 @@ class DuckDBStore:
             raise StoreError(
                 f"kind must be 'spending_cap', 'balance', or 'contribution', got {kind!r}"
             )
+        recurring_fields = (recurring_amount, recurring_interval, recurring_anchor)
         if kind != "contribution":
             if match_type is not None or match_pattern is not None:
                 raise StoreError("match_type/match_pattern only apply to contribution goals")
             if baseline_amount is not None or baseline_date is not None:
                 raise StoreError("baseline_amount/baseline_date only apply to contribution goals")
+            if any(f is not None for f in recurring_fields):
+                raise StoreError("recurring contributions only apply to contribution goals")
         if (match_type is None) != (match_pattern is None):
             raise StoreError("match_type and match_pattern must be provided together")
         if match_type is not None and match_type not in ("contains", "regex"):
             raise StoreError(f"match_type must be 'contains' or 'regex', got {match_type!r}")
         if (baseline_amount is None) != (baseline_date is None):
             raise StoreError("baseline_amount and baseline_date must be provided together")
+        # The recurring triple travels all-or-none. 0015 is plain ALTERs
+        # (no table CHECK), so this application-layer check is the only
+        # write-time gate besides validators.py — keep them agreeing.
+        if any(f is not None for f in recurring_fields) and any(
+            f is None for f in recurring_fields
+        ):
+            raise StoreError(
+                "recurring_amount, recurring_interval, and recurring_anchor "
+                "must be provided together"
+            )
+        if recurring_interval is not None and recurring_interval not in (
+            "weekly",
+            "biweekly",
+            "monthly",
+        ):
+            raise StoreError(
+                f"recurring_interval must be 'weekly', 'biweekly', or 'monthly', "
+                f"got {recurring_interval!r}"
+            )
+        if recurring_amount is not None and recurring_amount <= 0:
+            raise StoreError(f"recurring_amount must be positive, got {recurring_amount}")
         with self._lock:
             dup_row = self.conn.execute(
                 "SELECT 1 FROM goals WHERE lower(name) = lower(?)", [name]
@@ -1269,8 +1296,9 @@ class DuckDBStore:
                     INSERT INTO goals
                         (name, kind, amount, category_id, period,
                          account_id, direction, target_date,
-                         match_type, match_pattern, baseline_amount, baseline_date)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         match_type, match_pattern, baseline_amount, baseline_date,
+                         recurring_amount, recurring_interval, recurring_anchor)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     RETURNING id, created_at
                     """,
                     [
@@ -1286,6 +1314,9 @@ class DuckDBStore:
                         match_pattern,
                         baseline_amount,
                         _to_naive_utc(baseline_date),
+                        recurring_amount,
+                        recurring_interval,
+                        recurring_anchor,
                     ],
                 ).fetchone()
             except duckdb.Error as exc:
@@ -1311,6 +1342,9 @@ class DuckDBStore:
             match_pattern=match_pattern,
             baseline_amount=baseline_amount,
             baseline_date=_from_naive_utc(_to_naive_utc(baseline_date)),
+            recurring_amount=recurring_amount,
+            recurring_interval=recurring_interval,
+            recurring_anchor=recurring_anchor,
             created_at=created_at,
         )
 
@@ -1322,7 +1356,8 @@ class DuckDBStore:
                 SELECT g.id, g.name, g.kind, g.amount, g.category_id, c.name,
                        g.period, g.account_id, a.name, g.direction,
                        g.target_date, g.created_at, g.match_type, g.match_pattern,
-                       g.baseline_amount, g.baseline_date
+                       g.baseline_amount, g.baseline_date, g.recurring_amount,
+                       g.recurring_interval, g.recurring_anchor
                 FROM goals g
                 LEFT JOIN categories c ON c.id = g.category_id
                 LEFT JOIN accounts a ON a.id = g.account_id
@@ -1359,6 +1394,9 @@ class DuckDBStore:
             match_pattern=row[13],
             baseline_amount=Decimal(row[14]) if row[14] is not None else None,
             baseline_date=_from_naive_utc(row[15]),
+            recurring_amount=Decimal(row[16]) if row[16] is not None else None,
+            recurring_interval=row[17],
+            recurring_anchor=row[18],
             created_at=created_at,
         )
 

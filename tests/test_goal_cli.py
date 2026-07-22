@@ -329,6 +329,92 @@ def test_goal_add_contribution_baseline_pair_enforced(fresh_home: Path) -> None:
     assert "provided together" in result.output
 
 
+def test_goal_add_contribution_recurring_happy_path(fresh_home: Path) -> None:
+    """--recurring with only an anchor: interval defaults to biweekly."""
+    _seed_manual_account(fresh_home)
+    result = runner.invoke(
+        app,
+        [
+            "goal",
+            "add-contribution",
+            "MANUAL-sav",
+            "--target",
+            "4400",
+            "--period",
+            "year",
+            "--recurring",
+            "150.00",
+            "--recurring-anchor",
+            "2026-01-09",
+            "--name",
+            "HSA 2026",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert 'Added goal "HSA 2026"' in result.output
+    store = DuckDBStore(fresh_home / "data.duckdb")
+    try:
+        goal = store.list_goals()[0]
+        assert goal.recurring_amount == Decimal("150.00")
+        assert goal.recurring_interval == "biweekly"  # defaulted
+        assert goal.recurring_anchor is not None
+        assert goal.recurring_anchor.isoformat() == "2026-01-09"
+    finally:
+        store.close()
+
+
+def test_goal_add_contribution_recurring_requires_anchor(fresh_home: Path) -> None:
+    _seed_manual_account(fresh_home)
+    result = runner.invoke(
+        app,
+        ["goal", "add-contribution", "MANUAL-sav", "--target", "4400", "--recurring", "150.00"],
+    )
+    assert result.exit_code == 2
+    assert "provided together" in result.output
+
+
+def test_goal_add_contribution_recurring_interval_alone_rejected(fresh_home: Path) -> None:
+    """--recurring-interval without --recurring is a dangling flag, not
+    a silent no-op."""
+    _seed_manual_account(fresh_home)
+    result = runner.invoke(
+        app,
+        [
+            "goal",
+            "add-contribution",
+            "MANUAL-sav",
+            "--target",
+            "4400",
+            "--recurring-interval",
+            "weekly",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "provided together" in result.output
+
+
+def test_goal_add_contribution_recurring_bad_interval(fresh_home: Path) -> None:
+    _seed_manual_account(fresh_home)
+    result = runner.invoke(
+        app,
+        [
+            "goal",
+            "add-contribution",
+            "MANUAL-sav",
+            "--target",
+            "4400",
+            "--recurring",
+            "150.00",
+            "--recurring-interval",
+            "fortnightly",
+            "--recurring-anchor",
+            "2026-01-09",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "biweekly" in result.output
+
+
 def test_goal_add_contribution_future_baseline_date(fresh_home: Path) -> None:
     _seed_account(fresh_home)
     result = runner.invoke(

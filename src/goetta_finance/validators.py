@@ -265,6 +265,69 @@ def parse_goal_baseline_date(value: str | None, *, now: datetime | None = None) 
     return parsed
 
 
+_RECURRING_INTERVALS = ("weekly", "biweekly", "monthly")
+
+
+def parse_recurring_interval(value: str) -> str:
+    """Normalize and validate a recurring interval
+    ('weekly' | 'biweekly' | 'monthly')."""
+    lowered = value.strip().lower()
+    if lowered not in _RECURRING_INTERVALS:
+        raise GoalValidationError(
+            f"recurring interval must be 'weekly', 'biweekly', or 'monthly', got {value!r}",
+            param_hint="--recurring-interval",
+        )
+    return lowered
+
+
+def parse_recurring_anchor(value: str | None) -> date | None:
+    """Parse an optional ISO recurring-anchor date.
+
+    Past anchors are ALLOWED (unlike target dates): the payday series
+    extends both directions from the anchor, so "first payday of the
+    year" is the natural way to declare a schedule mid-year. Future
+    anchors are allowed for the same reason.
+    """
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(value.strip())
+    except ValueError as exc:
+        raise GoalValidationError(
+            f"recurring anchor must be YYYY-MM-DD, got {value!r}",
+            param_hint="--recurring-anchor",
+        ) from exc
+
+
+def validate_goal_recurring(
+    recurring_amount: Decimal | None,
+    recurring_interval: str | None,
+    recurring_anchor: date | None,
+) -> None:
+    """Recurring-schedule triple consistency for contribution goals.
+
+    All-three-or-none (an amount without a schedule, or a schedule
+    without an amount, accrues nothing meaningful); the amount passes
+    the same sanity bounds as goal amounts; the interval is whitelisted.
+    Application-enforced only — migration 0015 is plain ALTERs with no
+    table CHECK — so this and ``DuckDBStore.add_goal`` are the gates.
+    """
+    fields = (recurring_amount, recurring_interval, recurring_anchor)
+    if any(f is not None for f in fields) and any(f is None for f in fields):
+        raise GoalValidationError(
+            "recurring amount, interval, and anchor must be provided together",
+            param_hint="--recurring",
+        )
+    if recurring_amount is not None:
+        validate_goal_amount(recurring_amount, param_hint="--recurring")
+    if recurring_interval is not None and recurring_interval not in _RECURRING_INTERVALS:
+        raise GoalValidationError(
+            f"recurring interval must be 'weekly', 'biweekly', or 'monthly', "
+            f"got {recurring_interval!r}",
+            param_hint="--recurring-interval",
+        )
+
+
 def validate_goal_baseline(baseline_amount: Decimal | None, baseline_date: datetime | None) -> None:
     """Baseline pair consistency for contribution goals.
 
@@ -294,8 +357,13 @@ def validate_goal_shape(
     match_pattern: str | None = None,
     baseline_amount: Decimal | None = None,
     baseline_date: datetime | None = None,
+    recurring_amount: Decimal | None = None,
+    recurring_interval: str | None = None,
+    recurring_anchor: date | None = None,
 ) -> None:
-    """Cross-field check mirroring the goals table's CHECK constraints.
+    """Cross-field check mirroring the goals table's CHECK constraints
+    (plus the 0015 recurring rules, which have NO table CHECK — DuckDB
+    can't ALTER one in; this and the store are the write-time gates).
 
     The CLI commands satisfy this by construction (each command only
     exposes its kind's flags); the MCP ``set_goal`` tool takes the full
@@ -312,6 +380,15 @@ def validate_goal_shape(
             raise GoalValidationError(
                 "baseline_amount/baseline_date only apply to contribution goals",
                 param_hint="--baseline",
+            )
+        if (
+            recurring_amount is not None
+            or recurring_interval is not None
+            or recurring_anchor is not None
+        ):
+            raise GoalValidationError(
+                "recurring contributions only apply to contribution goals",
+                param_hint="--recurring",
             )
     if kind == "spending_cap":
         if category is None or period is None:
@@ -352,6 +429,7 @@ def validate_goal_shape(
                 param_hint="--pattern",
             )
         validate_goal_baseline(baseline_amount, baseline_date)
+        validate_goal_recurring(recurring_amount, recurring_interval, recurring_anchor)
     else:
         raise GoalValidationError(
             f"kind must be 'spending_cap', 'balance', or 'contribution', got {kind!r}",
