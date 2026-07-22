@@ -17,7 +17,7 @@ exception-translation belongs here.
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 PATTERN_MAX_LEN = 500
@@ -133,7 +133,7 @@ GOAL_NAME_MAX_LEN = 100
 # loudly at write time rather than produce a goal that can never move.
 GOAL_AMOUNT_MAX = Decimal("1000000000")
 
-_GOAL_KINDS = ("spending_cap", "balance")
+_GOAL_KINDS = ("spending_cap", "balance", "contribution")
 _GOAL_PERIODS = ("month", "year")
 _GOAL_DIRECTIONS = ("at_least", "at_most")
 
@@ -187,7 +187,7 @@ def parse_goal_kind(value: str) -> str:
     lowered = value.strip().lower()
     if lowered not in _GOAL_KINDS:
         raise GoalValidationError(
-            f"kind must be 'spending_cap' or 'balance', got {value!r}",
+            f"kind must be 'spending_cap', 'balance', or 'contribution', got {value!r}",
             param_hint="--kind",
         )
     return lowered
@@ -237,6 +237,51 @@ def parse_goal_target_date(value: str | None, *, today: date | None = None) -> d
     return parsed
 
 
+def parse_goal_baseline_date(value: str | None, *, now: datetime | None = None) -> datetime | None:
+    """Parse an optional ISO baseline date/datetime to tz-aware UTC.
+
+    A date-only value becomes midnight UTC of that day; naive datetimes
+    are taken as UTC (the storage convention). Must not be in the
+    future — a baseline records contributions already made, so it lands
+    in a real period. ``now`` is injectable for tests.
+    """
+    if value is None:
+        return None
+    text = value.strip()
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise GoalValidationError(
+            f"baseline date must be ISO format (YYYY-MM-DD), got {value!r}",
+            param_hint="--baseline-date",
+        ) from exc
+    parsed = parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    reference = now if now is not None else datetime.now(tz=UTC)
+    if parsed > reference:
+        raise GoalValidationError(
+            f"baseline date cannot be in the future, got {text}",
+            param_hint="--baseline-date",
+        )
+    return parsed
+
+
+def validate_goal_baseline(baseline_amount: Decimal | None, baseline_date: datetime | None) -> None:
+    """Baseline pair consistency for contribution goals.
+
+    Both-or-neither (a baseline amount is meaningless without the
+    period it lands in, and vice versa); the amount passes the same
+    sanity bounds as goal amounts. The not-in-the-future rule lives in
+    :func:`parse_goal_baseline_date` — both surfaces parse through it.
+    """
+    if (baseline_amount is None) != (baseline_date is None):
+        raise GoalValidationError(
+            "baseline amount and baseline date must be provided together",
+            param_hint="--baseline",
+        )
+    if baseline_amount is not None:
+        validate_goal_amount(baseline_amount, param_hint="--baseline")
+
+
 def validate_goal_shape(
     kind: str,
     *,
@@ -245,14 +290,29 @@ def validate_goal_shape(
     account_id: str | None,
     direction: str | None,
     target_date: date | None,
+    match_type: str | None = None,
+    match_pattern: str | None = None,
+    baseline_amount: Decimal | None = None,
+    baseline_date: datetime | None = None,
 ) -> None:
-    """Cross-field check mirroring the goals table's CHECK constraint.
+    """Cross-field check mirroring the goals table's CHECK constraints.
 
     The CLI commands satisfy this by construction (each command only
     exposes its kind's flags); the MCP ``set_goal`` tool takes the full
     flat parameter set and needs it. The store re-enforces via the SQL
     CHECK as the backstop.
     """
+    if kind != "contribution":
+        if match_type is not None or match_pattern is not None:
+            raise GoalValidationError(
+                "match_type/match_pattern only apply to contribution goals",
+                param_hint="--pattern",
+            )
+        if baseline_amount is not None or baseline_date is not None:
+            raise GoalValidationError(
+                "baseline_amount/baseline_date only apply to contribution goals",
+                param_hint="--baseline",
+            )
     if kind == "spending_cap":
         if category is None or period is None:
             raise GoalValidationError(
@@ -275,9 +335,26 @@ def validate_goal_shape(
                 "balance goals do not take a category or period",
                 param_hint="--direction",
             )
+    elif kind == "contribution":
+        if account_id is None or period is None:
+            raise GoalValidationError(
+                "contribution goals require an account_id and a period",
+                param_hint="--period",
+            )
+        if category is not None or direction is not None or target_date is not None:
+            raise GoalValidationError(
+                "contribution goals do not take a category, direction, or target_date",
+                param_hint="--period",
+            )
+        if (match_type is None) != (match_pattern is None):
+            raise GoalValidationError(
+                "match_type and match_pattern must be provided together",
+                param_hint="--pattern",
+            )
+        validate_goal_baseline(baseline_amount, baseline_date)
     else:
         raise GoalValidationError(
-            f"kind must be 'spending_cap' or 'balance', got {kind!r}",
+            f"kind must be 'spending_cap', 'balance', or 'contribution', got {kind!r}",
             param_hint="--kind",
         )
 

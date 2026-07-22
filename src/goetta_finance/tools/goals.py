@@ -25,13 +25,18 @@ from goetta_finance.tools._serialize import serialize_value
 from goetta_finance.tools.categorize import _suggest_category
 from goetta_finance.validators import (
     GoalValidationError,
+    RulePatternError,
+    parse_goal_baseline_date,
     parse_goal_direction,
     parse_goal_kind,
     parse_goal_period,
     parse_goal_target_date,
+    parse_match_type,
     validate_goal_amount,
+    validate_goal_baseline,
     validate_goal_name,
     validate_goal_shape,
+    validate_rule_pattern,
 )
 
 
@@ -63,6 +68,12 @@ def list_goals(store: FinanceStore) -> list[dict[str, Any]]:
                 "required_monthly": serialize_value(progress.required_monthly),
                 "projected_date": serialize_value(progress.projected_date),
                 "pending_delta": serialize_value(progress.pending_delta),
+                # Contribution-goal definition fields (migration 0014);
+                # null on every other kind — the wire shape is uniform.
+                "match_type": goal.match_type,
+                "match_pattern": goal.match_pattern,
+                "baseline_amount": serialize_value(goal.baseline_amount),
+                "baseline_date": serialize_value(goal.baseline_date),
             }
         )
     return out
@@ -79,8 +90,20 @@ def set_goal(
     account_id: str | None = None,
     direction: str | None = None,
     target_date: str | None = None,
+    match_type: str | None = None,
+    match_pattern: str | None = None,
+    baseline_amount: Decimal | None = None,
+    baseline_date: str | None = None,
 ) -> dict[str, Any]:
-    """Create a goal. Validates first (shared validators), then writes."""
+    """Create a goal. Validates first (shared validators), then writes.
+
+    ``match_pattern`` is an MCP-reachable regex write surface (the goal
+    pattern runs against every future feed row), so it goes through the
+    SAME ``validate_rule_pattern`` as category rules and transfer
+    links — identical gating to the CLI. ``match_type`` defaults to
+    'contains' when a pattern is given without one, mirroring the CLI
+    flag default.
+    """
     try:
         normalized_kind = parse_goal_kind(kind)
         goal_name = validate_goal_name(name)
@@ -88,6 +111,14 @@ def set_goal(
         normalized_period = parse_goal_period(period) if period is not None else None
         normalized_direction = parse_goal_direction(direction) if direction is not None else None
         parsed_target_date = parse_goal_target_date(target_date)
+        normalized_match_type: str | None = None
+        if match_pattern is not None:
+            normalized_match_type = parse_match_type(match_type if match_type else "contains")
+            validate_rule_pattern(match_pattern, normalized_match_type)
+        elif match_type is not None:
+            raise GoalValidationError("match_type requires a match_pattern", param_hint="--pattern")
+        parsed_baseline_date = parse_goal_baseline_date(baseline_date)
+        validate_goal_baseline(baseline_amount, parsed_baseline_date)
         validate_goal_shape(
             normalized_kind,
             category=category,
@@ -95,8 +126,12 @@ def set_goal(
             account_id=account_id,
             direction=normalized_direction,
             target_date=parsed_target_date,
+            match_type=normalized_match_type,
+            match_pattern=match_pattern,
+            baseline_amount=baseline_amount,
+            baseline_date=parsed_baseline_date,
         )
-    except GoalValidationError as exc:
+    except (GoalValidationError, RulePatternError) as exc:
         return {"ok": False, "error": f"goal validation failed: {exc}"}
     try:
         goal = store.add_goal(
@@ -108,6 +143,10 @@ def set_goal(
             account_id=account_id,
             direction=normalized_direction,
             target_date=parsed_target_date,
+            match_type=normalized_match_type,
+            match_pattern=match_pattern,
+            baseline_amount=baseline_amount,
+            baseline_date=parsed_baseline_date,
         )
     except StoreError as exc:
         message = str(exc)

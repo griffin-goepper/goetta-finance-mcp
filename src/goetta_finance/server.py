@@ -111,7 +111,8 @@ Schema:
   sync_runs(id, started_at, finished_at, accounts_touched, transactions_new,
             transactions_updated, warnings, errors)
   goals(id, name, kind, amount, category_id, period, account_id, direction,
-        target_date, created_at)
+        target_date, match_type, match_pattern, baseline_amount, baseline_date,
+        created_at)
   transfer_links(id, account_id, source_account_id, match_type, pattern,
                  anchor, created_at)
   transfer_link_applications(transaction_id, account_id, link_id, amount,
@@ -211,19 +212,32 @@ existing ones with `category set-spending <name> <bool>`. The
 spending_by_category tool joins categories on the resolved name and
 filters WHERE c.is_spending = TRUE by default.
 
-The goals table (migration 0008) holds user-defined thresholds with a
-kind discriminator: 'spending_cap' rows set category_id + period
+The goals table (migrations 0008/0014) holds user-defined thresholds
+with a kind discriminator: 'spending_cap' rows set category_id + period
 ('month'|'year'), 'balance' rows set account_id + direction
-('at_least'|'at_most') and an optional target_date. Goal status and
-progress are NOT stored — they are computed at read time (the same
-retroactivity property as the categorization view: recategorizing a
-transaction changes goal progress with no backfill). Spending caps use
-the same net-spending semantics as spending_by_category over UTC
-calendar buckets. Balance goals on is_liability accounts evaluate the
-absolute balance (amount owed): at_most is a debt ceiling, at_least a
-savings floor. Prefer the list_goals tool over ad-hoc SQL on this
-table — it carries the computed status, pace, and projection fields.
-Goal writes go through set_goal / remove_goal, not sql_query.
+('at_least'|'at_most') and an optional target_date, 'contribution' rows
+set account_id + period plus optional match_type/match_pattern and
+baseline_amount/baseline_date (each pair travels together, contribution
+only). Goal status and progress are NOT stored — they are computed at
+read time (the same retroactivity property as the categorization view:
+recategorizing a transaction changes goal progress with no backfill).
+Spending caps use the same net-spending semantics as
+spending_by_category over UTC calendar buckets. Balance goals on
+is_liability accounts evaluate the absolute balance (amount owed):
+at_most is a debt ceiling, at_least a savings floor. Contribution goals
+("contribute at least $X into account Y per month/year") count money
+INTO the goal's own account per UTC calendar bucket: the
+absolute value of matched SETTLED transactions on the account (pattern
+against description OR payee, same contains/regex semantics as transfer
+links; abs() because brokerages often sign cash-in negative), plus the
+account's transfer_link_applications rows posted in the period (already
+signed money-in — a linked manual account needs no pattern), plus
+baseline_amount when baseline_date falls in the period (contributions
+made before the feed's history). Ahead of the funding clock is on_track
+for contributions — the inverse of caps. Prefer the
+list_goals tool over ad-hoc SQL on this table — it carries the
+computed status, pace, and projection fields. Goal writes go through
+set_goal / remove_goal, not sql_query.
 
 The transfer_links table (migration 0012) connects a manual account to
 matching transactions on a synced account (pattern against payee OR
@@ -597,11 +611,19 @@ def build_server(
             "target_date is set), and pending_delta (sum of still-pending "
             "linked transfers, counted into the balance when they settle; "
             "positive = approaching; null when the account has no transfer "
-            "links). status is one of on_track / at_risk / "
-            "over / met, evaluated at read time — recategorizing "
+            "links). Contribution goals report money contributed INTO the "
+            "account this calendar month/year: the ABSOLUTE value of settled "
+            "transactions matching the goal's pattern (brokerages often sign "
+            "cash-in negative) plus applied linked transfers plus any "
+            "baseline, with pending matches previewed in "
+            "pending_delta and required_monthly on unmet year goals; "
+            "being ahead of the clock "
+            "is on_track (the inverse of caps). status is one of on_track / "
+            "at_risk / over / met, evaluated at read time — recategorizing "
             "transactions retroactively changes progress. Use when the "
-            "user asks about budgets, caps, savings targets, or debt "
-            "paydown. To create or delete goals use set_goal / remove_goal."
+            "user asks about budgets, caps, savings targets, debt "
+            "paydown, or contribution/funding pace (IRA, HSA, savings). "
+            "To create or delete goals use set_goal / remove_goal."
         )
     )
     def list_goals() -> list[dict[str, Any]]:
@@ -617,7 +639,19 @@ def build_server(
             "savings targets and emergency-fund floors, 'at_most' for debt "
             "ceilings/paydown (liability accounts evaluate the absolute "
             "balance = amount owed); target_date (YYYY-MM-DD, future) is "
-            "optional and enables required-per-month pace tracking. amount "
+            "optional and enables required-per-month pace tracking. "
+            "kind='contribution' requires account_id + period: contribute at "
+            "least amount INTO that account per calendar period, counted "
+            "from the account's own data. Synced accounts need "
+            "match_pattern (matched against description OR payee; matched "
+            "amounts count by ABSOLUTE value since brokerages often sign "
+            "cash-in negative) — e.g. a Roth IRA: kind='contribution', "
+            "amount=7500, period='year', match_pattern='CASH CONTRIBUTION "
+            "CURRENT YEAR', match_type='contains'. Manual accounts fed by "
+            "transfer links need no pattern — the applied-transfer ledger "
+            "already counts money in. baseline_amount + baseline_date "
+            "(ISO, not future) credit contributions made before the feed's "
+            "history to the period containing that date. amount "
             "must be positive, at most two decimal places. name must be "
             "unique. Errors return {ok: false, error} with a did-you-mean "
             "suggestion for category typos — fix and retry. Confirm the "
@@ -648,6 +682,45 @@ def build_server(
             str | None,
             Field(description="Balance goals only: optional future deadline, YYYY-MM-DD."),
         ] = None,
+        match_type: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Contribution goals only: 'contains' (default when "
+                    "match_pattern is given) or 'regex'."
+                )
+            ),
+        ] = None,
+        match_pattern: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Contribution goals only: pattern matched against the "
+                    "account's own transaction description OR payee; matched "
+                    "amounts count by absolute value. Required for synced "
+                    "accounts, optional for manual accounts with transfer links."
+                )
+            ),
+        ] = None,
+        baseline_amount: Annotated[
+            float | None,
+            Field(
+                description=(
+                    "Contribution goals only: contributions already made "
+                    "before the feed's history; requires baseline_date."
+                )
+            ),
+        ] = None,
+        baseline_date: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Contribution goals only: ISO date the baseline was "
+                    "reached (not future); counted into the period "
+                    "containing it. Requires baseline_amount."
+                )
+            ),
+        ] = None,
     ) -> dict[str, Any]:
         # The only float in goal math is this wire boundary. str() gives
         # the shortest round-trip repr, so two-decimal JSON inputs convert
@@ -664,6 +737,10 @@ def build_server(
             account_id=account_id,
             direction=direction,
             target_date=target_date,
+            match_type=match_type,
+            match_pattern=match_pattern,
+            baseline_amount=Decimal(str(baseline_amount)) if baseline_amount is not None else None,
+            baseline_date=baseline_date,
         )
 
     @mcp.tool(

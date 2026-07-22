@@ -301,6 +301,89 @@ async def test_server_goal_tools_e2e(store: DuckDBStore) -> None:
 
 
 @pytest.mark.anyio
+async def test_server_contribution_goal_e2e(store: DuckDBStore) -> None:
+    """Contribution goal through the real FastMCP parameter path: the
+    new optional args (incl. the float baseline_amount wire boundary)
+    reach the shared validators and the stored goal round-trips with
+    computed progress and the four definition fields."""
+    now = datetime.now(tz=UTC)
+    store.upsert_accounts(
+        [
+            Account(
+                id="roth-e2e",
+                org_name="Fidelity",
+                name="ROTH IRA",
+                balance=Decimal("21000.00"),
+                balance_date=now,
+                type=AccountType.INVESTMENT,
+            )
+        ]
+    )
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="roth-e2e-t1",
+                account_id="roth-e2e",
+                posted=now,
+                amount=Decimal("-500.00"),  # Fidelity signs cash-in negative
+                description="CASH CONTRIBUTION CURRENT YEAR (Cash)",
+            )
+        ]
+    )
+    # First day of the current UTC year: always in the past, always
+    # inside the goal's current year period — keeps the test date-proof.
+    baseline_day = f"{now.year}-01-01"
+    mcp = build_server(store)
+    async with create_connected_server_and_client_session(mcp) as session:
+        await session.initialize()
+        result = await session.call_tool(
+            "set_goal",
+            {
+                "name": "Roth IRA 2026",
+                "kind": "contribution",
+                "amount": 7500,
+                "account_id": "roth-e2e",
+                "period": "year",
+                "match_pattern": "CASH CONTRIBUTION CURRENT YEAR",
+                "match_type": "contains",
+                "baseline_amount": 3000.00,
+                "baseline_date": baseline_day,
+            },
+        )
+        payload = _decode(result)
+        assert payload["ok"] is True, payload
+
+        result = await session.call_tool("list_goals", {})
+        goal = next(g for g in _decode(result) if g["name"] == "Roth IRA 2026")
+        assert goal["kind"] == "contribution"
+        assert goal["match_type"] == "contains"
+        assert goal["match_pattern"] == "CASH CONTRIBUTION CURRENT YEAR"
+        assert goal["baseline_amount"] == "3000.00"
+        assert goal["baseline_date"].startswith(baseline_day)
+        # 3000 baseline + abs(-500) matched, both inside the current year.
+        assert goal["current"] == "3500.00"
+        assert goal["target"] == "7500.00"
+        assert goal["direction"] is None
+        assert goal["target_date"] is None
+        assert goal["status"] in ("on_track", "at_risk")
+
+        # Synced account without a pattern is refused through this path.
+        result = await session.call_tool(
+            "set_goal",
+            {
+                "name": "patternless",
+                "kind": "contribution",
+                "amount": 100,
+                "account_id": "roth-e2e",
+                "period": "month",
+            },
+        )
+        payload = _decode(result)
+        assert payload["ok"] is False
+        assert "need a match_pattern" in payload["error"]
+
+
+@pytest.mark.anyio
 async def test_server_set_goal_rejects_bad_shape_e2e(store: DuckDBStore) -> None:
     """The MCP write surface refuses cross-field shape violations —
     same validator as the CLI, through the real FastMCP path."""
@@ -407,6 +490,10 @@ def test_schema_hint_mentions_categorization_tables() -> None:
         "transfer_links",
         "transfer_link_applications",
         "pending",
+        "contribution",
+        "match_pattern",
+        "baseline_amount",
+        "baseline_date",
     ):
         assert marker in SQL_SCHEMA_HINT, f"SQL_SCHEMA_HINT missing {marker!r}"
 
@@ -442,6 +529,10 @@ def test_schema_hint_communicates_categorization_semantics() -> None:
         "true-up",  # set-balance stays authoritative; captures interest
         "in-flight snapshot",  # pending rows are replaced each sync, not history
         "reissue the id",  # pending id instability → prefer rules over overrides
+        "absolute value of matched",  # contribution abs-sum sign convention (0014)
+        "sign cash-in negative",  # why abs: brokerage feed signing (0014)
+        "needs no pattern",  # linked manual accounts work with zero config (0014)
+        "inverse of caps",  # ahead-of-clock is on_track for contributions (0014)
     ]
     for phrase in expected_phrases:
         assert phrase in SQL_SCHEMA_HINT, (
