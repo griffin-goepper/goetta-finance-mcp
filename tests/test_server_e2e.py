@@ -382,6 +382,35 @@ async def test_server_contribution_goal_e2e(store: DuckDBStore) -> None:
         assert payload["ok"] is False
         assert "need a match_pattern" in payload["error"]
 
+        # Declared recurring schedule through the real parameter path
+        # (0015): float wire amount, interval defaulted to biweekly.
+        result = await session.call_tool(
+            "set_goal",
+            {
+                "name": "Payroll 401k",
+                "kind": "contribution",
+                "amount": 4400,
+                "account_id": "roth-e2e",
+                "period": "year",
+                "match_pattern": "CASH CONTRIBUTION CURRENT YEAR",
+                "recurring_amount": 150.00,
+                "recurring_anchor": baseline_day,
+            },
+        )
+        payload = _decode(result)
+        assert payload["ok"] is True, payload
+        result = await session.call_tool("list_goals", {})
+        goals = _decode(result)
+        recurring = next(g for g in goals if g["name"] == "Payroll 401k")
+        assert recurring["recurring_amount"] == "150.00"
+        assert recurring["recurring_interval"] == "biweekly"  # defaulted
+        assert recurring["recurring_anchor"] == baseline_day
+        # Every other entry carries the keys as nulls (uniform wire shape).
+        other = next(g for g in goals if g["name"] == "Roth IRA 2026")
+        assert other["recurring_amount"] is None
+        assert other["recurring_interval"] is None
+        assert other["recurring_anchor"] is None
+
 
 @pytest.mark.anyio
 async def test_server_set_goal_rejects_bad_shape_e2e(store: DuckDBStore) -> None:
@@ -494,6 +523,9 @@ def test_schema_hint_mentions_categorization_tables() -> None:
         "match_pattern",
         "baseline_amount",
         "baseline_date",
+        "recurring_amount",
+        "recurring_interval",
+        "recurring_anchor",
     ):
         assert marker in SQL_SCHEMA_HINT, f"SQL_SCHEMA_HINT missing {marker!r}"
 
@@ -533,6 +565,9 @@ def test_schema_hint_communicates_categorization_semantics() -> None:
         "sign cash-in negative",  # why abs: brokerage feed signing (0014)
         "needs no pattern",  # linked manual accounts work with zero config (0014)
         "inverse of caps",  # ahead-of-clock is on_track for contributions (0014)
+        "declared, not observed",  # recurring accrual is calculated, no feed (0015)
+        "clamped to the month end",  # monthly payday day-of-month clamp (0015)
+        "all-or-none",  # recurring triple has NO table CHECK — app-enforced (0015)
     ]
     for phrase in expected_phrases:
         assert phrase in SQL_SCHEMA_HINT, (

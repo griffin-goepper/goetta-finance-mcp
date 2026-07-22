@@ -307,6 +307,11 @@ goetta-finance goal add-contribution <ira-id> --target 7500 --period year \
     --pattern "CASH CONTRIBUTION CURRENT YEAR" --baseline 3000 --baseline-date 2026-03-01
 goetta-finance goal add-contribution <manual-savings-id> --target 800   # linked manual: no pattern needed
 
+# Declare a recurring contribution no feed can see (payroll deduction):
+# 150.00 accrues per biweekly payday, calculated from the anchor's schedule.
+goetta-finance goal add-contribution <hsa-id> --target 4400 --period year \
+    --recurring 150.00 --recurring-anchor 2026-01-09
+
 goetta-finance goal list          # progress, status, and pace per goal
 goetta-finance goal remove 3      # confirms unless --yes
 ```
@@ -316,6 +321,7 @@ Semantics worth knowing:
 - **Cap math matches the pie exactly.** Spending caps reuse the same net-spending SQL as `spending_by_category` and the dashboard pie: refunds reduce the total, hidden accounts are excluded, pending transactions count, and periods are UTC calendar buckets.
 - **Liability accounts evaluate the absolute balance** (amount owed): `--direction at_most --target 2000` on a credit card means "owe under 2000" whichever way the institution signs the balance.
 - **Contribution goals sum absolute values** of settled matched transactions (description OR payee, `contains`/`regex` like transfer links) — brokerages often sign cash-in negative — plus applied linked transfers, plus an optional pre-history `--baseline` counted into the period containing `--baseline-date`. Synced accounts require `--pattern`; manual accounts fed by transfer links need zero extra config. Ahead of the funding clock is `on_track` — the inverse of caps.
+- **Recurring contributions are declared, not observed.** `--recurring` + `--recurring-interval` (`weekly`/`biweekly`/`monthly`) + `--recurring-anchor` accrue an amount per scheduled payday by calculation — for payroll deductions no feed can ever see. The payday series extends both directions from the anchor (monthly clamps to the month end: an anchor on the 31st pays Feb 28), each elapsed payday ticks the goal and its history bars, `required_monthly` nets out future scheduled paydays, and a goal whose schedule alone covers the target stays `on_track` between paydays. The CLI/dashboard prose and the MCP tool both disclose the declared portion.
 - **Status** is `on_track` / `at_risk` (ahead of linear pace, or trend projects past `--by`; for contributions, *behind* the funding clock) / `over` (cap blown, ceiling breached) / `met`. Balance goals derive pace from the last 90 days of balance snapshots.
 - **Breach summary after sync.** `goetta-finance sync` prints a yellow `goal:` line for each goal at status `over`; the daemon logs the same at WARNING after scheduled syncs. `at_risk` never fires a warning — it's pace noise by design.
 - From Claude: `list_goals` (progress + pace), `set_goal`, `remove_goal`. The dashboard has a **Goals** page with progress bars.

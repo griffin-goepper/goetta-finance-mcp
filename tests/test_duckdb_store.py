@@ -1887,6 +1887,84 @@ def test_transfer_applications_sum_and_monthly(store: DuckDBStore) -> None:
     }
 
 
+def test_migration_0015_applied(store: DuckDBStore) -> None:
+    rows = store.conn.execute("SELECT name FROM schema_migrations").fetchall()
+    assert ("0015_recurring_contributions.sql",) in rows
+    cols = {
+        row[0]
+        for row in store.conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'goals'"
+        ).fetchall()
+    }
+    assert {"recurring_amount", "recurring_interval", "recurring_anchor"} <= cols
+
+
+def test_add_goal_recurring_round_trip(store: DuckDBStore) -> None:
+    store.upsert_accounts([_manual_account(id="MANUAL-hsa")])
+    goal = store.add_goal(
+        "HSA 2026",
+        kind="contribution",
+        amount=Decimal("4400.00"),
+        account_id="MANUAL-hsa",
+        period="year",
+        recurring_amount=Decimal("150.00"),
+        recurring_interval="biweekly",
+        recurring_anchor=date(2026, 1, 9),
+    )
+    assert goal.recurring_amount == Decimal("150.00")
+    assert goal.recurring_interval == "biweekly"
+    assert goal.recurring_anchor == date(2026, 1, 9)
+    assert store.list_goals()[0] == goal
+
+
+def test_add_goal_recurring_bad_shapes(store: DuckDBStore) -> None:
+    """0015 has NO table CHECK (plain ALTERs) — the store's Python
+    checks are a write-time gate, so pin them."""
+    store.upsert_accounts([_manual_account(id="MANUAL-rec")])
+    with pytest.raises(StoreError, match="must be provided together"):
+        store.add_goal(
+            "half recurring",
+            kind="contribution",
+            amount=Decimal("100"),
+            account_id="MANUAL-rec",
+            period="month",
+            recurring_amount=Decimal("50"),
+        )
+    with pytest.raises(StoreError, match="'weekly', 'biweekly', or 'monthly'"):
+        store.add_goal(
+            "bad interval",
+            kind="contribution",
+            amount=Decimal("100"),
+            account_id="MANUAL-rec",
+            period="month",
+            recurring_amount=Decimal("50"),
+            recurring_interval="fortnightly",
+            recurring_anchor=date(2026, 1, 9),
+        )
+    with pytest.raises(StoreError, match="recurring_amount must be positive"):
+        store.add_goal(
+            "negative recurring",
+            kind="contribution",
+            amount=Decimal("100"),
+            account_id="MANUAL-rec",
+            period="month",
+            recurring_amount=Decimal("-5"),
+            recurring_interval="biweekly",
+            recurring_anchor=date(2026, 1, 9),
+        )
+    with pytest.raises(StoreError, match="only apply to contribution goals"):
+        store.add_goal(
+            "balance with recurring",
+            kind="balance",
+            amount=Decimal("100"),
+            account_id="MANUAL-rec",
+            direction="at_least",
+            recurring_amount=Decimal("50"),
+            recurring_interval="biweekly",
+            recurring_anchor=date(2026, 1, 9),
+        )
+
+
 def test_delete_account_refuses_when_contribution_goal_references_it(
     store: DuckDBStore,
 ) -> None:

@@ -123,6 +123,9 @@ class FinanceStore(Protocol):
         match_pattern: str | None = None,
         baseline_amount: Decimal | None = None,
         baseline_date: datetime | None = None,
+        recurring_amount: Decimal | None = None,
+        recurring_interval: str | None = None,
+        recurring_anchor: date | None = None,
     ) -> Goal: ...
 
     def list_goals(self) -> list[Goal]: ...
