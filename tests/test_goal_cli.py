@@ -182,6 +182,175 @@ def test_goal_add_balance_past_by_date(fresh_home: Path) -> None:
     assert "future" in result.output
 
 
+# --- add-contribution -------------------------------------------------------
+
+
+def _seed_manual_account(home: Path, *, account_id: str = "MANUAL-sav") -> None:
+    store = DuckDBStore(home / "data.duckdb")
+    try:
+        store.upsert_accounts(
+            [
+                Account(
+                    id=account_id,
+                    name="Manual Savings",
+                    balance=Decimal("5000.00"),
+                    balance_date=datetime.now(tz=UTC),
+                    type=AccountType.SAVINGS,
+                    is_manual=True,
+                )
+            ]
+        )
+    finally:
+        store.close()
+
+
+def test_goal_add_contribution_happy_path(fresh_home: Path) -> None:
+    _seed_account(fresh_home)
+    result = runner.invoke(
+        app,
+        [
+            "goal",
+            "add-contribution",
+            "ACT-goal",
+            "--target",
+            "7500",
+            "--period",
+            "year",
+            "--pattern",
+            "CASH CONTRIBUTION CURRENT YEAR",
+            "--baseline",
+            "3000",
+            "--baseline-date",
+            "2026-03-01",
+            "--name",
+            "Roth IRA 2026",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert 'Added goal "Roth IRA 2026"' in result.output
+    assert "contribute 7500 to Goal Checking per year" in result.output
+
+
+def test_goal_add_contribution_default_name(fresh_home: Path) -> None:
+    _seed_account(fresh_home)
+    result = runner.invoke(
+        app,
+        ["goal", "add-contribution", "ACT-goal", "--target", "500", "--pattern", "DEPOSIT"],
+    )
+    assert result.exit_code == 0, result.output
+    assert 'Added goal "ACT-goal contribute 500/month"' in result.output
+
+
+def test_goal_add_contribution_manual_account_needs_no_pattern(fresh_home: Path) -> None:
+    _seed_manual_account(fresh_home)
+    result = runner.invoke(
+        app,
+        ["goal", "add-contribution", "MANUAL-sav", "--target", "800"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "contribute 800 to Manual Savings per month" in result.output
+
+
+def test_goal_add_contribution_synced_account_requires_pattern(fresh_home: Path) -> None:
+    _seed_account(fresh_home)
+    result = runner.invoke(app, ["goal", "add-contribution", "ACT-goal", "--target", "100"])
+    assert result.exit_code == 1
+    assert "need a match_pattern" in result.output
+
+
+def test_goal_add_contribution_unknown_account(fresh_home: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["goal", "add-contribution", "nope", "--target", "100", "--pattern", "X"],
+    )
+    assert result.exit_code == 1
+    assert "account not found" in result.output
+
+
+def test_goal_add_contribution_rejects_redos_pattern(fresh_home: Path) -> None:
+    """The CLI runs the SAME shared validate_rule_pattern as category
+    rules — the goal matcher is a regex write surface too."""
+    _seed_account(fresh_home)
+    result = runner.invoke(
+        app,
+        [
+            "goal",
+            "add-contribution",
+            "ACT-goal",
+            "--target",
+            "100",
+            "--pattern",
+            "(a+)+$",
+            "--match",
+            "regex",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "nested quantifier" in result.output
+
+
+def test_goal_add_contribution_bad_match_type(fresh_home: Path) -> None:
+    _seed_account(fresh_home)
+    result = runner.invoke(
+        app,
+        [
+            "goal",
+            "add-contribution",
+            "ACT-goal",
+            "--target",
+            "100",
+            "--pattern",
+            "X",
+            "--match",
+            "exact",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "contains" in result.output and "regex" in result.output
+
+
+def test_goal_add_contribution_baseline_pair_enforced(fresh_home: Path) -> None:
+    _seed_account(fresh_home)
+    result = runner.invoke(
+        app,
+        [
+            "goal",
+            "add-contribution",
+            "ACT-goal",
+            "--target",
+            "100",
+            "--pattern",
+            "X",
+            "--baseline",
+            "50",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "provided together" in result.output
+
+
+def test_goal_add_contribution_future_baseline_date(fresh_home: Path) -> None:
+    _seed_account(fresh_home)
+    result = runner.invoke(
+        app,
+        [
+            "goal",
+            "add-contribution",
+            "ACT-goal",
+            "--target",
+            "100",
+            "--pattern",
+            "X",
+            "--baseline",
+            "50",
+            "--baseline-date",
+            "2999-01-01",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "future" in result.output
+
+
 # --- list -------------------------------------------------------------------
 
 

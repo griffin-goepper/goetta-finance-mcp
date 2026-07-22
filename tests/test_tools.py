@@ -11,7 +11,7 @@ from goetta_finance.store.duckdb_store import DuckDBStore
 from goetta_finance.tools._serialize import serialize_value
 from goetta_finance.tools.accounts import list_accounts
 from goetta_finance.tools.balance_history import account_balance_history
-from goetta_finance.tools.goals import remove_goal, set_goal
+from goetta_finance.tools.goals import list_goals, remove_goal, set_goal
 from goetta_finance.tools.set_account_balance import set_account_balance
 from goetta_finance.tools.spending_by_category import spending_by_category
 from goetta_finance.tools.sql_query import sql_query
@@ -187,6 +187,104 @@ def test_goal_tools_error_shapes(store: DuckDBStore) -> None:
     )
     assert bad_amount["ok"] is False
     assert "sub-cent" in bad_amount["error"]
+
+
+def test_set_goal_contribution_round_trip_and_list_fields(store: DuckDBStore) -> None:
+    """MCP write surface for the new kind: match_type defaults to
+    'contains' when only a pattern is given, and list_goals carries the
+    four definition fields on EVERY entry (null for other kinds)."""
+    _seed(store)
+    result = set_goal(
+        store,
+        name="Roth IRA 2026",
+        kind="contribution",
+        amount=Decimal("7500.00"),
+        account_id="a2",
+        period="year",
+        match_pattern="CASH CONTRIBUTION CURRENT YEAR",
+        baseline_amount=Decimal("3000.00"),
+        baseline_date="2026-03-01",
+    )
+    assert result["ok"] is True, result
+    cap = set_goal(
+        store,
+        name="Dining cap",
+        kind="spending_cap",
+        amount=Decimal("400.00"),
+        category="Dining",
+        period="month",
+    )
+    assert cap["ok"] is True
+    goals = {g["name"]: g for g in list_goals(store)}
+    contrib = goals["Roth IRA 2026"]
+    assert contrib["kind"] == "contribution"
+    assert contrib["match_type"] == "contains"  # defaulted from the pattern
+    assert contrib["match_pattern"] == "CASH CONTRIBUTION CURRENT YEAR"
+    assert contrib["baseline_amount"] == "3000.00"
+    assert contrib["baseline_date"] == "2026-03-01T00:00:00+00:00"
+    assert contrib["category"] is None
+    assert contrib["direction"] is None
+    assert contrib["target_date"] is None
+    assert contrib["monthly_delta"] is None
+    assert contrib["projected_date"] is None
+    # Non-contribution entries carry the same four keys, all null.
+    dining = goals["Dining cap"]
+    assert dining["match_type"] is None
+    assert dining["match_pattern"] is None
+    assert dining["baseline_amount"] is None
+    assert dining["baseline_date"] is None
+
+
+def test_set_goal_contribution_validation_errors(store: DuckDBStore) -> None:
+    """The MCP surface is gated identically to the CLI: shared
+    validate_rule_pattern refuses ReDoS shapes, the baseline pair and
+    match pair are enforced, and match_type alone is refused."""
+    _seed(store)
+    redos = set_goal(
+        store,
+        name="evil",
+        kind="contribution",
+        amount=Decimal("100"),
+        account_id="a2",
+        period="month",
+        match_type="regex",
+        match_pattern="(a+)+$",
+    )
+    assert redos["ok"] is False
+    assert "nested quantifier" in redos["error"]
+    half_baseline = set_goal(
+        store,
+        name="half",
+        kind="contribution",
+        amount=Decimal("100"),
+        account_id="a2",
+        period="month",
+        match_pattern="X",
+        baseline_amount=Decimal("50"),
+    )
+    assert half_baseline["ok"] is False
+    assert "provided together" in half_baseline["error"]
+    lone_match_type = set_goal(
+        store,
+        name="lonely type",
+        kind="contribution",
+        amount=Decimal("100"),
+        account_id="a2",
+        period="month",
+        match_type="contains",
+    )
+    assert lone_match_type["ok"] is False
+    assert "requires a match_pattern" in lone_match_type["error"]
+    synced_no_pattern = set_goal(
+        store,
+        name="no matcher",
+        kind="contribution",
+        amount=Decimal("100"),
+        account_id="a2",
+        period="month",
+    )
+    assert synced_no_pattern["ok"] is False
+    assert "need a match_pattern" in synced_no_pattern["error"]
 
 
 def test_sync_now_without_client_returns_error_payload(

@@ -1485,6 +1485,427 @@ def test_delete_account_refuses_when_goal_references_it(store: DuckDBStore) -> N
     assert len(store.list_goals()) == 1
 
 
+# --- Contribution goals (migration 0014) -------------------------------------
+
+
+def _apply_migrations_through(store: DuckDBStore, last: str) -> None:
+    """Apply migrations up to and including ``last``, mimicking init()'s
+    loop, so a test can build a genuinely pre-``last+1`` database."""
+    from importlib.resources import files
+
+    conn = store.conn
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations ("
+        "name TEXT PRIMARY KEY, applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    )
+    migrations_dir = files("goetta_finance.store.migrations")
+    for name in sorted(e.name for e in migrations_dir.iterdir() if e.name.endswith(".sql")):
+        if name > last:
+            break
+        conn.execute(migrations_dir.joinpath(name).read_text())
+        conn.execute("INSERT INTO schema_migrations (name) VALUES (?)", [name])
+
+
+def test_migration_0014_applied(store: DuckDBStore) -> None:
+    """Pin the migration filename and the rebuilt table's new columns."""
+    rows = store.conn.execute("SELECT name FROM schema_migrations").fetchall()
+    assert ("0014_contribution_goals.sql",) in rows
+    cols = {
+        row[0]
+        for row in store.conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'goals'"
+        ).fetchall()
+    }
+    assert {"match_type", "match_pattern", "baseline_amount", "baseline_date"} <= cols
+
+
+def test_migration_0014_preserves_goal_rows_and_sequence(tmp_path: Path) -> None:
+    """The 0014 table REBUILD (CHECK constraints can't be ALTERed) must
+    replay safely over a database that already has goal rows: ids and
+    rows survive the copy, and goals_id_seq keeps counting past the
+    surviving max id."""
+    store = DuckDBStore(tmp_path / "replay.duckdb")
+    try:
+        _apply_migrations_through(store, "0013_category_match_cache.sql")
+        store.upsert_accounts([_account(id="ACT-old")])
+        # Old-shape inserts (the new columns don't exist yet).
+        store.conn.execute(
+            "INSERT INTO goals (name, kind, amount, category_id, period) "
+            "SELECT 'Old dining cap', 'spending_cap', 400.00, id, 'month' "
+            "FROM categories WHERE name = 'Dining'"
+        )
+        store.conn.execute(
+            "INSERT INTO goals (name, kind, amount, account_id, direction, target_date) "
+            "VALUES ('Old fund', 'balance', 1000.00, 'ACT-old', 'at_least', DATE '2027-06-01')"
+        )
+        before = {
+            row[0]: row[1] for row in store.conn.execute("SELECT id, name FROM goals").fetchall()
+        }
+        assert len(before) == 2
+
+        store.init()  # applies exactly 0014
+
+        after = store.list_goals()
+        assert {g.id: g.name for g in after} == before
+        cap = next(g for g in after if g.name == "Old dining cap")
+        assert cap.kind is GoalKind.SPENDING_CAP
+        assert cap.amount == Decimal("400.00")
+        assert cap.category_name == "Dining"
+        fund = next(g for g in after if g.name == "Old fund")
+        assert fund.direction is GoalDirection.AT_LEAST
+        assert fund.target_date == date(2027, 6, 1)
+        # New columns are NULL on copied rows.
+        assert all(g.match_type is None and g.baseline_amount is None for g in after)
+        # The shared sequence continues past the surviving max id.
+        new_goal = store.add_goal(
+            "Post-rebuild goal",
+            kind="contribution",
+            amount=Decimal("100.00"),
+            account_id="ACT-old",
+            period="month",
+            match_type="contains",
+            match_pattern="CONTRIBUTION",
+        )
+        assert new_goal.id > max(before)
+    finally:
+        store.close()
+
+
+def test_add_goal_contribution_round_trip(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account(id="ACT-roth")])
+    goal = store.add_goal(
+        "Roth IRA 2026",
+        kind="contribution",
+        amount=Decimal("7500.00"),
+        account_id="ACT-roth",
+        period="year",
+        match_type="contains",
+        match_pattern="CASH CONTRIBUTION CURRENT YEAR",
+        baseline_amount=Decimal("3000.00"),
+        baseline_date=datetime(2026, 3, 1, tzinfo=UTC),
+    )
+    assert goal.id >= 1
+    assert goal.kind is GoalKind.CONTRIBUTION
+    assert goal.period is GoalPeriod.YEAR
+    assert goal.account_name == "Checking 1234"
+    assert goal.match_type == "contains"
+    assert goal.match_pattern == "CASH CONTRIBUTION CURRENT YEAR"
+    assert goal.baseline_amount == Decimal("3000.00")
+    assert goal.baseline_date == datetime(2026, 3, 1, tzinfo=UTC)
+    assert goal.category_id is None
+    assert goal.direction is None
+    assert goal.target_date is None
+
+    listed = store.list_goals()
+    assert len(listed) == 1
+    assert listed[0] == goal
+
+
+def test_add_goal_contribution_manual_account_needs_no_pattern(store: DuckDBStore) -> None:
+    """Manual accounts may omit the matcher — the transfer-link
+    applications ledger already records money in."""
+    store.upsert_accounts([_manual_account(id="MANUAL-contrib-ok")])
+    goal = store.add_goal(
+        "Apple monthly",
+        kind="contribution",
+        amount=Decimal("800.00"),
+        account_id="MANUAL-contrib-ok",
+        period="month",
+    )
+    assert goal.match_type is None
+    assert goal.match_pattern is None
+
+
+def test_add_goal_contribution_synced_account_requires_pattern(store: DuckDBStore) -> None:
+    """A synced account's feed needs a matcher — refuse patternless
+    contribution goals on non-manual accounts."""
+    store.upsert_accounts([_account(id="ACT-synced")])
+    with pytest.raises(StoreError, match="need a match_pattern"):
+        store.add_goal(
+            "no matcher",
+            kind="contribution",
+            amount=Decimal("100"),
+            account_id="ACT-synced",
+            period="month",
+        )
+
+
+def test_add_goal_contribution_bad_shape_raises(store: DuckDBStore) -> None:
+    store.upsert_accounts([_account(id="ACT-shape2")])
+    with pytest.raises(StoreError, match="require an account_id and a period"):
+        store.add_goal("no acct", kind="contribution", amount=Decimal("100"), period="month")
+    with pytest.raises(StoreError, match="do not take a category"):
+        store.add_goal(
+            "with cat",
+            kind="contribution",
+            amount=Decimal("100"),
+            account_id="ACT-shape2",
+            period="month",
+            category_name="Dining",
+        )
+    with pytest.raises(StoreError, match="match_type and match_pattern must be provided together"):
+        store.add_goal(
+            "half matcher",
+            kind="contribution",
+            amount=Decimal("100"),
+            account_id="ACT-shape2",
+            period="month",
+            match_type="contains",
+        )
+    with pytest.raises(
+        StoreError, match="baseline_amount and baseline_date must be provided together"
+    ):
+        store.add_goal(
+            "half baseline",
+            kind="contribution",
+            amount=Decimal("100"),
+            account_id="ACT-shape2",
+            period="month",
+            match_type="contains",
+            match_pattern="X",
+            baseline_amount=Decimal("50"),
+        )
+    with pytest.raises(StoreError, match="only apply to contribution goals"):
+        store.add_goal(
+            "cap with matcher",
+            kind="spending_cap",
+            amount=Decimal("100"),
+            category_name="Dining",
+            period="month",
+            match_type="contains",
+            match_pattern="X",
+        )
+    with pytest.raises(StoreError, match="only apply to contribution goals"):
+        store.add_goal(
+            "balance with baseline",
+            kind="balance",
+            amount=Decimal("100"),
+            account_id="ACT-shape2",
+            direction="at_least",
+            baseline_amount=Decimal("50"),
+            baseline_date=datetime(2026, 3, 1, tzinfo=UTC),
+        )
+
+
+def _contribution_txn(
+    store: DuckDBStore,
+    txn_id: str,
+    amount: str,
+    *,
+    posted: datetime,
+    account_id: str = "ACT-contrib",
+    description: str = "CASH CONTRIBUTION CURRENT YEAR (Cash)",
+    payee: str | None = None,
+    pending: bool = False,
+) -> None:
+    store.upsert_transactions(
+        [
+            Transaction(
+                id=txn_id,
+                account_id=account_id,
+                posted=posted,
+                amount=Decimal(amount),
+                description=description,
+                payee=payee,
+                pending=pending,
+            )
+        ]
+    )
+
+
+def test_contribution_matched_sum_contains_abs_settled_window(store: DuckDBStore) -> None:
+    """'contains' matching is case-insensitive, sums ABSOLUTE values
+    (Fidelity signs cash-in negative), counts settled rows only, and
+    respects the [start, end) window."""
+    store.upsert_accounts([_account(id="ACT-contrib")])
+    _contribution_txn(store, "c-in", "-500.00", posted=datetime(2026, 7, 10, tzinfo=UTC))
+    _contribution_txn(store, "c-pos", "100.00", posted=datetime(2026, 7, 12, tzinfo=UTC))
+    _contribution_txn(store, "c-before", "-625.00", posted=datetime(2026, 6, 15, tzinfo=UTC))
+    _contribution_txn(
+        store,
+        "c-other",
+        "-12.34",
+        posted=datetime(2026, 7, 11, tzinfo=UTC),
+        description="DIVIDEND RECEIVED",
+    )
+    _contribution_txn(
+        store, "c-pend", "-250.00", posted=datetime(2026, 7, 20, tzinfo=UTC), pending=True
+    )
+    total = store.contribution_matched_sum(
+        "ACT-contrib",
+        match_type="contains",
+        pattern="cash contribution current year",
+        start=datetime(2026, 7, 1, tzinfo=UTC),
+        end=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    # abs(-500) + abs(+100); June row and pending row excluded.
+    assert total == Decimal("600.00")
+    pending_total = store.contribution_matched_sum(
+        "ACT-contrib",
+        match_type="contains",
+        pattern="cash contribution current year",
+        pending=True,
+    )
+    assert pending_total == Decimal("250.00")
+
+
+def test_contribution_matched_sum_regex_and_payee(store: DuckDBStore) -> None:
+    """'regex' matching uses regexp_matches, and either description OR
+    payee may carry the match — same clause as transfer links."""
+    store.upsert_accounts([_account(id="ACT-contrib")])
+    _contribution_txn(
+        store,
+        "c-desc",
+        "-300.00",
+        posted=datetime(2026, 7, 10, tzinfo=UTC),
+        description="EMPLOYER 401K PLAN CONTRIB",
+    )
+    _contribution_txn(
+        store,
+        "c-payee",
+        "-200.00",
+        posted=datetime(2026, 7, 11, tzinfo=UTC),
+        description="misc credit",
+        payee="EMPLOYER 401K MATCH",
+    )
+    _contribution_txn(
+        store,
+        "c-neither",
+        "-999.00",
+        posted=datetime(2026, 7, 12, tzinfo=UTC),
+        description="GROCERIES",
+    )
+    total = store.contribution_matched_sum(
+        "ACT-contrib",
+        match_type="regex",
+        pattern="^EMPLOYER 401K",
+        start=datetime(2026, 7, 1, tzinfo=UTC),
+        end=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    assert total == Decimal("500.00")
+
+
+def test_contribution_matched_sum_naive_utc_binding(store: DuckDBStore) -> None:
+    """Class-of-bug pin (the tz-aware param trap): a contribution posted
+    2026-07-01T00:30Z must land in July, not June, regardless of the
+    session time zone. Forcing a POSITIVE-offset session tz makes the
+    failure mode real on any machine: without ``_to_naive_utc`` at the
+    bind boundary the naive column casts through Tokyo time and the row
+    slides back into June."""
+    store.upsert_accounts([_account(id="ACT-contrib")])
+    _contribution_txn(store, "c-tz", "-500.00", posted=datetime(2026, 7, 1, 0, 30, tzinfo=UTC))
+    store.conn.execute("SET TimeZone = 'Asia/Tokyo'")
+    try:
+        july = store.contribution_matched_sum(
+            "ACT-contrib",
+            match_type="contains",
+            pattern="CASH CONTRIBUTION",
+            start=datetime(2026, 7, 1, tzinfo=UTC),
+            end=datetime(2026, 8, 1, tzinfo=UTC),
+        )
+        june = store.contribution_matched_sum(
+            "ACT-contrib",
+            match_type="contains",
+            pattern="CASH CONTRIBUTION",
+            start=datetime(2026, 6, 1, tzinfo=UTC),
+            end=datetime(2026, 7, 1, tzinfo=UTC),
+        )
+    finally:
+        store.conn.execute("RESET TimeZone")
+    assert july == Decimal("500.00")
+    assert june == Decimal("0")
+
+
+def test_contribution_matched_monthly_buckets_sparse(store: DuckDBStore) -> None:
+    """Monthly buckets agree with the single-window sum (same clause,
+    same abs expression); empty months are absent, pending excluded."""
+    store.upsert_accounts([_account(id="ACT-contrib")])
+    _contribution_txn(store, "c-jun", "-625.00", posted=datetime(2026, 6, 15, tzinfo=UTC))
+    _contribution_txn(store, "c-jul-a", "-500.00", posted=datetime(2026, 7, 2, tzinfo=UTC))
+    _contribution_txn(store, "c-jul-b", "-125.00", posted=datetime(2026, 7, 20, tzinfo=UTC))
+    _contribution_txn(
+        store, "c-pend", "-99.00", posted=datetime(2026, 7, 21, tzinfo=UTC), pending=True
+    )
+    buckets = store.contribution_matched_monthly(
+        "ACT-contrib",
+        match_type="contains",
+        pattern="CASH CONTRIBUTION",
+        start=datetime(2026, 4, 1, tzinfo=UTC),
+        end=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    assert buckets == {
+        date(2026, 6, 1): Decimal("625.00"),
+        date(2026, 7, 1): Decimal("625.00"),
+    }
+
+
+def test_transfer_applications_sum_and_monthly(store: DuckDBStore) -> None:
+    """The ledger sums are signed (money-in positive, a transfer back
+    out reduces) and window/bucket by the application's posted time."""
+    store.upsert_accounts([_account(id="ACT-src"), _manual_account(id="MANUAL-led")])
+    txns = [
+        Transaction(
+            id="led-1",
+            account_id="ACT-src",
+            posted=datetime(2026, 6, 10, tzinfo=UTC),
+            amount=Decimal("-1000.00"),  # outflow from source = +1000 in
+            description="Transfer to Apple Savings",
+        ),
+        Transaction(
+            id="led-2",
+            account_id="ACT-src",
+            posted=datetime(2026, 7, 5, tzinfo=UTC),
+            amount=Decimal("-800.00"),
+            description="Transfer to Apple Savings",
+        ),
+        Transaction(
+            id="led-3",
+            account_id="ACT-src",
+            posted=datetime(2026, 7, 15, tzinfo=UTC),
+            amount=Decimal("300.00"),  # money moved back out = -300
+            description="Transfer from Apple Savings",
+        ),
+    ]
+    store.upsert_transactions(txns)
+    store.record_transfer_applications("MANUAL-led", 1, txns)
+    july = store.transfer_applications_sum(
+        "MANUAL-led",
+        start=datetime(2026, 7, 1, tzinfo=UTC),
+        end=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    assert july == Decimal("500.00")  # 800 - 300
+    all_time = store.transfer_applications_sum("MANUAL-led")
+    assert all_time == Decimal("1500.00")
+    buckets = store.transfer_applications_monthly(
+        "MANUAL-led",
+        start=datetime(2026, 6, 1, tzinfo=UTC),
+        end=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    assert buckets == {
+        date(2026, 6, 1): Decimal("1000.00"),
+        date(2026, 7, 1): Decimal("500.00"),
+    }
+
+
+def test_delete_account_refuses_when_contribution_goal_references_it(
+    store: DuckDBStore,
+) -> None:
+    """The goals guard extends to the new kind: a contribution goal's
+    account_id blocks deletion like a balance goal's does."""
+    store.upsert_accounts([_manual_account(id="MANUAL-contrib-del")])
+    store.add_goal(
+        "Apple fund",
+        kind="contribution",
+        amount=Decimal("500"),
+        account_id="MANUAL-contrib-del",
+        period="month",
+    )
+    with pytest.raises(StoreError, match=r"goal\(s\) referencing it"):
+        store.delete_account("MANUAL-contrib-del")
+    assert any(a.id == "MANUAL-contrib-del" for a in store.get_accounts())
+    assert len(store.list_goals()) == 1
+
+
 def test_query_sql_normalizes_tz_aware_datetime_params(store: DuckDBStore) -> None:
     """Class-of-bug pin: timestamps are stored naive UTC, so a tz-aware
     datetime param must be normalized to naive UTC before binding.

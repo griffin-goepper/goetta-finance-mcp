@@ -25,7 +25,11 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 
-from goetta_finance.goals import spending_cap_history
+from goetta_finance.goals import (
+    contribution_history,
+    contribution_monthly_target,
+    spending_cap_history,
+)
 from goetta_finance.models import GoalKind
 from goetta_finance.store import FinanceStore
 from goetta_finance.tools._serialize import serialize_value
@@ -214,9 +218,14 @@ def register_api(app: FastAPI) -> None:
 
         Spending caps: per-period buckets at the goal's own granularity
         (month/year), oldest first; the newest bucket equals the goal
-        card's ``current`` to the cent. Balance goals: raw balance
-        snapshots (``abs()`` for liabilities — amount owed), ``periods``
-        read as calendar months of lookback.
+        card's ``current`` to the cent. Contribution goals: ALWAYS
+        monthly buckets regardless of goal period (``periods`` read as
+        months of lookback), each judged against ``monthly_target``
+        (the amount for month goals, amount/12 for year goals); the
+        newest bucket equals this month's contribution sum to the cent.
+        Balance goals: raw balance snapshots (``abs()`` for
+        liabilities — amount owed), ``periods`` read as calendar months
+        of lookback.
         """
         store = _store(request)
         periods = _clamp(periods, 1, 36)
@@ -243,6 +252,26 @@ def register_api(app: FastAPI) -> None:
             }
         if goal.account_id is None:  # pragma: no cover - table CHECK
             raise HTTPException(status_code=404, detail=f"goal {goal_id} has no account")
+        if goal.kind is GoalKind.CONTRIBUTION:
+            months = contribution_history(store, goal, months=periods)
+            return {
+                "goal_id": goal.id,
+                "kind": goal.kind.value,
+                "period": goal.period.value if goal.period is not None else None,
+                "account_id": goal.account_id,
+                "account_name": goal.account_name,
+                "target": str(goal.amount),
+                "monthly_target": str(contribution_monthly_target(goal)),
+                "periods": [
+                    {
+                        "period_start": m.period_start.isoformat(),
+                        "period_end": m.period_end.isoformat(),
+                        "actual": str(m.actual),
+                        "met": m.met,
+                    }
+                    for m in months
+                ],
+            }
         account = next(
             (a for a in store.get_accounts(include_hidden=True) if a.id == goal.account_id),
             None,

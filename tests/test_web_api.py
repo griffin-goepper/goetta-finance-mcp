@@ -348,6 +348,82 @@ def test_api_goal_history_unknown_id_404(client: TestClient) -> None:
     assert client.get("/api/v1/goals/99999/history").status_code == 404
 
 
+def _seed_contribution(store: DuckDBStore, *, period: str, amount: str) -> int:
+    """A contribution goal on the checking account plus one matched
+    settled row this month (150) and one last month (50)."""
+    store.upsert_transactions(
+        [
+            Transaction(
+                id=f"tx-contrib-now-{period}",
+                account_id="acc-checking",
+                posted=IN_MONTH,
+                amount=Decimal("-150.00"),
+                description="EMPLOYEE CONTRIBUTION 401K",
+            ),
+            Transaction(
+                id=f"tx-contrib-prev-{period}",
+                account_id="acc-checking",
+                posted=MONTH_START - timedelta(days=10),
+                amount=Decimal("-50.00"),
+                description="EMPLOYEE CONTRIBUTION 401K",
+            ),
+        ]
+    )
+    goal = store.add_goal(
+        f"contrib-{period}",
+        kind="contribution",
+        amount=Decimal(amount),
+        account_id="acc-checking",
+        period=period,
+        match_type="contains",
+        match_pattern="EMPLOYEE CONTRIBUTION",
+    )
+    return goal.id
+
+
+def test_api_goal_history_contribution_year_goal_monthly_buckets(
+    client: TestClient, store: DuckDBStore
+) -> None:
+    """Wire-contract pin: contribution history is ALWAYS monthly buckets
+    (even for a year goal), judged against monthly_target = target/12."""
+    goal_id = _seed_contribution(store, period="year", amount="1200.00")
+    body = client.get(f"/api/v1/goals/{goal_id}/history?periods=3").json()
+    assert body["kind"] == "contribution"
+    assert body["period"] == "year"
+    assert body["account_id"] == "acc-checking"
+    assert body["account_name"] == "Checking 1234"
+    assert body["target"] == "1200.00"
+    assert body["monthly_target"] == "100.00"  # 1200/12, quantized to cents
+    assert len(body["periods"]) == 3  # months of lookback, oldest first
+    newest = body["periods"][-1]
+    assert newest["actual"] == "150.00"
+    assert newest["met"] is True  # 150 >= 100
+    prior = body["periods"][-2]
+    assert prior["actual"] == "50.00"
+    assert prior["met"] is False  # 50 < 100
+    datetime.fromisoformat(newest["period_start"])
+    datetime.fromisoformat(newest["period_end"])
+
+
+def test_api_goal_history_contribution_newest_matches_card(
+    client: TestClient, store: DuckDBStore
+) -> None:
+    """Cent pin: the newest history bucket equals the goal card's
+    ``current`` for a month-period goal — same sums, same tables."""
+    goal_id = _seed_contribution(store, period="month", amount="200.00")
+    card = next(g for g in client.get("/api/v1/goals").json()["goals"] if g["id"] == goal_id)
+    assert card["current"] == "150.00"
+    assert card["kind"] == "contribution"
+    assert card["match_pattern"] == "EMPLOYEE CONTRIBUTION"
+    assert card["match_type"] == "contains"
+    assert card["baseline_amount"] is None
+    assert card["baseline_date"] is None
+    assert "monthly_target" not in card  # history-endpoint field, not a card field
+    body = client.get(f"/api/v1/goals/{goal_id}/history").json()
+    assert body["monthly_target"] == body["target"] == "200.00"  # month goal: target itself
+    assert body["periods"][-1]["actual"] == card["current"]
+
+
 def test_api_transactions_filters_and_search(client: TestClient) -> None:
     body = client.get("/api/v1/transactions?q=food+truck").json()
     assert body["count"] == 1

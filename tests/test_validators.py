@@ -8,7 +8,7 @@ coverage. Per CLAUDE.md: both write surfaces must be gated identically.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -20,12 +20,14 @@ from goetta_finance.validators import (
     GoalValidationError,
     RulePatternError,
     format_rule_bounds,
+    parse_goal_baseline_date,
     parse_goal_direction,
     parse_goal_kind,
     parse_goal_period,
     parse_goal_target_date,
     parse_match_type,
     validate_goal_amount,
+    validate_goal_baseline,
     validate_goal_name,
     validate_goal_shape,
     validate_rule_amount_bounds,
@@ -149,6 +151,7 @@ def test_validate_goal_amount_carries_custom_param_hint() -> None:
 def test_parse_goal_kind_normalizes_and_rejects() -> None:
     assert parse_goal_kind("  Spending_Cap ") == "spending_cap"
     assert parse_goal_kind("BALANCE") == "balance"
+    assert parse_goal_kind("Contribution") == "contribution"
     with pytest.raises(GoalValidationError) as exc_info:
         parse_goal_kind("envelope")
     assert exc_info.value.param_hint == "--kind"
@@ -247,6 +250,138 @@ def test_validate_goal_shape_balance() -> None:
             direction="at_most",
             target_date=None,
         )
+
+
+# --- Contribution goal validators (migration 0014) ---------------------------
+# The match pattern goes through the SAME validate_rule_pattern as
+# category rules and transfer links (MCP-reachable regex write surface —
+# CLAUDE.md threat model); these pin the contribution-specific pieces.
+
+
+def test_validate_goal_shape_contribution_happy() -> None:
+    validate_goal_shape(
+        "contribution",
+        category=None,
+        period="year",
+        account_id="a1",
+        direction=None,
+        target_date=None,
+        match_type="contains",
+        match_pattern="CASH CONTRIBUTION",
+        baseline_amount=Decimal("3000"),
+        baseline_date=datetime(2026, 3, 1, tzinfo=UTC),
+    )  # no raise
+    validate_goal_shape(
+        "contribution",
+        category=None,
+        period="month",
+        account_id="a1",
+        direction=None,
+        target_date=None,
+    )  # patternless + baselineless is a valid shape (manual accounts)
+
+
+def test_validate_goal_shape_contribution_requirements_and_forbids() -> None:
+    with pytest.raises(GoalValidationError, match="require an account_id and a period"):
+        validate_goal_shape(
+            "contribution",
+            category=None,
+            period=None,
+            account_id="a1",
+            direction=None,
+            target_date=None,
+        )
+    with pytest.raises(GoalValidationError, match="do not take a category"):
+        validate_goal_shape(
+            "contribution",
+            category="Dining",
+            period="month",
+            account_id="a1",
+            direction=None,
+            target_date=None,
+        )
+    with pytest.raises(GoalValidationError, match="do not take a category"):
+        validate_goal_shape(
+            "contribution",
+            category=None,
+            period="month",
+            account_id="a1",
+            direction="at_least",
+            target_date=None,
+        )
+    with pytest.raises(GoalValidationError, match="provided together") as exc_info:
+        validate_goal_shape(
+            "contribution",
+            category=None,
+            period="month",
+            account_id="a1",
+            direction=None,
+            target_date=None,
+            match_type="contains",
+        )
+    assert exc_info.value.param_hint == "--pattern"
+
+
+def test_validate_goal_shape_match_and_baseline_only_on_contribution() -> None:
+    with pytest.raises(GoalValidationError, match="only apply to contribution"):
+        validate_goal_shape(
+            "spending_cap",
+            category="Dining",
+            period="month",
+            account_id=None,
+            direction=None,
+            target_date=None,
+            match_type="contains",
+            match_pattern="X",
+        )
+    with pytest.raises(GoalValidationError, match="only apply to contribution"):
+        validate_goal_shape(
+            "balance",
+            category=None,
+            period=None,
+            account_id="a1",
+            direction="at_least",
+            target_date=None,
+            baseline_amount=Decimal("50"),
+            baseline_date=datetime(2026, 3, 1, tzinfo=UTC),
+        )
+
+
+def test_goal_match_pattern_goes_through_rule_pattern_validator() -> None:
+    """The contribution matcher is validated by the EXISTING shared
+    validator — the canonical ReDoS shape is refused for goals exactly
+    as for category rules."""
+    with pytest.raises(RulePatternError, match="nested quantifier"):
+        validate_rule_pattern("(a+)+$", "regex")
+
+
+def test_validate_goal_baseline_pair_rules() -> None:
+    validate_goal_baseline(None, None)  # no raise
+    validate_goal_baseline(Decimal("3000"), datetime(2026, 3, 1, tzinfo=UTC))  # no raise
+    with pytest.raises(GoalValidationError, match="provided together") as exc_info:
+        validate_goal_baseline(Decimal("3000"), None)
+    assert exc_info.value.param_hint == "--baseline"
+    with pytest.raises(GoalValidationError, match="provided together"):
+        validate_goal_baseline(None, datetime(2026, 3, 1, tzinfo=UTC))
+    with pytest.raises(GoalValidationError, match="positive"):
+        validate_goal_baseline(Decimal("-5"), datetime(2026, 3, 1, tzinfo=UTC))
+    with pytest.raises(GoalValidationError, match="sub-cent"):
+        validate_goal_baseline(Decimal("9.999"), datetime(2026, 3, 1, tzinfo=UTC))
+
+
+def test_parse_goal_baseline_date_parses_and_bounds() -> None:
+    now = datetime(2026, 5, 13, 12, tzinfo=UTC)
+    assert parse_goal_baseline_date(None, now=now) is None
+    assert parse_goal_baseline_date("2026-03-01", now=now) == datetime(2026, 3, 1, tzinfo=UTC)
+    # Full datetimes work too; naive is taken as UTC.
+    assert parse_goal_baseline_date("2026-03-01T09:30:00", now=now) == datetime(
+        2026, 3, 1, 9, 30, tzinfo=UTC
+    )
+    with pytest.raises(GoalValidationError, match="future") as exc_info:
+        parse_goal_baseline_date("2026-05-14", now=now)
+    assert exc_info.value.param_hint == "--baseline-date"
+    with pytest.raises(GoalValidationError, match="ISO"):
+        parse_goal_baseline_date("March 1st", now=now)
 
 
 def test_validate_goal_shape_unknown_kind() -> None:
