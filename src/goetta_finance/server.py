@@ -112,7 +112,7 @@ Schema:
             transactions_updated, warnings, errors)
   goals(id, name, kind, amount, category_id, period, account_id, direction,
         target_date, match_type, match_pattern, baseline_amount, baseline_date,
-        created_at)
+        recurring_amount, recurring_interval, recurring_anchor, created_at)
   transfer_links(id, account_id, source_account_id, match_type, pattern,
                  anchor, created_at)
   transfer_link_applications(transaction_id, account_id, link_id, amount,
@@ -233,8 +233,19 @@ links; abs() because brokerages often sign cash-in negative), plus the
 account's transfer_link_applications rows posted in the period (already
 signed money-in — a linked manual account needs no pattern), plus
 baseline_amount when baseline_date falls in the period (contributions
-made before the feed's history). Ahead of the funding clock is on_track
-for contributions — the inverse of caps. Prefer the
+made before the feed's history), plus DECLARED recurring accrual:
+recurring_amount / recurring_interval ('weekly'|'biweekly'|'monthly') /
+recurring_anchor declare a schedule (payroll deductions no feed can
+see) and each elapsed payday accrues recurring_amount by calculation —
+declared, not observed. The payday series extends both directions from
+the anchor; monthly uses the anchor's day-of-month,
+clamped to the month end. The recurring triple travels all-or-none and only on
+contribution rows, enforced in the application layer (0015 is plain
+ALTERs; DuckDB can't ALTER a table CHECK in) — raw SQL won't stop you
+writing an inconsistent triple, so goal writes MUST go through
+set_goal. Ahead of the funding clock is on_track
+for contributions — the inverse of caps, and a goal whose schedule
+alone covers the target stays on_track between paydays. Prefer the
 list_goals tool over ad-hoc SQL on this table — it carries the
 computed status, pace, and projection fields. Goal writes go through
 set_goal / remove_goal, not sql_query.
@@ -615,9 +626,12 @@ def build_server(
             "account this calendar month/year: the ABSOLUTE value of settled "
             "transactions matching the goal's pattern (brokerages often sign "
             "cash-in negative) plus applied linked transfers plus any "
-            "baseline, with pending matches previewed in "
-            "pending_delta and required_monthly on unmet year goals; "
-            "being ahead of the clock "
+            "baseline plus DECLARED recurring accrual (recurring_amount per "
+            "elapsed scheduled payday — calculated from the declared "
+            "schedule, never observed in a feed; disclose that to the user "
+            "when reporting progress), with pending matches previewed in "
+            "pending_delta and required_monthly on unmet year goals (net of "
+            "future scheduled paydays); being ahead of the clock "
             "is on_track (the inverse of caps). status is one of on_track / "
             "at_risk / over / met, evaluated at read time — recategorizing "
             "transactions retroactively changes progress. Use when the "
@@ -651,7 +665,15 @@ def build_server(
             "transfer links need no pattern — the applied-transfer ledger "
             "already counts money in. baseline_amount + baseline_date "
             "(ISO, not future) credit contributions made before the feed's "
-            "history to the period containing that date. amount "
+            "history to the period containing that date. "
+            "recurring_amount + recurring_interval ('weekly'|'biweekly'|"
+            "'monthly', default 'biweekly') + recurring_anchor (ISO date, "
+            "past OK) declare a recurring contribution NO feed can observe "
+            "— e.g. an HSA funded by payroll: recurring_amount=150.00, "
+            "recurring_interval='biweekly', recurring_anchor='2026-01-09' "
+            "accrues 150.00 per payday by calculation. This is DECLARED, "
+            "not observed — progress assumes the schedule actually "
+            "happens, so tell the user that when reporting it. amount "
             "must be positive, at most two decimal places. name must be "
             "unique. Errors return {ok: false, error} with a did-you-mean "
             "suggestion for category typos — fix and retry. Confirm the "
@@ -721,6 +743,36 @@ def build_server(
                 )
             ),
         ] = None,
+        recurring_amount: Annotated[
+            float | None,
+            Field(
+                description=(
+                    "Contribution goals only: DECLARED amount accrued per "
+                    "scheduled payday (e.g. a payroll deduction no feed "
+                    "sees); requires recurring_anchor."
+                )
+            ),
+        ] = None,
+        recurring_interval: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Contribution goals only: 'weekly', 'biweekly' (default "
+                    "when recurring_amount is given), or 'monthly' (anchor's "
+                    "day-of-month, clamped to month end)."
+                )
+            ),
+        ] = None,
+        recurring_anchor: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Contribution goals only: ISO date of any payday in the "
+                    "schedule (past OK — the series extends both directions). "
+                    "Requires recurring_amount."
+                )
+            ),
+        ] = None,
     ) -> dict[str, Any]:
         # The only float in goal math is this wire boundary. str() gives
         # the shortest round-trip repr, so two-decimal JSON inputs convert
@@ -741,6 +793,11 @@ def build_server(
             match_pattern=match_pattern,
             baseline_amount=Decimal(str(baseline_amount)) if baseline_amount is not None else None,
             baseline_date=baseline_date,
+            recurring_amount=Decimal(str(recurring_amount))
+            if recurring_amount is not None
+            else None,
+            recurring_interval=recurring_interval,
+            recurring_anchor=recurring_anchor,
         )
 
     @mcp.tool(

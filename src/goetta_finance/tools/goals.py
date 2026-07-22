@@ -32,9 +32,12 @@ from goetta_finance.validators import (
     parse_goal_period,
     parse_goal_target_date,
     parse_match_type,
+    parse_recurring_anchor,
+    parse_recurring_interval,
     validate_goal_amount,
     validate_goal_baseline,
     validate_goal_name,
+    validate_goal_recurring,
     validate_goal_shape,
     validate_rule_pattern,
 )
@@ -68,12 +71,16 @@ def list_goals(store: FinanceStore) -> list[dict[str, Any]]:
                 "required_monthly": serialize_value(progress.required_monthly),
                 "projected_date": serialize_value(progress.projected_date),
                 "pending_delta": serialize_value(progress.pending_delta),
-                # Contribution-goal definition fields (migration 0014);
-                # null on every other kind — the wire shape is uniform.
+                # Contribution-goal definition fields (migrations
+                # 0014/0015); null on every other kind — the wire shape
+                # is uniform.
                 "match_type": goal.match_type,
                 "match_pattern": goal.match_pattern,
                 "baseline_amount": serialize_value(goal.baseline_amount),
                 "baseline_date": serialize_value(goal.baseline_date),
+                "recurring_amount": serialize_value(goal.recurring_amount),
+                "recurring_interval": goal.recurring_interval,
+                "recurring_anchor": serialize_value(goal.recurring_anchor),
             }
         )
     return out
@@ -94,6 +101,9 @@ def set_goal(
     match_pattern: str | None = None,
     baseline_amount: Decimal | None = None,
     baseline_date: str | None = None,
+    recurring_amount: Decimal | None = None,
+    recurring_interval: str | None = None,
+    recurring_anchor: str | None = None,
 ) -> dict[str, Any]:
     """Create a goal. Validates first (shared validators), then writes.
 
@@ -101,8 +111,9 @@ def set_goal(
     pattern runs against every future feed row), so it goes through the
     SAME ``validate_rule_pattern`` as category rules and transfer
     links — identical gating to the CLI. ``match_type`` defaults to
-    'contains' when a pattern is given without one, mirroring the CLI
-    flag default.
+    'contains' when a pattern is given without one, and
+    ``recurring_interval`` defaults to 'biweekly' when a recurring
+    amount is given without one, both mirroring the CLI flag defaults.
     """
     try:
         normalized_kind = parse_goal_kind(kind)
@@ -119,6 +130,13 @@ def set_goal(
             raise GoalValidationError("match_type requires a match_pattern", param_hint="--pattern")
         parsed_baseline_date = parse_goal_baseline_date(baseline_date)
         validate_goal_baseline(baseline_amount, parsed_baseline_date)
+        normalized_interval: str | None = None
+        if recurring_interval is not None:
+            normalized_interval = parse_recurring_interval(recurring_interval)
+        elif recurring_amount is not None:
+            normalized_interval = "biweekly"
+        parsed_recurring_anchor = parse_recurring_anchor(recurring_anchor)
+        validate_goal_recurring(recurring_amount, normalized_interval, parsed_recurring_anchor)
         validate_goal_shape(
             normalized_kind,
             category=category,
@@ -130,6 +148,9 @@ def set_goal(
             match_pattern=match_pattern,
             baseline_amount=baseline_amount,
             baseline_date=parsed_baseline_date,
+            recurring_amount=recurring_amount,
+            recurring_interval=normalized_interval,
+            recurring_anchor=parsed_recurring_anchor,
         )
     except (GoalValidationError, RulePatternError) as exc:
         return {"ok": False, "error": f"goal validation failed: {exc}"}
@@ -147,6 +168,9 @@ def set_goal(
             match_pattern=match_pattern,
             baseline_amount=baseline_amount,
             baseline_date=parsed_baseline_date,
+            recurring_amount=recurring_amount,
+            recurring_interval=normalized_interval,
+            recurring_anchor=parsed_recurring_anchor,
         )
     except StoreError as exc:
         message = str(exc)

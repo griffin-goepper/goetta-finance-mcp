@@ -287,6 +287,86 @@ def test_set_goal_contribution_validation_errors(store: DuckDBStore) -> None:
     assert "need a match_pattern" in synced_no_pattern["error"]
 
 
+def test_set_goal_recurring_round_trip_and_list_fields(store: DuckDBStore) -> None:
+    """MCP surface for the declared schedule (0015): interval defaults
+    to 'biweekly', the anchor parses from ISO, and list_goals carries
+    the triple on every entry (null on other kinds)."""
+    _seed(store)
+    result = set_goal(
+        store,
+        name="HSA 2026",
+        kind="contribution",
+        amount=Decimal("4400.00"),
+        account_id="a2",
+        period="year",
+        match_pattern="EMPLOYER CONTRIBUTION",
+        recurring_amount=Decimal("150.00"),
+        recurring_anchor="2026-01-09",
+    )
+    assert result["ok"] is True, result
+    cap = set_goal(
+        store,
+        name="Dining cap 2",
+        kind="spending_cap",
+        amount=Decimal("400.00"),
+        category="Dining",
+        period="month",
+    )
+    assert cap["ok"] is True
+    goals = {g["name"]: g for g in list_goals(store)}
+    hsa = goals["HSA 2026"]
+    assert hsa["recurring_amount"] == "150.00"
+    assert hsa["recurring_interval"] == "biweekly"  # defaulted
+    assert hsa["recurring_anchor"] == "2026-01-09"
+    dining = goals["Dining cap 2"]
+    assert dining["recurring_amount"] is None
+    assert dining["recurring_interval"] is None
+    assert dining["recurring_anchor"] is None
+
+
+def test_set_goal_recurring_validation_errors(store: DuckDBStore) -> None:
+    _seed(store)
+    partial = set_goal(
+        store,
+        name="half schedule",
+        kind="contribution",
+        amount=Decimal("100"),
+        account_id="a2",
+        period="month",
+        match_pattern="X",
+        recurring_amount=Decimal("50"),
+    )
+    assert partial["ok"] is False
+    assert "provided together" in partial["error"]
+    bad_interval = set_goal(
+        store,
+        name="bad interval",
+        kind="contribution",
+        amount=Decimal("100"),
+        account_id="a2",
+        period="month",
+        match_pattern="X",
+        recurring_amount=Decimal("50"),
+        recurring_interval="fortnightly",
+        recurring_anchor="2026-01-09",
+    )
+    assert bad_interval["ok"] is False
+    assert "biweekly" in bad_interval["error"]
+    on_balance = set_goal(
+        store,
+        name="balance recurring",
+        kind="balance",
+        amount=Decimal("100"),
+        account_id="a2",
+        direction="at_least",
+        recurring_amount=Decimal("50"),
+        recurring_interval="biweekly",
+        recurring_anchor="2026-01-09",
+    )
+    assert on_balance["ok"] is False
+    assert "only apply to contribution" in on_balance["error"]
+
+
 def test_sync_now_without_client_returns_error_payload(
     store: DuckDBStore,
 ) -> None:

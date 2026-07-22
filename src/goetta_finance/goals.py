@@ -37,6 +37,7 @@ comparison is the INVERSE of spending caps.
 
 from __future__ import annotations
 
+import calendar
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import NamedTuple
@@ -96,6 +97,44 @@ def _as_decimal(value: object) -> Decimal:
 
 def _aware_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
+def _payday_dates(interval: str, anchor: date, lo: date, hi: date) -> list[date]:
+    """All scheduled paydays p with ``lo <= p <= hi``, ascending.
+
+    The series extends BOTH directions from the anchor: weekly/biweekly
+    is ``anchor + k*7/14 days`` for ALL integer k (an anchor of
+    2026-07-10 still yields the 2026-01-09..07-10 biweekly paydays);
+    monthly is the anchor's day-of-month in every month, clamped to the
+    month's last day (anchor Jan 31 pays Feb 28). Pure UTC date math —
+    the callers translate period datetimes to dates at midnight-UTC
+    boundaries.
+    """
+    if hi < lo:
+        return []
+    if interval in ("weekly", "biweekly"):
+        step = 7 if interval == "weekly" else 14
+        # Smallest k with anchor + k*step >= lo (k may be negative).
+        k = -(-(lo - anchor).days // step)  # ceil division
+        out = []
+        payday = anchor + timedelta(days=k * step)
+        while payday <= hi:
+            out.append(payday)
+            payday += timedelta(days=step)
+        return out
+    if interval != "monthly":  # pragma: no cover - validators + store gate
+        raise ValueError(f"unknown recurring interval: {interval!r}")
+    out = []
+    year, month = lo.year, lo.month
+    while (year, month) <= (hi.year, hi.month):
+        last_day = calendar.monthrange(year, month)[1]
+        payday = date(year, month, min(anchor.day, last_day))
+        if lo <= payday <= hi:
+            out.append(payday)
+        month += 1
+        if month == 13:
+            month, year = 1, year + 1
+    return out
 
 
 def _required_monthly(gap: Decimal, target: date, now: datetime) -> Decimal | None:
@@ -235,7 +274,7 @@ def contribution_progress(
 ) -> GoalProgress:
     """Money contributed into the goal's account this period vs the target.
 
-    ``current`` sums three sources over the UTC calendar bucket:
+    ``current`` sums four sources over the UTC calendar bucket:
 
       1. The baseline, when ``baseline_date`` falls inside the period —
          contributions made before the feed's history starts.
@@ -246,21 +285,32 @@ def contribution_progress(
       3. SUM(amount) of transfer-link application ledger rows posted in
          the period — already signed money-in, so a linked manual
          account needs no pattern at all.
+      4. DECLARED recurring accrual (0015): paydays from the goal's
+         schedule with period_start <= payday <= now, each accruing
+         ``recurring_amount`` — by calculation, never observed in a
+         feed (the payroll-deduction case no feed can see). The
+         declared portion is carried on ``declared_total`` so the
+         prose can disclose it.
 
-    Pattern matches and ledger rows draw from different sources (the
-    account's own feed and the applications table), so a goal using
-    both never double-counts.
+    Pattern matches, ledger rows, and declared accrual draw from
+    different sources (the account's own feed, the applications table,
+    and pure schedule math), so a goal using several never
+    double-counts.
 
-    Status: MET at/over the target; ON_TRACK when funding is at or
-    ahead of the clock (percent >= elapsed); AT_RISK behind — the
-    INVERSE of caps, where ahead-of-pace is bad. Never OVER.
+    Status: MET at/over the target; otherwise ON_TRACK when the
+    schedule alone covers the rest (current + future scheduled paydays
+    this period >= target — prevents a perfectly-on-schedule payroll
+    goal from flickering at_risk on biweekly step-lag) OR funding is at
+    or ahead of the clock (percent >= elapsed); AT_RISK behind both —
+    the INVERSE of caps, where ahead-of-pace is bad. Never OVER.
 
     ``required_monthly`` (year goals only, unmet): the remaining gap
-    over the months left to the period end — the same months-remaining
-    math dated balance goals use. ``pending_delta`` previews matched
-    still-pending feed rows plus pending linked transfers; ``None``
-    when the goal has no pattern AND the account has no links (nothing
-    can ever be pending for it).
+    NET of future scheduled paydays, over the months left to the
+    period end — the same months-remaining math dated balance goals
+    use; ``None`` when the schedule alone covers it. ``pending_delta``
+    previews matched still-pending feed rows plus pending linked
+    transfers; ``None`` when the goal has no pattern AND the account
+    has no links (nothing can ever be pending for it).
     """
     if goal.period is None or goal.account_id is None:  # pragma: no cover - table CHECK
         raise StoreError(f"contribution goal {goal.id} is missing account or period")
@@ -280,6 +330,28 @@ def contribution_progress(
             end=end,
         )
     current += store.transfer_applications_sum(goal.account_id, start=start, end=end)
+    declared_total: Decimal | None = None
+    scheduled_future = Decimal("0")
+    if (
+        goal.recurring_amount is not None
+        and goal.recurring_interval is not None
+        and goal.recurring_anchor is not None
+    ):
+        # Paydays with period_start <= p <= now accrue now (p < period_end
+        # is implied: now is inside the period, so now.date() < end.date()).
+        past_paydays = _payday_dates(
+            goal.recurring_interval, goal.recurring_anchor, start.date(), now.date()
+        )
+        declared_total = goal.recurring_amount * len(past_paydays)
+        current += declared_total
+        # Paydays still to come THIS period: now < p < period_end.
+        future_paydays = _payday_dates(
+            goal.recurring_interval,
+            goal.recurring_anchor,
+            now.date() + timedelta(days=1),
+            end.date() - timedelta(days=1),
+        )
+        scheduled_future = goal.recurring_amount * len(future_paydays)
     percent = (current / goal.amount * 100).quantize(_PERCENT_Q)
     elapsed = (
         Decimal(int((now - start).total_seconds()))
@@ -288,13 +360,13 @@ def contribution_progress(
     ).quantize(_PERCENT_Q)
     if current >= goal.amount:
         status = GoalStatus.MET
-    elif percent >= elapsed:
+    elif current + scheduled_future >= goal.amount or percent >= elapsed:
         status = GoalStatus.ON_TRACK
     else:
         status = GoalStatus.AT_RISK
     required_monthly: Decimal | None = None
     if status is not GoalStatus.MET and goal.period is GoalPeriod.YEAR:
-        remaining = goal.amount - current
+        remaining = goal.amount - current - scheduled_future
         if remaining > 0:
             required_monthly = _required_monthly(remaining, end.date(), now)
     link_pending = pending_transfer_delta(store, goal.account_id)
@@ -322,6 +394,7 @@ def contribution_progress(
         period_elapsed_percent=elapsed,
         required_monthly=required_monthly,
         pending_delta=pending_delta,
+        declared_total=declared_total,
     )
 
 
@@ -354,8 +427,11 @@ def contribution_history(
     ``contribution_matched_monthly``, ledger rows via
     ``transfer_applications_monthly`` — identical expressions to
     :func:`contribution_progress`), with the baseline added to the
-    bucket containing ``baseline_date``, so the newest bucket equals
-    this month's contribution sum to the cent.
+    bucket containing ``baseline_date`` and each ELAPSED scheduled
+    payday's ``recurring_amount`` folded into its month's ``actual``
+    (paydays after ``now`` don't tick yet — the bars step up every
+    payday, same accrual rule as the goal card), so the newest bucket
+    equals this month's contribution sum to the cent.
     """
     if goal.period is None or goal.account_id is None:  # pragma: no cover - table CHECK
         raise StoreError(f"contribution goal {goal.id} is missing account or period")
@@ -384,11 +460,31 @@ def contribution_history(
     if goal.baseline_amount is not None and goal.baseline_date is not None:
         baseline_at = _aware_utc(goal.baseline_date)
         baseline_bucket = date(baseline_at.year, baseline_at.month, 1)
+    declared: dict[date, Decimal] = {}
+    if (
+        goal.recurring_amount is not None
+        and goal.recurring_interval is not None
+        and goal.recurring_anchor is not None
+    ):
+        # Elapsed paydays only (p <= now) — a payday later this month
+        # hasn't accrued yet, matching the goal card.
+        for payday in _payday_dates(
+            goal.recurring_interval,
+            goal.recurring_anchor,
+            oldest_start.date(),
+            min(now.date(), newest_end.date() - timedelta(days=1)),
+        ):
+            key = date(payday.year, payday.month, 1)
+            declared[key] = declared.get(key, Decimal("0")) + goal.recurring_amount
     monthly_target = contribution_monthly_target(goal)
     out: list[ContributionPeriod] = []
     for start, end in reversed(bounds):
         key = start.date()
-        actual = matched.get(key, Decimal("0")) + applied.get(key, Decimal("0"))
+        actual = (
+            matched.get(key, Decimal("0"))
+            + applied.get(key, Decimal("0"))
+            + declared.get(key, Decimal("0"))
+        )
         if baseline_bucket == key and goal.baseline_amount is not None:
             actual += goal.baseline_amount
         out.append(
@@ -634,6 +730,10 @@ def describe_progress(progress: GoalProgress) -> str:
             f"contributed this {period_noun} — {progress.period_elapsed_percent}% "
             "of period elapsed"
         )
+        if progress.declared_total:
+            # Disclose the calculated portion: declared schedule, not
+            # observed in any feed.
+            line += f", of which {progress.declared_total} declared recurring"
         if progress.status is GoalStatus.MET:
             line += ", met"
         elif progress.status is GoalStatus.AT_RISK:

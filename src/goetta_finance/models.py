@@ -131,6 +131,15 @@ class Goal(BaseModel):
     match_pattern: str | None = None
     baseline_amount: Decimal | None = None
     baseline_date: datetime | None = None
+    # contribution (migration 0015): DECLARED recurring schedule —
+    # recurring_amount accrues per payday generated from
+    # recurring_anchor at recurring_interval ('weekly'|'biweekly'|
+    # 'monthly'), by calculation, never observed in any feed. The
+    # triple travels all-or-none (application-enforced; 0015 is plain
+    # ALTERs, no table CHECK).
+    recurring_amount: Decimal | None = None
+    recurring_interval: str | None = None
+    recurring_anchor: date | None = None
     created_at: datetime
 
 
@@ -160,6 +169,11 @@ class GoalProgress(BaseModel):
     # still-pending linked transfers, counted into the balance when they
     # settle; positive = approaching. None when the account has no links.
     pending_delta: Decimal | None = None
+    # contribution goals with a recurring schedule (0015): the DECLARED
+    # portion of ``current`` — paydays elapsed this period x
+    # recurring_amount. Internal (feeds the shared prose disclosure);
+    # NOT part of the list_goals wire shape.
+    declared_total: Decimal | None = None
 
 
 class TransferLink(BaseModel):
