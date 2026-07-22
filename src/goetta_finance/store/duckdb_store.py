@@ -129,6 +129,25 @@ def _match_cache_insert_sql(id_filter: str = "") -> str:
     """  # noqa: S608  # nosec B608
 
 
+def _pattern_match_clause(match_type: str) -> str:
+    """The description-OR-payee pattern predicate over ``transactions t``.
+
+    ONE home for the transfer-link/contribution matching semantics:
+    'contains' is a case-insensitive substring, 'regex' is
+    ``regexp_matches``, both evaluated against description OR payee.
+    Two hard-coded clauses; the pattern binds TWICE as a parameter.
+    Callers: ``_link_matched_transactions`` (0012 roll-forward) and the
+    ``contribution_matched_*`` methods (0014 goals) — they must never
+    drift, so neither builds its own clause.
+    """
+    if match_type == "contains":
+        return (
+            "(lower(t.description) LIKE '%' || lower(?) || '%' "
+            "OR lower(COALESCE(t.payee, '')) LIKE '%' || lower(?) || '%')"
+        )
+    return "(regexp_matches(t.description, ?) OR regexp_matches(COALESCE(t.payee, ''), ?))"
+
+
 def _sql_timeout_seconds() -> float:
     """Read ``query_sql`` statement-timeout from environment, default 30s.
 
@@ -1153,14 +1172,26 @@ class DuckDBStore:
         account_id: str | None = None,
         direction: str | None = None,
         target_date: date | None = None,
+        match_type: str | None = None,
+        match_pattern: str | None = None,
+        baseline_amount: Decimal | None = None,
+        baseline_date: datetime | None = None,
     ) -> Goal:
-        """Insert a goal (migration 0008). Returns the stored Goal.
+        """Insert a goal (migrations 0008/0014). Returns the stored Goal.
 
         Re-checks the per-kind column shape with friendly errors before
         the table CHECK constraint gets a chance to produce raw SQL
         text. Category lookup is case-insensitive; the "category not
         found: X" message shape is load-bearing (the CLI and MCP
         did-you-mean helpers key off it).
+
+        Contribution goals on a NON-manual account require a
+        ``match_pattern`` — a synced account's feed needs a matcher to
+        tell contributions from everything else. Manual accounts may
+        omit it: their transfer-link applications ledger already records
+        money in. ``match_pattern`` is stored as-is; the surface layers
+        run ``validators.validate_rule_pattern`` first, same contract as
+        ``add_rule`` / ``add_transfer_link``.
         """
         name = name.strip()
         if not name:
@@ -1177,8 +1208,28 @@ class DuckDBStore:
                 raise StoreError("balance goals require an account_id and a direction")
             if category_name is not None or period is not None:
                 raise StoreError("balance goals do not take a category or period")
+        elif kind == "contribution":
+            if account_id is None or period is None:
+                raise StoreError("contribution goals require an account_id and a period")
+            if category_name is not None or direction is not None or target_date is not None:
+                raise StoreError(
+                    "contribution goals do not take a category, direction, or target_date"
+                )
         else:
-            raise StoreError(f"kind must be 'spending_cap' or 'balance', got {kind!r}")
+            raise StoreError(
+                f"kind must be 'spending_cap', 'balance', or 'contribution', got {kind!r}"
+            )
+        if kind != "contribution":
+            if match_type is not None or match_pattern is not None:
+                raise StoreError("match_type/match_pattern only apply to contribution goals")
+            if baseline_amount is not None or baseline_date is not None:
+                raise StoreError("baseline_amount/baseline_date only apply to contribution goals")
+        if (match_type is None) != (match_pattern is None):
+            raise StoreError("match_type and match_pattern must be provided together")
+        if match_type is not None and match_type not in ("contains", "regex"):
+            raise StoreError(f"match_type must be 'contains' or 'regex', got {match_type!r}")
+        if (baseline_amount is None) != (baseline_date is None):
+            raise StoreError("baseline_amount and baseline_date must be provided together")
         with self._lock:
             dup_row = self.conn.execute(
                 "SELECT 1 FROM goals WHERE lower(name) = lower(?)", [name]
@@ -1199,21 +1250,43 @@ class DuckDBStore:
             resolved_account: str | None = None
             if account_id is not None:
                 acct_row = self.conn.execute(
-                    "SELECT name FROM accounts WHERE id = ?", [account_id]
+                    "SELECT name, is_manual FROM accounts WHERE id = ?", [account_id]
                 ).fetchone()
                 if acct_row is None:
                     raise StoreError(f"account not found: {account_id}")
                 resolved_account = acct_row[0]
+                if kind == "contribution" and match_pattern is None and not acct_row[1]:
+                    raise StoreError(
+                        f"contribution goals on a synced account need a match_pattern "
+                        f"to tell contributions apart from the rest of the feed; "
+                        f"{account_id} is not manual. Pass a pattern (e.g. the "
+                        "contribution row's description), or use a manual account "
+                        "fed by transfer links."
+                    )
             try:
                 row = self.conn.execute(
                     """
                     INSERT INTO goals
                         (name, kind, amount, category_id, period,
-                         account_id, direction, target_date)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                         account_id, direction, target_date,
+                         match_type, match_pattern, baseline_amount, baseline_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     RETURNING id, created_at
                     """,
-                    [name, kind, amount, category_id, period, account_id, direction, target_date],
+                    [
+                        name,
+                        kind,
+                        amount,
+                        category_id,
+                        period,
+                        account_id,
+                        direction,
+                        target_date,
+                        match_type,
+                        match_pattern,
+                        baseline_amount,
+                        _to_naive_utc(baseline_date),
+                    ],
                 ).fetchone()
             except duckdb.Error as exc:
                 raise StoreError(f"add_goal failed: {exc}") from exc
@@ -1234,6 +1307,10 @@ class DuckDBStore:
             account_name=resolved_account,
             direction=GoalDirection(direction) if direction is not None else None,
             target_date=target_date,
+            match_type=match_type,
+            match_pattern=match_pattern,
+            baseline_amount=baseline_amount,
+            baseline_date=_from_naive_utc(_to_naive_utc(baseline_date)),
             created_at=created_at,
         )
 
@@ -1244,7 +1321,8 @@ class DuckDBStore:
                 """
                 SELECT g.id, g.name, g.kind, g.amount, g.category_id, c.name,
                        g.period, g.account_id, a.name, g.direction,
-                       g.target_date, g.created_at
+                       g.target_date, g.created_at, g.match_type, g.match_pattern,
+                       g.baseline_amount, g.baseline_date
                 FROM goals g
                 LEFT JOIN categories c ON c.id = g.category_id
                 LEFT JOIN accounts a ON a.id = g.account_id
@@ -1277,8 +1355,161 @@ class DuckDBStore:
             account_name=row[8],
             direction=GoalDirection(row[9]) if row[9] is not None else None,
             target_date=row[10],
+            match_type=row[12],
+            match_pattern=row[13],
+            baseline_amount=Decimal(row[14]) if row[14] is not None else None,
+            baseline_date=_from_naive_utc(row[15]),
             created_at=created_at,
         )
+
+    def contribution_matched_sum(
+        self,
+        account_id: str,
+        *,
+        match_type: str,
+        pattern: str,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        pending: bool = False,
+    ) -> Decimal:
+        """SUM(abs(amount)) of the account's own matched transactions.
+
+        The read side of contribution goals (migration 0014): matching
+        mirrors ``_link_matched_transactions`` exactly — 'contains' is a
+        case-insensitive substring, 'regex' is ``regexp_matches``, both
+        against description OR payee (``_pattern_match_clause`` is the
+        one home). ABSOLUTE values: brokerage feeds commonly sign
+        cash-in negative, so sign is presentation, not direction — a
+        matched row always counts toward the goal.
+
+        ``start`` (inclusive) / ``end`` (exclusive) are the UTC period
+        bounds, normalized to naive UTC at the bind boundary
+        (``_to_naive_utc``) so the window never shifts through the
+        session time zone. ``pending=True`` sums still-pending matches
+        (the ``pending_delta`` preview) — deliberately unwindowed, like
+        the pending set itself: it is a snapshot, not history.
+        """
+        clauses = ["t.account_id = ?", "t.pending = ?", _pattern_match_clause(match_type)]
+        params: list[Any] = [account_id, pending, pattern, pattern]
+        if start is not None:
+            clauses.append("t.posted >= ?")
+            params.append(_to_naive_utc(start))
+        if end is not None:
+            clauses.append("t.posted < ?")
+            params.append(_to_naive_utc(end))
+        with self._lock:
+            # ruff S608 / bandit B608: ``clauses`` is a fixed allow-list of
+            # column predicates plus one of _pattern_match_clause's two
+            # hard-coded strings; every value binds via ``params``.
+            row = self.conn.execute(
+                f"""
+                SELECT COALESCE(SUM(abs(t.amount)), 0)
+                FROM transactions t
+                WHERE {" AND ".join(clauses)}
+                """,  # noqa: S608  # nosec B608
+                params,
+            ).fetchone()
+        if row is None or row[0] is None:  # pragma: no cover - COALESCE
+            return Decimal("0")
+        return Decimal(row[0])
+
+    def contribution_matched_monthly(
+        self,
+        account_id: str,
+        *,
+        match_type: str,
+        pattern: str,
+        start: datetime,
+        end: datetime,
+    ) -> dict[date, Decimal]:
+        """Settled matched SUM(abs(amount)) per UTC calendar month.
+
+        The bucketed sibling of :meth:`contribution_matched_sum` (same
+        match clause, same abs-sum expression, settled only) so
+        ``goals.contribution_history`` fetches all its months in one
+        query — the ``query_category_spending_by_bucket`` pattern.
+        Sparse: months with no matches are absent; keys are the first
+        day of the month.
+        """
+        match_clause = _pattern_match_clause(match_type)
+        with self._lock:
+            # ruff S608 / bandit B608: see contribution_matched_sum.
+            rows = self.conn.execute(
+                f"""
+                SELECT date_trunc('month', t.posted) AS month_start,
+                       SUM(abs(t.amount)) AS total
+                FROM transactions t
+                WHERE t.account_id = ?
+                  AND t.pending = FALSE
+                  AND t.posted >= ?
+                  AND t.posted < ?
+                  AND {match_clause}
+                GROUP BY 1
+                """,  # noqa: S608  # nosec B608
+                [account_id, _to_naive_utc(start), _to_naive_utc(end), pattern, pattern],
+            ).fetchall()
+        out: dict[date, Decimal] = {}
+        for row in rows:
+            key = row[0].date() if isinstance(row[0], datetime) else row[0]
+            out[key] = Decimal(row[1])
+        return out
+
+    def transfer_applications_sum(
+        self, account_id: str, *, start: datetime | None = None, end: datetime | None = None
+    ) -> Decimal:
+        """SUM(amount) of the account's transfer-link applications ledger
+        rows with ``posted`` in [start, end).
+
+        Ledger amounts are already signed money-IN (an outflow from the
+        source was recorded as positive), so no abs() here — a transfer
+        back out genuinely reduces the period's contributions. Counts
+        rows regardless of whether their link still exists: applied
+        money stayed applied (the 0012 unlink contract).
+        """
+        clauses = ["account_id = ?"]
+        params: list[Any] = [account_id]
+        if start is not None:
+            clauses.append("posted >= ?")
+            params.append(_to_naive_utc(start))
+        if end is not None:
+            clauses.append("posted < ?")
+            params.append(_to_naive_utc(end))
+        with self._lock:
+            # ruff S608 / bandit B608: fixed literal predicates, values
+            # bind via ``params``.
+            row = self.conn.execute(
+                f"""
+                SELECT COALESCE(SUM(amount), 0)
+                FROM transfer_link_applications
+                WHERE {" AND ".join(clauses)}
+                """,  # noqa: S608  # nosec B608
+                params,
+            ).fetchone()
+        if row is None or row[0] is None:  # pragma: no cover - COALESCE
+            return Decimal("0")
+        return Decimal(row[0])
+
+    def transfer_applications_monthly(
+        self, account_id: str, *, start: datetime, end: datetime
+    ) -> dict[date, Decimal]:
+        """SUM(amount) of ledger rows per UTC calendar month — the
+        bucketed sibling of :meth:`transfer_applications_sum`, for
+        ``goals.contribution_history``. Sparse, keyed by month start."""
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT date_trunc('month', posted) AS month_start, SUM(amount) AS total
+                FROM transfer_link_applications
+                WHERE account_id = ? AND posted >= ? AND posted < ?
+                GROUP BY 1
+                """,
+                [account_id, _to_naive_utc(start), _to_naive_utc(end)],
+            ).fetchall()
+        out: dict[date, Decimal] = {}
+        for row in rows:
+            key = row[0].date() if isinstance(row[0], datetime) else row[0]
+            out[key] = Decimal(row[1])
+        return out
 
     def add_transfer_link(
         self,
@@ -1439,15 +1670,7 @@ class DuckDBStore:
         return self._link_matched_transactions(link, pending=True)
 
     def _link_matched_transactions(self, link: TransferLink, *, pending: bool) -> list[Transaction]:
-        if link.match_type == "contains":
-            match_clause = (
-                "(lower(t.description) LIKE '%' || lower(?) || '%' "
-                "OR lower(COALESCE(t.payee, '')) LIKE '%' || lower(?) || '%')"
-            )
-        else:
-            match_clause = (
-                "(regexp_matches(t.description, ?) OR regexp_matches(COALESCE(t.payee, ''), ?))"
-            )
+        match_clause = _pattern_match_clause(link.match_type)
         with self._lock:
             # ruff S608 / bandit B608: ``match_clause`` is one of two
             # hard-coded strings; the pattern binds via parameters.
