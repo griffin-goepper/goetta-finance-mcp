@@ -31,6 +31,9 @@ from goetta_finance.tools.categorize import (
 from goetta_finance.tools.goals import list_goals as _list_goals
 from goetta_finance.tools.goals import remove_goal as _remove_goal
 from goetta_finance.tools.goals import set_goal as _set_goal
+from goetta_finance.tools.set_account_balance import (
+    set_account_balance as _set_account_balance,
+)
 from goetta_finance.tools.spending_by_category import (
     spending_by_category as _spending_by_category,
 )
@@ -230,10 +233,12 @@ the link's anchor through the same write path as `account set-balance`
 (accounts.balance plus a balance_snapshots row), and records them in
 transfer_link_applications so nothing ever double-counts. This is
 write-time bookkeeping, not read-time resolution: balances and
-snapshots stay authoritative, and a `set-balance` true-up re-anchors
-the links (that's also how interest gets captured — transfer sums
-can't see it). Prefer the list_transfer_links / link_account_transfers
-/ unlink_account_transfers tools over ad-hoc SQL on these tables.
+snapshots stay authoritative, and a `set-balance` true-up (the
+set_account_balance tool, or `goetta-finance account set-balance`)
+re-anchors the links (that's also how interest gets captured — transfer
+sums can't see it). Prefer the list_transfer_links /
+link_account_transfers / unlink_account_transfers tools over ad-hoc SQL
+on these tables.
 
 Money columns are DECIMAL(18,2); timestamps are TIMESTAMP in UTC. Transaction
 `amount` is signed (negative = money out). Results are well-suited to be
@@ -744,5 +749,63 @@ def build_server(
         link_id: Annotated[int, Field(ge=1, description="Link id from list_transfer_links.")],
     ) -> dict[str, Any]:
         return _unlink_account_transfers(store, link_id)
+
+    @mcp.tool(
+        description=(
+            "Update a MANUAL account's balance — a true-up for interest, "
+            "market movement, or anything transfer sums can't see. MANUAL "
+            "accounts only (ids starting MANUAL-...): synced accounts get "
+            "their balance from SimpleFIN and a manual edit would be "
+            "overwritten. Writes the new balance plus a balance_snapshots "
+            "row so net-worth-over-time reflects it, and re-anchors the "
+            "account's transfer links at as_of: linked transfers posted "
+            "after the true-up still auto-apply — each once and only once — "
+            "so nothing double-counts. Example: account='Apple Savings' (or "
+            "'MANUAL-1a2b...'), balance=30450.12, as_of='2026-07-01' "
+            "(optional ISO date/datetime, default now UTC, never future). "
+            "Errors return {ok: false, error} with a did-you-mean for "
+            "account-name typos. Confirm the account and amount with the "
+            "user before writing. AUTOMATIC balance roll-forward on "
+            "matching transfers is the transfer-links feature "
+            "(link_account_transfers / list_transfer_links) — use this tool "
+            "for drift/interest true-ups, not per-contribution bookkeeping."
+        )
+    )
+    def set_account_balance(
+        account: Annotated[
+            str,
+            Field(
+                description=(
+                    "Account id (e.g. 'MANUAL-1a2b...') or account name "
+                    "(case-insensitive, e.g. 'Apple Savings')."
+                )
+            ),
+        ],
+        balance: Annotated[
+            float,
+            Field(
+                description=(
+                    "The account's true current balance, e.g. 30450.12. "
+                    "Signed as the account carries it."
+                )
+            ),
+        ],
+        as_of: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional ISO date or datetime the balance was observed "
+                    "(e.g. '2026-07-01' or '2026-07-01T12:00:00Z'). Default "
+                    "now (UTC). Must not be in the future."
+                )
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        # Same wire-boundary rationale as set_goal: str() gives the exact
+        # shortest repr, so JSON amounts convert to Decimal without float
+        # artifacts before reaching the shared write path.
+        return _set_account_balance(
+            store, account=account, balance=Decimal(str(balance)), as_of=as_of
+        )
 
     return mcp

@@ -82,6 +82,7 @@ async def test_server_lists_expected_tools(store: DuckDBStore) -> None:
             "list_transfer_links",
             "link_account_transfers",
             "unlink_account_transfers",
+            "set_account_balance",
         }
 
 
@@ -448,6 +449,72 @@ def test_schema_hint_communicates_categorization_semantics() -> None:
             "identifier names alone don't tell Claude how to use the "
             "view; please re-check the categorization paragraph."
         )
+
+
+@pytest.mark.anyio
+async def test_server_set_account_balance_e2e(store: DuckDBStore) -> None:
+    """Full MCP round-trip for the manual-balance true-up: update by
+    name (case-insensitive) → balance + snapshot written; non-manual
+    refused; unknown name gets a did-you-mean."""
+    store.upsert_accounts(
+        [
+            Account(
+                id="tu-e2e-chk",
+                org_name="Bank",
+                name="Checking",
+                balance=Decimal("100.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.CHECKING,
+            ),
+            Account(
+                id="MANUAL-tu-e2e",
+                name="Apple Savings",
+                balance=Decimal("25000.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.SAVINGS,
+                is_manual=True,
+            ),
+        ]
+    )
+    mcp = build_server(store)
+    async with create_connected_server_and_client_session(mcp) as session:
+        await session.initialize()
+
+        result = await session.call_tool(
+            "set_account_balance",
+            {"account": "apple savings", "balance": 30450.12, "as_of": "2026-06-01"},
+        )
+        payload = _decode(result)
+        assert payload["ok"] is True, payload
+        assert payload["account"]["id"] == "MANUAL-tu-e2e"
+        assert payload["account"]["balance"] == "30450.12"
+        assert payload["snapshot"]["balance"] == "30450.12"
+        assert payload["snapshot"]["timestamp"].startswith("2026-06-01")
+        assert payload["links_reanchored"] == 0
+        assert payload["transfers_reapplied"] == []
+        acc = next(a for a in store.get_accounts() if a.id == "MANUAL-tu-e2e")
+        assert acc.balance == Decimal("30450.12")
+        snaps = store.conn.execute(
+            "SELECT balance FROM balance_snapshots WHERE account_id = 'MANUAL-tu-e2e'"
+        ).fetchall()
+        assert [r[0] for r in snaps] == [Decimal("30450.12")]
+
+        # Non-manual accounts are refused — sync owns those balances.
+        result = await session.call_tool(
+            "set_account_balance", {"account": "tu-e2e-chk", "balance": 1}
+        )
+        payload = _decode(result)
+        assert payload["ok"] is False
+        assert "non-manual" in payload["error"]
+        assert "SimpleFIN" in payload["error"]
+
+        # Unknown names get a difflib did-you-mean.
+        result = await session.call_tool(
+            "set_account_balance", {"account": "Aple Savings", "balance": 1}
+        )
+        payload = _decode(result)
+        assert payload["ok"] is False
+        assert 'Did you mean "Apple Savings"?' in payload["error"]
 
 
 @pytest.mark.anyio

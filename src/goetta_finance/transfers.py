@@ -25,8 +25,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import NamedTuple
 
+from goetta_finance.errors import BalanceTrueUpError
 from goetta_finance.models import (
+    Account,
     BalanceSnapshot,
     Transaction,
     TransferLink,
@@ -132,6 +135,73 @@ def apply_transfer_links(store: FinanceStore) -> list[str]:
     return lines
 
 
+class TrueUpResult(NamedTuple):
+    """What a manual-balance true-up did — one shape for both surfaces.
+
+    ``account`` is the post-true-up row, including any linked transfers
+    that re-applied on top of the declared balance, so its balance is
+    the honest final figure. ``snapshot`` is the ``balance_snapshots``
+    row written for the declared balance itself. ``links_reanchored``
+    counts the transfer links whose anchor moved to ``as_of``;
+    ``applied`` carries :func:`apply_transfer_links`' summary lines
+    (empty when the account has no links or nothing was eligible).
+    """
+
+    account: Account
+    snapshot: BalanceSnapshot
+    links_reanchored: int
+    applied: list[str]
+
+
+def true_up_manual_balance(
+    store: FinanceStore,
+    account_id: str,
+    balance: Decimal,
+    as_of: datetime,
+) -> TrueUpResult:
+    """Declare a manual account's true balance as of a moment.
+
+    THE ``set-balance`` write path: CLI ``account set-balance`` and the
+    MCP ``set_account_balance`` tool both call this so the two surfaces
+    can't drift. Writes ``accounts.balance``/``balance_date`` plus a
+    ``balance_snapshots`` row so net-worth-over-time reflects the
+    change, then re-anchors the account's transfer links at ``as_of``:
+    the declared balance speaks for everything posted at or before it,
+    and matched transfers posted after it (re-)apply against the new
+    base immediately — each at most once ever, enforced by the
+    applications ledger — so the returned balance is honest and later
+    syncs can't double-count.
+
+    Raises :class:`BalanceTrueUpError` for an unknown account, a
+    non-manual account (sync owns those balances), a non-finite
+    balance, or a future ``as_of`` (``as_of`` must be tz-aware UTC —
+    both surfaces normalize before calling).
+    """
+    account = next((a for a in store.get_accounts() if a.id == account_id), None)
+    if account is None:
+        raise BalanceTrueUpError(f"account not found: {account_id}")
+    if not account.is_manual:
+        raise BalanceTrueUpError(f"refusing to update non-manual account: {account_id}")
+    if not balance.is_finite():
+        raise BalanceTrueUpError(f"balance must be a finite number, got {balance}")
+    if as_of > datetime.now(tz=UTC):
+        raise BalanceTrueUpError("as_of cannot be in the future")
+    updated = account.model_copy(update={"balance": balance, "balance_date": as_of})
+    store.upsert_accounts([updated])
+    snapshot = BalanceSnapshot(account_id=account_id, balance=balance, timestamp=as_of)
+    store.record_balance_snapshot(snapshot)
+    links_reanchored = store.reset_transfer_link_anchors(account_id, as_of)
+    applied = apply_transfer_links(store) if links_reanchored else []
+    if applied:
+        updated = next(a for a in store.get_accounts() if a.id == account_id)
+    return TrueUpResult(
+        account=updated,
+        snapshot=snapshot,
+        links_reanchored=links_reanchored,
+        applied=applied,
+    )
+
+
 def pending_transfer_delta(store: FinanceStore, account_id: str) -> Decimal | None:
     """Signed sum the account's links WOULD apply from still-pending
     source transactions — a read-time preview of the next roll-forward.
@@ -233,9 +303,11 @@ def _aware(value: datetime) -> datetime:
 
 __all__ = [
     "SUGGESTION_MIN_TRANSACTIONS",
+    "TrueUpResult",
     "apply_transfer_links",
     "describe_link",
     "describe_suggestion",
     "pending_transfer_delta",
     "transfer_link_suggestions",
+    "true_up_manual_balance",
 ]
