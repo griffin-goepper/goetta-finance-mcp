@@ -602,6 +602,10 @@ def test_get_transactions_view_route_perf_under_10k(store: DuckDBStore) -> None:
         FROM range(0, 10000) AS t(i)
         """
     )
+    # The raw in-engine INSERT bypasses upsert_transactions' write-through
+    # cache maintenance (migration 0013), so rebuild explicitly — exactly
+    # the documented use of the public rebuild method.
+    store.rebuild_category_match_cache()
 
     durations_ms: list[float] = []
     for _ in range(10):

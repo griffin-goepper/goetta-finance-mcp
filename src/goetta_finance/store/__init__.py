@@ -100,6 +100,11 @@ class FinanceStore(Protocol):
 
     def clear_transaction_override(self, transaction_id: str) -> None: ...
 
+    # Rule-match cache (migration 0013). Maintained write-through by the
+    # methods above; exposed for callers that write transactions or rules
+    # around the store (in-engine bulk loads in tests, repair scripts).
+    def rebuild_category_match_cache(self) -> None: ...
+
     # Goals (migration 0008). Progress/status is NOT a store concern —
     # it's computed read-time by goals.py from these definitions plus
     # the existing read methods.
