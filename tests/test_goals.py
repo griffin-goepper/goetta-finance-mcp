@@ -11,6 +11,8 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 
+import pytest
+
 from goetta_finance.goals import (
     balance_goal_progress,
     evaluate_goals,
@@ -515,6 +517,39 @@ def test_evaluate_goals_pending_delta_via_transfer_links(store: DuckDBStore) -> 
 
 def test_evaluate_goals_empty_store(store: DuckDBStore) -> None:
     assert evaluate_goals(store, now=NOW) == []
+
+
+def test_evaluate_goals_one_spending_query_per_distinct_period(
+    store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression pin for the 2026-07 dashboard slowdown: with N caps,
+    evaluate_goals must issue ONE spending query per DISTINCT period,
+    not one per cap (measured live: 6 month caps made /goals a 4.3s
+    endpoint). Three month caps + one year cap → exactly two queries,
+    with per-goal results identical to the per-goal path."""
+    import goetta_finance.goals as goals_module
+
+    _seed_account(store)
+    _add_txn(store, "t-batch", "-100.00")
+    for category, amount in (("Dining", "400"), ("Groceries", "300"), ("Shopping", "200")):
+        _cap(store, category=category, amount=amount)
+    _cap(store, category="Gas", amount="1200", period="year")
+
+    calls: list[tuple[datetime, datetime]] = []
+    real = goals_module.query_spending_by_category
+
+    def counting(store_: DuckDBStore, start: datetime, end: datetime, **kwargs: bool) -> list:
+        calls.append((start, end))
+        return real(store_, start, end, **kwargs)
+
+    monkeypatch.setattr(goals_module, "query_spending_by_category", counting)
+    progresses = evaluate_goals(store, now=NOW)
+
+    assert len(calls) == 2
+    by_name = {p.goal.name: p for p in progresses}
+    assert by_name["Dining cap"].current == Decimal("100.00")
+    assert by_name["Groceries cap"].current == Decimal("0")
+    assert by_name["Gas cap"].current == Decimal("0")
 
 
 # --- goal_breach_warnings ----------------------------------------------------

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any
 
 from goetta_finance.store import FinanceStore
@@ -68,6 +69,56 @@ def query_spending_by_category(
         ORDER BY total DESC
     """  # noqa: S608  # nosec B608
     return store.query_sql(sql, [start, end])
+
+
+def query_category_spending_by_bucket(
+    store: FinanceStore,
+    start: datetime,
+    end: datetime,
+    *,
+    category: str,
+    bucket: str,
+) -> dict[date, Decimal]:
+    """Net spending for ONE category, grouped into calendar buckets.
+
+    The bucketed sibling of :func:`query_spending_by_category`, added so
+    ``goals.spending_cap_history`` can fetch all its periods in one
+    query instead of one full scan per bucket. Same semantics contract:
+    the identical net-spending CASE (a positive amount in Uncategorized
+    contributes 0; refunds reduce), hidden accounts excluded, pending
+    included, UTC ``date_trunc`` calendar buckets — so each bucket
+    equals to the cent what ``query_spending_by_category`` returns for
+    that bucket's bounds. There is no ``is_spending`` filter: the
+    explicit ``category`` filter matches ``include_non_spending=True``
+    behavior (a cap keeps tracking a category later reclassified as
+    non-spending).
+
+    Sparse: buckets with no activity are absent — callers zero-fill.
+    Keys are the first day of each bucket.
+    """
+    if bucket not in ("month", "year"):
+        raise ValueError(f"bucket must be 'month' or 'year', got {bucket!r}")
+    # ruff S608 / bandit B608: ``bucket`` is whitelisted to two literals
+    # just above; everything else binds via the params list.
+    sql = f"""
+        SELECT
+            date_trunc('{bucket}', t.posted) AS period_start,
+            SUM(CASE WHEN t.amount > 0 AND t.category = 'Uncategorized'
+                     THEN 0 ELSE -t.amount END) AS total
+        FROM transactions_with_category t
+        WHERE t.posted >= ? AND t.posted <= ?
+          AND COALESCE(t.account_is_hidden, FALSE) = FALSE
+          AND t.category = ?
+        GROUP BY 1
+    """  # noqa: S608  # nosec B608
+    rows = store.query_sql(sql, [start, end, category])
+    out: dict[date, Decimal] = {}
+    for row in rows:
+        p = row["period_start"]
+        key = p.date() if isinstance(p, datetime) else p
+        total = row["total"]
+        out[key] = total if isinstance(total, Decimal) else Decimal(str(total))
+    return out
 
 
 def spending_by_category(
