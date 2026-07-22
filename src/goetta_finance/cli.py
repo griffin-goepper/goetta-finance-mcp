@@ -24,7 +24,7 @@ from goetta_finance.config import (
     write_default_prefixes_file,
 )
 from goetta_finance.daemon import run_daemon
-from goetta_finance.errors import GoettaFinanceError, SetupTokenError
+from goetta_finance.errors import BalanceTrueUpError, GoettaFinanceError, SetupTokenError
 from goetta_finance.goals import (
     describe_goal,
     describe_progress,
@@ -62,6 +62,7 @@ from goetta_finance.transfers import (
     describe_link,
     describe_suggestion,
     transfer_link_suggestions,
+    true_up_manual_balance,
 )
 from goetta_finance.validators import (
     GoalValidationError,
@@ -1025,37 +1026,22 @@ def account_set_balance(
         typer.secho(f"account set-balance failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
     try:
-        existing = next((a for a in store.get_accounts() if a.id == account_id), None)
-        if existing is None:
-            typer.secho(f"account not found: {account_id}", fg=typer.colors.RED, err=True)
-            raise typer.Exit(code=1)
-        if not existing.is_manual:
-            typer.secho(
-                f"refusing to update non-manual account: {account_id}",
-                fg=typer.colors.RED,
-                err=True,
-            )
-            raise typer.Exit(code=1)
         balance_value = _parse_decimal(balance, field="balance")
         balance_date = _parse_as_of(as_of)
-        updated = existing.model_copy(
-            update={"balance": balance_value, "balance_date": balance_date}
-        )
-        store.upsert_accounts([updated])
-        store.record_balance_snapshot(
-            BalanceSnapshot(account_id=account_id, balance=balance_value, timestamp=balance_date)
-        )
+        # Shared write path (transfers.true_up_manual_balance): updates
+        # the balance, records the snapshot, and re-anchors any transfer
+        # links so matched transfers posted after --as-of re-apply
+        # against the new base (so the echoed final balance is honest).
+        result = true_up_manual_balance(store, account_id, balance_value, as_of=balance_date)
         typer.echo(
-            f"Updated {account_id}: {balance_value:.2f} {existing.currency} as of "
+            f"Updated {account_id}: {balance_value:.2f} {result.account.currency} as of "
             f"{balance_date.astimezone().isoformat(timespec='seconds')}"
         )
-        # A true-up on a linked account re-anchors its links: the new
-        # balance speaks for everything posted at or before --as-of, and
-        # matched transfers posted after it re-apply against the new
-        # base immediately (so the echoed final balance is honest).
-        if store.reset_transfer_link_anchors(account_id, balance_date):
-            for line in apply_transfer_links(store):
-                typer.echo(f"  transfer: {line}")
+        for line in result.applied:
+            typer.echo(f"  transfer: {line}")
+    except BalanceTrueUpError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
     except GoettaFinanceError as exc:
         typer.secho(f"account set-balance failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
