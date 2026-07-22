@@ -87,6 +87,48 @@ _UPSERT_SET_CLAUSE = (
 )
 
 
+def _match_cache_insert_sql(id_filter: str = "") -> str:
+    """INSERT that (re)computes ``category_match_cache`` rows.
+
+    The ONE home for the rule-match semantics since migration 0013 moved
+    them out of the ``transactions_with_category`` view: 'contains' is a
+    case-insensitive substring on description, 'regex' is
+    ``regexp_matches`` on description, optional amount bounds refine as
+    half-open ``[min, max)`` on ``abs(amount)``, and the lowest-priority
+    rule wins with id as the tie-break — byte-equivalent predicates to
+    0009's inline view. Description remains the only matched text (payee
+    is derived from it; memo is the documented prompt-injection surface —
+    see 0004).
+
+    ``id_filter`` is either empty (full rebuild) or a caller-supplied
+    ``AND t.id IN (?, ?, ...)`` of pure parameter markers (targeted
+    refresh after an upsert).
+    """
+    # ruff S608 / bandit B608: ``id_filter`` is "" or "AND t.id IN (?, ...)"
+    # composed of parameter markers only; values bind via params.
+    return f"""
+        INSERT INTO category_match_cache (transaction_id, category_id)
+        SELECT transaction_id, category_id FROM (
+            SELECT
+                t.id AS transaction_id,
+                r.category_id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY t.id ORDER BY r.priority ASC, r.id ASC
+                ) AS rn
+            FROM transactions t
+            JOIN category_rules r ON
+                (
+                    (r.match_type = 'contains'
+                     AND lower(t.description) LIKE '%' || lower(r.pattern) || '%')
+                    OR (r.match_type = 'regex' AND regexp_matches(t.description, r.pattern))
+                )
+                AND (r.min_amount IS NULL OR abs(t.amount) >= r.min_amount)
+                AND (r.max_amount IS NULL OR abs(t.amount) < r.max_amount)
+            WHERE TRUE {id_filter}
+        ) WHERE rn = 1
+    """  # noqa: S608  # nosec B608
+
+
 def _sql_timeout_seconds() -> float:
     """Read ``query_sql`` statement-timeout from environment, default 30s.
 
@@ -289,6 +331,13 @@ class DuckDBStore:
                     raise StoreError(f"Migration {name} failed: {exc}") from exc
                 applied_any = True
             if applied_any:
+                # Any migration can change matching inputs (0013 created
+                # the cache empty on purpose; a future one might seed
+                # default rules), so a full rebuild after applying is the
+                # blanket safety net. No-migration opens skip it — the
+                # cache persists on disk and the write paths keep it
+                # current.
+                self.rebuild_category_match_cache()
                 # Flush freshly applied DDL out of the WAL immediately.
                 # DuckDB's WAL replay chokes on CREATE OR REPLACE VIEW
                 # entries ("GetDefaultDatabase with no default database
@@ -299,6 +348,59 @@ class DuckDBStore:
                 # here closes that window — migration DDL never outlives
                 # init() in the WAL.
                 self.conn.execute("CHECKPOINT")
+
+    def rebuild_category_match_cache(self) -> None:
+        """Recompute ``category_match_cache`` for every transaction.
+
+        This is where the O(transactions x rules) pattern-matching cost
+        lives since migration 0013 — paid once per rules change (and per
+        migration batch) instead of on every read of
+        ``transactions_with_category``. Runs automatically from
+        ``add_rule`` / ``remove_rule`` / ``init``; call it directly only
+        after writing transactions or rules around the store's methods
+        (e.g. an in-engine bulk load in a test or maintenance script).
+
+        DELETE + INSERT under one transaction so a crash mid-rebuild
+        can't persist a half-built cache; the store lock already keeps
+        concurrent readers from observing the intermediate state.
+        """
+        with self._lock:
+            self.conn.execute("BEGIN")
+            try:
+                self._rebuild_category_match_cache_statements()
+                self.conn.execute("COMMIT")
+            except duckdb.Error as exc:
+                self.conn.execute("ROLLBACK")
+                raise StoreError(f"category match cache rebuild failed: {exc}") from exc
+
+    def _rebuild_category_match_cache_statements(self) -> None:
+        """Bare rebuild statements, for callers managing their own
+        transaction (``add_rule`` / ``remove_rule`` run these atomically
+        with the rule write itself, so no reader — and no crash — can
+        observe a rule without its retroactive effect)."""
+        self.conn.execute("DELETE FROM category_match_cache")
+        self.conn.execute(_match_cache_insert_sql())
+
+    def _refresh_category_match_cache(self, ids: Sequence[str]) -> None:
+        """Recompute cache rows for just ``ids`` (upserted transactions).
+
+        Caller holds the lock and an open transaction. Cost is
+        len(ids) x rules — trivial for sync-sized batches, and one
+        set-based pass even for importer-sized ones.
+        """
+        if not ids:
+            return
+        placeholders = ", ".join(["?"] * len(ids))
+        # ruff S608 / bandit B608: interpolation is parameter markers
+        # only, matching the audited pattern in ``upsert_transactions``.
+        self.conn.execute(
+            f"DELETE FROM category_match_cache WHERE transaction_id IN ({placeholders})",  # noqa: S608  # nosec B608
+            list(ids),
+        )
+        self.conn.execute(
+            _match_cache_insert_sql(f"AND t.id IN ({placeholders})"),
+            list(ids),
+        )
 
     def upsert_accounts(self, accounts: list[Account]) -> None:
         if not accounts:
@@ -527,25 +629,36 @@ class DuckDBStore:
                     updated_count += 1
                 else:
                     new_count += 1
-            self.conn.executemany(
-                """
-                INSERT INTO transactions (
-                    id, account_id, posted, transacted_at, amount, description,
-                    payee, memo, pending, extra
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (id) DO UPDATE SET
-                    account_id = excluded.account_id,
-                    posted = excluded.posted,
-                    transacted_at = excluded.transacted_at,
-                    amount = excluded.amount,
-                    description = excluded.description,
-                    payee = excluded.payee,
-                    memo = excluded.memo,
-                    pending = excluded.pending,
-                    extra = excluded.extra
-                """,
-                rows,
-            )
+            # One transaction around upsert + cache refresh: an update can
+            # change description/amount (pending settling is the common
+            # case), so the matched rule must move with it — never persist
+            # one without the other.
+            self.conn.execute("BEGIN")
+            try:
+                self.conn.executemany(
+                    """
+                    INSERT INTO transactions (
+                        id, account_id, posted, transacted_at, amount, description,
+                        payee, memo, pending, extra
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (id) DO UPDATE SET
+                        account_id = excluded.account_id,
+                        posted = excluded.posted,
+                        transacted_at = excluded.transacted_at,
+                        amount = excluded.amount,
+                        description = excluded.description,
+                        payee = excluded.payee,
+                        memo = excluded.memo,
+                        pending = excluded.pending,
+                        extra = excluded.extra
+                    """,
+                    rows,
+                )
+                self._refresh_category_match_cache(ids)
+                self.conn.execute("COMMIT")
+            except duckdb.Error:
+                self.conn.execute("ROLLBACK")
+                raise
             return SyncResult(new=new_count, updated=updated_count)
 
     def delete_stale_pending(self, account_ids: Collection[str], keep_ids: Collection[str]) -> int:
@@ -585,6 +698,13 @@ class DuckDBStore:
             stale_ph = ", ".join(["?"] * len(stale))
             self.conn.execute(
                 f"DELETE FROM transaction_overrides WHERE transaction_id IN ({stale_ph})",  # noqa: S608  # nosec B608
+                stale,
+            )
+            # Cache rows go with the transactions (no FK — same 0011
+            # rationale as overrides; an orphan would be inert behind the
+            # view's INNER-from-transactions shape, but don't leave one).
+            self.conn.execute(
+                f"DELETE FROM category_match_cache WHERE transaction_id IN ({stale_ph})",  # noqa: S608  # nosec B608
                 stale,
             )
             self.conn.execute(
@@ -682,9 +802,9 @@ class DuckDBStore:
             clauses.append("posted <= ?")
             params.append(_to_naive_utc(end))
         # When category is requested OR we need to filter hidden accounts,
-        # route through the view (it carries ``account_is_hidden``). The
-        # view's CTEs evaluate the rule-matching join, so we only pay
-        # that cost when category info is in scope.
+        # route through the view (it carries ``account_is_hidden``). Since
+        # migration 0013 the view is a plain join over the match cache,
+        # so the routing choice is about column scope, not cost.
         use_view = category is not None or not include_hidden
         source = "transactions_with_category" if use_view else "transactions"
         if category is not None:
@@ -926,6 +1046,10 @@ class DuckDBStore:
             ).fetchone()
             if cat_row is None:
                 raise StoreError(f"category not found: {category_name}")
+            # Rule write + cache rebuild commit together: the rebuild IS
+            # the retroactive application of the new rule (0013), so one
+            # must never land without the other.
+            self.conn.execute("BEGIN")
             try:
                 row = self.conn.execute(
                     """
@@ -944,7 +1068,10 @@ class DuckDBStore:
                         max_amount,
                     ],
                 ).fetchone()
+                self._rebuild_category_match_cache_statements()
+                self.conn.execute("COMMIT")
             except duckdb.Error as exc:
+                self.conn.execute("ROLLBACK")
                 raise StoreError(f"add_rule failed: {exc}") from exc
         if row is None:
             raise StoreError("add_rule did not return a row")
@@ -966,7 +1093,16 @@ class DuckDBStore:
                 raise StoreError(f"rule not found: {rule_id}")
             if bool(row[0]) and not force:
                 raise StoreError(f"refusing to remove default rule {rule_id} without force=True")
-            self.conn.execute("DELETE FROM category_rules WHERE id = ?", [int(rule_id)])
+            # Same atomic shape as add_rule: the rebuild is the removal's
+            # retroactive effect.
+            self.conn.execute("BEGIN")
+            try:
+                self.conn.execute("DELETE FROM category_rules WHERE id = ?", [int(rule_id)])
+                self._rebuild_category_match_cache_statements()
+                self.conn.execute("COMMIT")
+            except duckdb.Error as exc:
+                self.conn.execute("ROLLBACK")
+                raise StoreError(f"remove_rule failed: {exc}") from exc
 
     def set_transaction_override(self, transaction_id: str, category_name: str) -> bool:
         """Apply a per-transaction category override.

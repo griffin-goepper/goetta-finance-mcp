@@ -44,7 +44,10 @@ from goetta_finance.models import (
     GoalStatus,
 )
 from goetta_finance.store import FinanceStore
-from goetta_finance.tools.spending_by_category import query_spending_by_category
+from goetta_finance.tools.spending_by_category import (
+    query_category_spending_by_bucket,
+    query_spending_by_category,
+)
 from goetta_finance.transfers import pending_transfer_delta
 
 _DAYS_PER_MONTH = Decimal("30.44")  # mean Gregorian month
@@ -83,27 +86,37 @@ def _as_decimal(value: object) -> Decimal:
 
 
 def spending_cap_progress(
-    store: FinanceStore, goal: Goal, *, now: datetime | None = None
+    store: FinanceStore,
+    goal: Goal,
+    *,
+    now: datetime | None = None,
+    totals_by_category: dict[str, Decimal] | None = None,
 ) -> GoalProgress:
     """Net spending in the goal's category this period vs the cap.
 
     ``include_non_spending=True`` so a cap on a category the user later
     flips to non-spending still returns a row — the total expression is
     identical in both modes; the flag only gates which rows appear.
+
+    ``totals_by_category`` lets :func:`evaluate_goals` share ONE
+    spending query across every cap on the same period instead of
+    re-scanning per goal; it must be the {category: total} mapping of
+    exactly the query below for this goal's period bounds. Omitted, the
+    query runs here (the single-goal path).
     """
     if goal.period is None or goal.category_name is None:  # pragma: no cover
         raise StoreError(f"spending_cap goal {goal.id} is missing category or period")
     now = (now or datetime.now(tz=UTC)).astimezone(UTC)
     start, end = period_bounds(goal.period, now)
-    # The shared helper's end bound is inclusive (posted <= end); back off
-    # one microsecond so the first instant of the next bucket is excluded.
-    rows = query_spending_by_category(
-        store, start, end - timedelta(microseconds=1), include_non_spending=True
-    )
-    current = next(
-        (_as_decimal(r["total"]) for r in rows if r["category"] == goal.category_name),
-        Decimal("0"),
-    )
+    if totals_by_category is None:
+        # The shared helper's end bound is inclusive (posted <= end); back
+        # off one microsecond so the first instant of the next bucket is
+        # excluded.
+        rows = query_spending_by_category(
+            store, start, end - timedelta(microseconds=1), include_non_spending=True
+        )
+        totals_by_category = {str(r["category"]): _as_decimal(r["total"]) for r in rows}
+    current = totals_by_category.get(goal.category_name, Decimal("0"))
     percent = (current / goal.amount * 100).quantize(_PERCENT_Q)
     elapsed = (
         Decimal(int((now - start).total_seconds()))
@@ -147,10 +160,13 @@ def spending_cap_history(
     """Per-period net spending vs the cap, oldest first, newest last.
 
     Buckets are the goal's own period granularity (month or year), walked
-    backwards from the bucket containing ``now``. Each bucket reuses the
-    exact :func:`spending_cap_progress` query (same net-spending CASE,
-    pending included, hidden excluded, microsecond end backoff), so the
-    newest bucket always equals the goal card's ``current`` to the cent.
+    backwards from the bucket containing ``now``. All buckets come from
+    ONE :func:`query_category_spending_by_bucket` call (same net-spending
+    CASE as :func:`spending_cap_progress`, pending included, hidden
+    excluded, microsecond end backoff, UTC ``date_trunc`` buckets ==
+    :func:`period_bounds` buckets), so the newest bucket always equals
+    the goal card's ``current`` to the cent — previously this looped one
+    full spending query per bucket.
     """
     if goal.period is None or goal.category_name is None:  # pragma: no cover
         raise StoreError(f"spending_cap goal {goal.id} is missing category or period")
@@ -161,15 +177,18 @@ def spending_cap_history(
         start, end = period_bounds(goal.period, cursor)
         bounds.append((start, end))
         cursor = start - timedelta(microseconds=1)
+    oldest_start = bounds[-1][0]
+    newest_end = bounds[0][1]
+    actual_by_bucket = query_category_spending_by_bucket(
+        store,
+        oldest_start,
+        newest_end - timedelta(microseconds=1),
+        category=goal.category_name,
+        bucket="month" if goal.period is GoalPeriod.MONTH else "year",
+    )
     out: list[SpendingCapPeriod] = []
     for start, end in reversed(bounds):
-        rows = query_spending_by_category(
-            store, start, end - timedelta(microseconds=1), include_non_spending=True
-        )
-        actual = next(
-            (_as_decimal(r["total"]) for r in rows if r["category"] == goal.category_name),
-            Decimal("0"),
-        )
+        actual = actual_by_bucket.get(start.date(), Decimal("0"))
         out.append(
             SpendingCapPeriod(
                 period_start=start,
@@ -301,10 +320,32 @@ def evaluate_goals(store: FinanceStore, *, now: datetime | None = None) -> list[
     accounts: dict[str, Account] = {}
     if any(g.kind is GoalKind.BALANCE for g in goals):
         accounts = {a.id: a for a in store.get_accounts(include_hidden=True)}
+    # One spending query per DISTINCT cap period (month/year), not per
+    # cap — with N caps on the same period this is the difference
+    # between 1 scan and N identical ones (measured live: 6 caps made
+    # /goals a 4.3s endpoint pre-0013).
+    totals_by_period: dict[GoalPeriod, dict[str, Decimal]] = {}
+    for period in {
+        g.period for g in goals if g.kind is GoalKind.SPENDING_CAP and g.period is not None
+    }:
+        start, end = period_bounds(period, now)
+        rows = query_spending_by_category(
+            store, start, end - timedelta(microseconds=1), include_non_spending=True
+        )
+        totals_by_period[period] = {str(r["category"]): _as_decimal(r["total"]) for r in rows}
     out: list[GoalProgress] = []
     for goal in goals:
         if goal.kind is GoalKind.SPENDING_CAP:
-            out.append(spending_cap_progress(store, goal, now=now))
+            out.append(
+                spending_cap_progress(
+                    store,
+                    goal,
+                    now=now,
+                    totals_by_category=totals_by_period.get(goal.period)
+                    if goal.period is not None
+                    else None,
+                )
+            )
         else:
             if goal.account_id is None:  # pragma: no cover - table CHECK
                 raise StoreError(f"balance goal {goal.id} has no account_id")

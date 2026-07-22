@@ -204,9 +204,17 @@ def net_worth_series(
     """Aggregate per-account balance snapshots into daily total net worth.
 
     For each day in the window, find the latest snapshot for each account
-    at or before that day and sum the **signed** balances. Days with no
-    snapshot for any account are skipped (the chart's x axis is the union
-    of days that had at least one snapshot).
+    at or before that day and sum the **signed** balances. The first point
+    is the window boundary, followed by days on which a balance changed.
+
+    Account history often starts at different times because connecting a
+    new institution records its existing balance on that day. Treating the
+    first observation as zero before that instant creates a fictitious net-
+    worth gain (for example, connecting an established brokerage looks like
+    a six-figure windfall). Seed every account at the window boundary with
+    its latest older snapshot, or its earliest known snapshot when no older
+    one exists. The latter is an estimate, but it preserves the truthful
+    fact that "first observed" is not the same as "newly acquired."
 
     Signed-balance formula (matches the user-facing pattern documented in
     server.SQL_SCHEMA_HINT): a liability contributes ``-ABS(balance)``
@@ -218,39 +226,96 @@ def net_worth_series(
     since = end - timedelta(days=days)
     rows = store.query_sql(
         """
-        SELECT bs.account_id,
-               bs.timestamp,
-               CASE WHEN a.is_liability
-                    THEN -ABS(bs.balance)
-                    ELSE bs.balance
-               END AS signed_balance
-        FROM balance_snapshots bs
-        JOIN accounts a ON a.id = bs.account_id
-        WHERE bs.timestamp >= ?
-          AND COALESCE(a.is_hidden, FALSE) = FALSE
-        ORDER BY bs.account_id, bs.timestamp
+        WITH signed_snapshots AS (
+            SELECT bs.account_id,
+                   bs.timestamp,
+                   CASE WHEN a.is_liability
+                        THEN -ABS(bs.balance)
+                        ELSE bs.balance
+                   END AS signed_balance
+            FROM balance_snapshots bs
+            JOIN accounts a ON a.id = bs.account_id
+            WHERE bs.timestamp <= ?
+              AND COALESCE(a.is_hidden, FALSE) = FALSE
+        ), seed_timestamps AS (
+            SELECT account_id, MAX(timestamp) AS timestamp
+            FROM signed_snapshots
+            WHERE timestamp < ?
+            GROUP BY account_id
+        )
+        SELECT account_id, timestamp, signed_balance
+        FROM signed_snapshots
+        WHERE timestamp >= ?
+        UNION ALL
+        SELECT snapshots.account_id, snapshots.timestamp, snapshots.signed_balance
+        FROM signed_snapshots snapshots
+        JOIN seed_timestamps seeds
+          ON seeds.account_id = snapshots.account_id
+         AND seeds.timestamp = snapshots.timestamp
+        ORDER BY account_id, timestamp
         """,
-        [since],
+        [end, since, since],
     )
 
-    latest_per_account: dict[str, Decimal] = {}
-    days_seen: set[date] = set()
-    rows_by_day: dict[date, list[tuple[str, Decimal]]] = {}
+    history_by_account: dict[str, list[tuple[datetime, Decimal]]] = {}
     for row in rows:
-        ts = row["timestamp"]
-        day = ts.date() if isinstance(ts, datetime) else ts
-        days_seen.add(day)
-        rows_by_day.setdefault(day, []).append(
-            (row["account_id"], _as_decimal(row["signed_balance"]))
+        timestamp = row["timestamp"]
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=UTC)
+        history_by_account.setdefault(str(row["account_id"]), []).append(
+            (timestamp, _as_decimal(row["signed_balance"]))
         )
 
+    latest_per_account: dict[str, Decimal] = {}
+    rows_by_day: dict[date, list[tuple[str, Decimal]]] = {}
+    for account_id, history in history_by_account.items():
+        history.sort(key=lambda item: item[0])
+        older = [item for item in history if item[0] < since]
+        seed = older[-1] if older else history[0]
+        latest_per_account[account_id] = seed[1]
+        for timestamp, balance in history:
+            if timestamp < since:
+                continue
+            rows_by_day.setdefault(timestamp.date(), []).append((account_id, balance))
+
     out: list[NetWorthPoint] = []
+    days_seen = {since.date(), *rows_by_day.keys()} if latest_per_account else set()
     for day in sorted(days_seen):
-        for acct, bal in rows_by_day[day]:
+        for acct, bal in rows_by_day.get(day, []):
             latest_per_account[acct] = bal
         total = sum(latest_per_account.values(), Decimal("0"))
         out.append(NetWorthPoint(day=day, balance=total))
     return out
+
+
+def net_worth_coverage_start(store: FinanceStore) -> date | None:
+    """First day on which every visible account has observed history.
+
+    Points before this date use the earliest-known-balance baseline from
+    :func:`net_worth_series` and should be labeled as estimates by clients.
+    ``None`` means there are no visible accounts or at least one visible
+    account has no balance snapshot yet.
+    """
+    rows = store.query_sql(
+        """
+        WITH first_snapshots AS (
+            SELECT account_id, MIN(timestamp) AS first_snapshot
+            FROM balance_snapshots
+            GROUP BY account_id
+        )
+        SELECT CASE
+                   WHEN COUNT(*) = 0 OR COUNT(first_snapshot) < COUNT(*) THEN NULL
+                   ELSE MAX(first_snapshot)
+               END AS complete_from
+        FROM accounts
+        LEFT JOIN first_snapshots ON first_snapshots.account_id = accounts.id
+        WHERE COALESCE(accounts.is_hidden, FALSE) = FALSE
+        """
+    )
+    if not rows or rows[0]["complete_from"] is None:
+        return None
+    complete_from = rows[0]["complete_from"]
+    return complete_from.date() if isinstance(complete_from, datetime) else complete_from
 
 
 def spending_by_category_last_n_days(
@@ -353,6 +418,7 @@ __all__: Sequence[str] = (
     "display_currency",
     "monthly_income_spending",
     "monthly_spending_by_category",
+    "net_worth_coverage_start",
     "net_worth_series",
     "parse_json_list",
     "recent_sync_runs",

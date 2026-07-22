@@ -37,6 +37,7 @@ from goetta_finance.web.aggregations import (
     display_currency,
     monthly_income_spending,
     monthly_spending_by_category,
+    net_worth_coverage_start,
     net_worth_series,
     parse_json_list,
     recent_sync_runs,
@@ -121,9 +122,12 @@ def register_api(app: FastAPI) -> None:
     @router.get("/net-worth")
     def net_worth(request: Request, days: int = 90) -> dict[str, Any]:
         days = _clamp(days, 1, 1830)
-        points = net_worth_series(_store(request), days=days)
+        store = _store(request)
+        points = net_worth_series(store, days=days)
+        complete_from = net_worth_coverage_start(store)
         return {
             "days": days,
+            "complete_from": complete_from.isoformat() if complete_from else None,
             "points": [{"date": p.day.isoformat(), "balance": str(p.balance)} for p in points],
         }
 
