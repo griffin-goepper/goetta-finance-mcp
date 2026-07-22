@@ -105,9 +105,9 @@ class FinanceStore(Protocol):
     # around the store (in-engine bulk loads in tests, repair scripts).
     def rebuild_category_match_cache(self) -> None: ...
 
-    # Goals (migration 0008). Progress/status is NOT a store concern —
-    # it's computed read-time by goals.py from these definitions plus
-    # the existing read methods.
+    # Goals (migrations 0008/0014). Progress/status is NOT a store
+    # concern — it's computed read-time by goals.py from these
+    # definitions plus the existing read methods.
     def add_goal(
         self,
         name: str,
@@ -119,11 +119,48 @@ class FinanceStore(Protocol):
         account_id: str | None = None,
         direction: str | None = None,
         target_date: date | None = None,
+        match_type: str | None = None,
+        match_pattern: str | None = None,
+        baseline_amount: Decimal | None = None,
+        baseline_date: datetime | None = None,
     ) -> Goal: ...
 
     def list_goals(self) -> list[Goal]: ...
 
     def remove_goal(self, goal_id: int) -> None: ...
+
+    # Contribution-goal read side (migration 0014): matched abs-amount
+    # sums over the destination account's own feed (transfer-link match
+    # semantics) and signed sums over the applications ledger. Window
+    # bounds are [start, end) in UTC; goals.py owns the period math.
+    def contribution_matched_sum(
+        self,
+        account_id: str,
+        *,
+        match_type: str,
+        pattern: str,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        pending: bool = False,
+    ) -> Decimal: ...
+
+    def contribution_matched_monthly(
+        self,
+        account_id: str,
+        *,
+        match_type: str,
+        pattern: str,
+        start: datetime,
+        end: datetime,
+    ) -> dict[date, Decimal]: ...
+
+    def transfer_applications_sum(
+        self, account_id: str, *, start: datetime | None = None, end: datetime | None = None
+    ) -> Decimal: ...
+
+    def transfer_applications_monthly(
+        self, account_id: str, *, start: datetime, end: datetime
+    ) -> dict[date, Decimal]: ...
 
     # Transfer links (migration 0012). Roll-forward application is NOT a
     # store concern — transfers.py orchestrates it through these plus

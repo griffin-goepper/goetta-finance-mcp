@@ -15,6 +15,11 @@ import pytest
 
 from goetta_finance.goals import (
     balance_goal_progress,
+    contribution_history,
+    contribution_monthly_target,
+    contribution_progress,
+    describe_goal,
+    describe_progress,
     evaluate_goals,
     goal_breach_warnings,
     period_bounds,
@@ -32,6 +37,7 @@ from goetta_finance.models import (
     Transaction,
 )
 from goetta_finance.store.duckdb_store import DuckDBStore
+from goetta_finance.transfers import apply_transfer_links
 
 NOW = datetime(2026, 5, 13, 12, tzinfo=UTC)
 MAY_ELAPSED = Decimal("40.3")  # 12.5 of 31 days, quantized 0.1
@@ -625,3 +631,368 @@ def test_breach_warnings_never_contain_transaction_descriptions(
     lines = goal_breach_warnings(store, now=NOW)
     assert lines
     assert all("VENMO" not in line and "do not log" not in line for line in lines)
+
+
+# --- contribution goals (migration 0014) -------------------------------------
+#
+# NOW is still 2026-05-13T12:00Z: 40.3% of May elapsed, 36.3% of 2026
+# elapsed (132.5 of 365 days) — behind/ahead assertions key off those.
+
+
+def _contribution_txn(
+    store: DuckDBStore,
+    txn_id: str,
+    amount: str,
+    *,
+    posted: datetime,
+    account_id: str = "g-roth",
+    description: str = "CASH CONTRIBUTION CURRENT YEAR (Cash)",
+    pending: bool = False,
+) -> None:
+    store.upsert_transactions(
+        [
+            Transaction(
+                id=txn_id,
+                account_id=account_id,
+                posted=posted,
+                amount=Decimal(amount),
+                description=description,
+                pending=pending,
+            )
+        ]
+    )
+
+
+def _contribution_goal(
+    store: DuckDBStore,
+    *,
+    name: str,
+    amount: str = "1000",
+    period: str = "month",
+    account_id: str = "g-roth",
+    pattern: str | None = "CASH CONTRIBUTION",
+    match: str = "contains",
+    baseline: str | None = None,
+    baseline_date: datetime | None = None,
+) -> Goal:
+    return store.add_goal(
+        name,
+        kind="contribution",
+        amount=Decimal(amount),
+        account_id=account_id,
+        period=period,
+        match_type=match if pattern is not None else None,
+        match_pattern=pattern,
+        baseline_amount=Decimal(baseline) if baseline is not None else None,
+        baseline_date=baseline_date,
+    )
+
+
+def _seed_linked_manual(store: DuckDBStore, *, account_id: str = "g-sav") -> None:
+    """A manual savings account linked to g-a1 on the 'goal test txn'
+    pattern (matches _add_txn's default description), anchored 30 days
+    before NOW — the shape of the existing pending-delta link test."""
+    _seed_account(store)
+    store.upsert_accounts(
+        [
+            Account(
+                id=account_id,
+                name="Linked Savings",
+                balance=Decimal("5000.00"),
+                balance_date=NOW - timedelta(days=30),  # link anchors here
+                type=AccountType.SAVINGS,
+                is_manual=True,
+            )
+        ]
+    )
+    store.add_transfer_link(account_id, "g-a1", match_type="contains", pattern="goal test txn")
+
+
+def test_contribution_month_abs_settled_status_inversion(store: DuckDBStore) -> None:
+    """The Fidelity shape: cash-in signed NEGATIVE, summed by absolute
+    value, settled rows only — and ahead-of-clock is ON_TRACK, the
+    inverse of caps (a cap at 50% spent mid-May would be AT_RISK)."""
+    _seed_account(store, account_id="g-roth")
+    goal = _contribution_goal(store, name="Roth monthly")
+    _contribution_txn(store, "c-1", "-300.00", posted=datetime(2026, 5, 5, tzinfo=UTC))
+    _contribution_txn(
+        store,
+        "c-noise",
+        "-999.00",
+        posted=datetime(2026, 5, 6, tzinfo=UTC),
+        description="DIVIDEND RECEIVED",
+    )
+    _contribution_txn(
+        store, "c-pend", "-100.00", posted=datetime(2026, 5, 12, tzinfo=UTC), pending=True
+    )
+    progress = contribution_progress(store, goal, now=NOW)
+    assert progress.current == Decimal("300.00")
+    assert progress.percent == Decimal("30.0")
+    assert progress.period_elapsed_percent == MAY_ELAPSED
+    assert progress.status is GoalStatus.AT_RISK  # 30.0 < 40.3: behind the clock
+    assert progress.period_start == datetime(2026, 5, 1, tzinfo=UTC)
+    assert progress.period_end == datetime(2026, 6, 1, tzinfo=UTC)
+    assert progress.monthly_delta is None
+    assert progress.projected_date is None
+    assert progress.required_monthly is None  # month-period goals never carry it
+    assert progress.pending_delta == Decimal("100.00")
+
+    _contribution_txn(store, "c-2", "-200.00", posted=datetime(2026, 5, 8, tzinfo=UTC))
+    progress = contribution_progress(store, goal, now=NOW)
+    assert progress.percent == Decimal("50.0")
+    assert progress.status is GoalStatus.ON_TRACK  # 50.0 >= 40.3: ahead is GOOD
+
+    _contribution_txn(store, "c-3", "-500.00", posted=datetime(2026, 5, 9, tzinfo=UTC))
+    progress = contribution_progress(store, goal, now=NOW)
+    assert progress.current == Decimal("1000.00")
+    assert progress.status is GoalStatus.MET
+
+
+def test_contribution_regex_matching(store: DuckDBStore) -> None:
+    _seed_account(store, account_id="g-roth")
+    goal = _contribution_goal(store, name="401k regex", pattern="^EMPLOYER 401K", match="regex")
+    _contribution_txn(
+        store,
+        "c-re-1",
+        "-250.00",
+        posted=datetime(2026, 5, 5, tzinfo=UTC),
+        description="EMPLOYER 401K PLAN CONTRIB",
+    )
+    _contribution_txn(
+        store,
+        "c-re-miss",
+        "-75.00",
+        posted=datetime(2026, 5, 6, tzinfo=UTC),
+        description="NOT AN EMPLOYER 401K ROW",  # regex is anchored
+    )
+    progress = contribution_progress(store, goal, now=NOW)
+    assert progress.current == Decimal("250.00")
+
+
+def test_contribution_year_period_and_baseline_in_period(store: DuckDBStore) -> None:
+    """Year bucketing plus the baseline: counted when baseline_date
+    falls inside the period, with required_monthly spreading the gap
+    over the months left to the period end."""
+    _seed_account(store, account_id="g-roth")
+    goal = _contribution_goal(
+        store,
+        name="Roth IRA 2026",
+        amount="7500",
+        period="year",
+        baseline="3000",
+        baseline_date=datetime(2026, 3, 1, tzinfo=UTC),
+    )
+    _contribution_txn(store, "c-feb", "-500.00", posted=datetime(2026, 2, 10, tzinfo=UTC))
+    _contribution_txn(store, "c-may", "-625.00", posted=datetime(2026, 5, 5, tzinfo=UTC))
+    progress = contribution_progress(store, goal, now=NOW)
+    assert progress.current == Decimal("4125.00")  # 3000 baseline + 500 + 625
+    assert progress.period_start == datetime(2026, 1, 1, tzinfo=UTC)
+    assert progress.period_end == datetime(2027, 1, 1, tzinfo=UTC)
+    assert progress.period_elapsed_percent == Decimal("36.3")
+    assert progress.status is GoalStatus.ON_TRACK  # 55.0 >= 36.3
+    # gap 3375 over the 233 days to 2027-01-01 = 7.654 mean months.
+    assert progress.required_monthly == Decimal("440.92")
+
+
+def test_contribution_baseline_outside_period_not_counted(store: DuckDBStore) -> None:
+    """A March baseline is invisible to May's month bucket (and a met
+    goal carries no required_monthly)."""
+    _seed_account(store, account_id="g-roth")
+    goal = _contribution_goal(
+        store,
+        name="baseline out",
+        baseline="3000",
+        baseline_date=datetime(2026, 3, 1, tzinfo=UTC),
+    )
+    progress = contribution_progress(store, goal, now=NOW)
+    assert progress.current == Decimal("0")
+    assert progress.status is GoalStatus.AT_RISK
+
+    met_year = _contribution_goal(
+        store,
+        name="met year",
+        amount="2000",
+        period="year",
+        baseline="3000",
+        baseline_date=datetime(2026, 3, 1, tzinfo=UTC),
+    )
+    met_progress = contribution_progress(store, met_year, now=NOW)
+    assert met_progress.status is GoalStatus.MET
+    assert met_progress.required_monthly is None
+
+
+def test_contribution_ledger_counts_for_linked_manual_account(store: DuckDBStore) -> None:
+    """The Apple Savings shape: a linked manual account needs ZERO extra
+    config — applied transfers count via the ledger, no pattern."""
+    _seed_linked_manual(store)
+    _add_txn(store, "t-led-1", "-800.00", category=None)  # May 10, matches link
+    applied = apply_transfer_links(store)
+    assert applied  # sanity: the transfer rolled forward
+    goal = _contribution_goal(store, name="Savings monthly", account_id="g-sav", pattern=None)
+    progress = contribution_progress(store, goal, now=NOW)
+    assert progress.current == Decimal("800.00")
+    assert progress.status is GoalStatus.ON_TRACK  # 80.0 >= 40.3
+    assert progress.pending_delta == Decimal("0.00")  # links exist, nothing pending
+
+
+def test_contribution_pattern_plus_ledger_no_double_count(store: DuckDBStore) -> None:
+    """Pattern matches (the account's own feed) and ledger rows (the
+    applications table) draw from different tables — a goal using both
+    counts each dollar once."""
+    _seed_linked_manual(store)
+    _add_txn(store, "t-led-2", "-800.00", category=None)
+    apply_transfer_links(store)
+    # A row on the manual account itself (e.g. imported history).
+    _contribution_txn(
+        store,
+        "c-own",
+        "-300.00",
+        posted=datetime(2026, 5, 8, tzinfo=UTC),
+        account_id="g-sav",
+        description="DEPOSIT FROM PAYROLL",
+    )
+    goal = _contribution_goal(
+        store, name="Savings both", account_id="g-sav", pattern="DEPOSIT FROM PAYROLL"
+    )
+    progress = contribution_progress(store, goal, now=NOW)
+    assert progress.current == Decimal("1100.00")  # 800 ledger + 300 matched, no overlap
+
+
+def test_contribution_pending_delta_pattern_and_links(store: DuckDBStore) -> None:
+    """pending_delta sums matched pending feed rows AND the pending
+    linked-transfer preview when both apply."""
+    _seed_linked_manual(store)
+    _add_txn(store, "t-pend-link", "-200.00", pending=True, category=None)  # link preview
+    _contribution_txn(
+        store,
+        "c-pend-own",
+        "-50.00",
+        posted=datetime(2026, 5, 12, tzinfo=UTC),
+        account_id="g-sav",
+        description="DEPOSIT FROM PAYROLL",
+        pending=True,
+    )
+    goal = _contribution_goal(
+        store, name="Savings pending", account_id="g-sav", pattern="DEPOSIT FROM PAYROLL"
+    )
+    progress = contribution_progress(store, goal, now=NOW)
+    assert progress.pending_delta == Decimal("250.00")
+
+
+def test_contribution_pending_delta_none_without_pattern_or_links(
+    store: DuckDBStore,
+) -> None:
+    """No pattern and no links means nothing can ever be pending for
+    the goal — None, not '0.00' (the concept doesn't apply)."""
+    store.upsert_accounts(
+        [
+            Account(
+                id="g-lonely",
+                name="Lonely Manual",
+                balance=Decimal("100.00"),
+                balance_date=NOW,
+                is_manual=True,
+            )
+        ]
+    )
+    goal = _contribution_goal(store, name="lonely", account_id="g-lonely", pattern=None)
+    progress = contribution_progress(store, goal, now=NOW)
+    assert progress.pending_delta is None
+
+
+def test_contribution_history_month_goal_newest_equals_current(store: DuckDBStore) -> None:
+    """Cent pin, mirroring the spending-cap history contract: the newest
+    monthly bucket equals the goal card's ``current`` — baseline
+    included when baseline_date falls in that month."""
+    _seed_account(store, account_id="g-roth")
+    goal = _contribution_goal(
+        store,
+        name="Roth history",
+        baseline="100",
+        baseline_date=datetime(2026, 5, 2, tzinfo=UTC),
+    )
+    _contribution_txn(store, "c-mar", "-200.00", posted=datetime(2026, 3, 10, tzinfo=UTC))
+    _contribution_txn(store, "c-may-h", "-500.00", posted=datetime(2026, 5, 5, tzinfo=UTC))
+    _contribution_txn(
+        store, "c-pend-h", "-77.00", posted=datetime(2026, 5, 12, tzinfo=UTC), pending=True
+    )
+    progress = contribution_progress(store, goal, now=NOW)
+    history = contribution_history(store, goal, months=3, now=NOW)
+    assert len(history) == 3
+    assert [h.period_start for h in history] == [
+        datetime(2026, 3, 1, tzinfo=UTC),
+        datetime(2026, 4, 1, tzinfo=UTC),
+        datetime(2026, 5, 1, tzinfo=UTC),
+    ]
+    newest = history[-1]
+    assert newest.actual == progress.current == Decimal("600.00")  # 500 + 100 baseline
+    assert newest.period_end == datetime(2026, 6, 1, tzinfo=UTC)
+    assert newest.met is False  # 600 < 1000
+    assert history[0].actual == Decimal("200.00")
+    assert history[1].actual == Decimal("0")
+
+
+def test_contribution_history_year_goal_monthly_target(store: DuckDBStore) -> None:
+    """A year goal's history is STILL monthly buckets, judged against
+    amount/12 — twelve funding checkpoints, not one year bar."""
+    _seed_account(store, account_id="g-roth")
+    goal = _contribution_goal(store, name="Roth yearly hist", amount="7500", period="year")
+    assert contribution_monthly_target(goal) == Decimal("625.00")
+    _contribution_txn(store, "c-apr-y", "-700.00", posted=datetime(2026, 4, 10, tzinfo=UTC))
+    _contribution_txn(store, "c-may-y", "-500.00", posted=datetime(2026, 5, 5, tzinfo=UTC))
+    history = contribution_history(store, goal, months=2, now=NOW)
+    april, may = history
+    assert april.actual == Decimal("700.00")
+    assert april.met is True  # 700 >= 625
+    assert may.actual == Decimal("500.00")
+    assert may.met is False  # 500 < 625
+
+
+def test_contribution_history_includes_ledger_rows(store: DuckDBStore) -> None:
+    _seed_linked_manual(store)
+    _add_txn(store, "t-led-h", "-800.00", category=None)
+    apply_transfer_links(store)
+    goal = _contribution_goal(store, name="Savings hist", account_id="g-sav", pattern=None)
+    history = contribution_history(store, goal, months=2, now=NOW)
+    assert history[-1].actual == Decimal("800.00")
+    assert history[-2].actual == Decimal("0")
+
+
+def test_evaluate_goals_includes_contribution(store: DuckDBStore) -> None:
+    """The dispatcher routes the new kind (and needs no Account row for
+    it); ordering stays list_goals' name order."""
+    _seed_account(store)
+    _seed_account(store, account_id="g-roth")
+    _add_txn(store, "t-mix-c", "-100.00")
+    _cap(store, name="A dining cap")
+    _contribution_goal(store, name="B roth monthly")
+    _contribution_txn(store, "c-mix", "-500.00", posted=datetime(2026, 5, 5, tzinfo=UTC))
+    progresses = evaluate_goals(store, now=NOW)
+    assert [p.goal.name for p in progresses] == ["A dining cap", "B roth monthly"]
+    contrib = progresses[1]
+    assert contrib.goal.kind is GoalKind.CONTRIBUTION
+    assert contrib.current == Decimal("500.00")
+    assert contrib.status is GoalStatus.ON_TRACK
+
+
+def test_breach_warnings_ignore_contribution_goals(store: DuckDBStore) -> None:
+    """Contribution goals never reach OVER (over-funding is MET), so the
+    post-sync breach report stays silent about them."""
+    _seed_account(store, account_id="g-roth")
+    _contribution_goal(store, name="overfunded", amount="100")
+    _contribution_txn(store, "c-over", "-999.00", posted=datetime(2026, 5, 5, tzinfo=UTC))
+    assert goal_breach_warnings(store, now=NOW) == []
+
+
+def test_describe_contribution_goal_and_progress(store: DuckDBStore) -> None:
+    """The shared prose formatters (CLI + dashboard) speak the new kind."""
+    _seed_account(store, account_id="g-roth")
+    goal = _contribution_goal(store, name="Roth prose", amount="1000")
+    _contribution_txn(store, "c-prose", "-500.00", posted=datetime(2026, 5, 5, tzinfo=UTC))
+    assert describe_goal(goal) == "contribute 1000 to Goal Checking per month"
+    progress = contribution_progress(store, goal, now=NOW)
+    line = describe_progress(progress)
+    assert "500.00 of 1000" in line
+    assert "contributed this month" in line
+    assert "40.3% of period elapsed" in line
+    assert "behind pace" not in line  # 50.0 >= 40.3

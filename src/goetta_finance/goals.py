@@ -24,6 +24,15 @@ user's mental number for a credit card or loan is "how much do I owe",
 so ``at_most 2000`` means "owe under 2000" whether the institution
 signs the balance negative (SimpleFIN credit cards) or positive
 (amount-owed loan servicers).
+
+Contribution goals (migration 0014) count money INTO the goal's own
+account per UTC calendar period: the ABSOLUTE value of settled feed
+rows matching the goal's pattern (brokerages commonly sign cash-in
+negative — sign is presentation, not direction), plus the
+transfer-link applications ledger (already signed money-in), plus an
+optional pre-history baseline counted into the period containing
+``baseline_date``. Ahead of the clock is GOOD here — the status pace
+comparison is the INVERSE of spending caps.
 """
 
 from __future__ import annotations
@@ -83,6 +92,24 @@ def _as_decimal(value: object) -> Decimal:
     if value is None:
         return Decimal("0")
     return Decimal(str(value))
+
+
+def _aware_utc(dt: datetime) -> datetime:
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
+def _required_monthly(gap: Decimal, target: date, now: datetime) -> Decimal | None:
+    """Months-remaining pace: gap over (days to ``target`` / mean month).
+
+    THE months-remaining helper — dated balance goals use it against
+    ``target_date`` and year-period contribution goals against their
+    period end, so "need X/mo" means the same thing on both. ``None``
+    at or past the target date (pace toward the past is meaningless).
+    """
+    days_remaining = (target - now.date()).days
+    if days_remaining <= 0:
+        return None
+    return (gap / (Decimal(days_remaining) / _DAYS_PER_MONTH)).quantize(_MONEY_Q)
 
 
 def spending_cap_progress(
@@ -200,6 +227,181 @@ def spending_cap_history(
     return out
 
 
+def contribution_progress(
+    store: FinanceStore,
+    goal: Goal,
+    *,
+    now: datetime | None = None,
+) -> GoalProgress:
+    """Money contributed into the goal's account this period vs the target.
+
+    ``current`` sums three sources over the UTC calendar bucket:
+
+      1. The baseline, when ``baseline_date`` falls inside the period —
+         contributions made before the feed's history starts.
+      2. SUM(abs(amount)) of SETTLED feed rows matching the goal's
+         pattern (``contribution_matched_sum`` — transfer-link match
+         semantics against description OR payee). Absolute values on
+         purpose: brokerages commonly sign cash-in negative.
+      3. SUM(amount) of transfer-link application ledger rows posted in
+         the period — already signed money-in, so a linked manual
+         account needs no pattern at all.
+
+    Pattern matches and ledger rows draw from different sources (the
+    account's own feed and the applications table), so a goal using
+    both never double-counts.
+
+    Status: MET at/over the target; ON_TRACK when funding is at or
+    ahead of the clock (percent >= elapsed); AT_RISK behind — the
+    INVERSE of caps, where ahead-of-pace is bad. Never OVER.
+
+    ``required_monthly`` (year goals only, unmet): the remaining gap
+    over the months left to the period end — the same months-remaining
+    math dated balance goals use. ``pending_delta`` previews matched
+    still-pending feed rows plus pending linked transfers; ``None``
+    when the goal has no pattern AND the account has no links (nothing
+    can ever be pending for it).
+    """
+    if goal.period is None or goal.account_id is None:  # pragma: no cover - table CHECK
+        raise StoreError(f"contribution goal {goal.id} is missing account or period")
+    now = (now or datetime.now(tz=UTC)).astimezone(UTC)
+    start, end = period_bounds(goal.period, now)
+    current = Decimal("0")
+    if goal.baseline_amount is not None and goal.baseline_date is not None:
+        baseline_at = _aware_utc(goal.baseline_date)
+        if start <= baseline_at < end:
+            current += goal.baseline_amount
+    if goal.match_type is not None and goal.match_pattern is not None:
+        current += store.contribution_matched_sum(
+            goal.account_id,
+            match_type=goal.match_type,
+            pattern=goal.match_pattern,
+            start=start,
+            end=end,
+        )
+    current += store.transfer_applications_sum(goal.account_id, start=start, end=end)
+    percent = (current / goal.amount * 100).quantize(_PERCENT_Q)
+    elapsed = (
+        Decimal(int((now - start).total_seconds()))
+        / Decimal(int((end - start).total_seconds()))
+        * 100
+    ).quantize(_PERCENT_Q)
+    if current >= goal.amount:
+        status = GoalStatus.MET
+    elif percent >= elapsed:
+        status = GoalStatus.ON_TRACK
+    else:
+        status = GoalStatus.AT_RISK
+    required_monthly: Decimal | None = None
+    if status is not GoalStatus.MET and goal.period is GoalPeriod.YEAR:
+        remaining = goal.amount - current
+        if remaining > 0:
+            required_monthly = _required_monthly(remaining, end.date(), now)
+    link_pending = pending_transfer_delta(store, goal.account_id)
+    pending_delta: Decimal | None = None
+    if goal.match_pattern is not None or link_pending is not None:
+        pending_total = Decimal("0")
+        if goal.match_type is not None and goal.match_pattern is not None:
+            pending_total += store.contribution_matched_sum(
+                goal.account_id,
+                match_type=goal.match_type,
+                pattern=goal.match_pattern,
+                pending=True,
+            )
+        if link_pending is not None:
+            pending_total += link_pending
+        pending_delta = pending_total.quantize(_MONEY_Q)
+    return GoalProgress(
+        goal=goal,
+        status=status,
+        current=current,
+        target=goal.amount,
+        percent=percent,
+        period_start=start,
+        period_end=end,
+        period_elapsed_percent=elapsed,
+        required_monthly=required_monthly,
+        pending_delta=pending_delta,
+    )
+
+
+class ContributionPeriod(NamedTuple):
+    """One historical MONTH of a contribution goal's actuals."""
+
+    period_start: datetime
+    period_end: datetime  # exclusive
+    actual: Decimal
+    met: bool  # actual >= contribution_monthly_target(goal)
+
+
+def contribution_monthly_target(goal: Goal) -> Decimal:
+    """Per-month funding bar: the amount itself for month goals,
+    amount/12 quantized to cents for year goals."""
+    if goal.period is GoalPeriod.MONTH:
+        return goal.amount
+    return (goal.amount / 12).quantize(_MONEY_Q)
+
+
+def contribution_history(
+    store: FinanceStore, goal: Goal, *, months: int = 12, now: datetime | None = None
+) -> list[ContributionPeriod]:
+    """Per-MONTH contribution actuals, oldest first, newest last.
+
+    Always monthly buckets regardless of the goal's own period — a year
+    goal reads as twelve monthly funding checkpoints against
+    :func:`contribution_monthly_target`. All months come from ONE
+    bucketed query per source (matched feed rows via
+    ``contribution_matched_monthly``, ledger rows via
+    ``transfer_applications_monthly`` — identical expressions to
+    :func:`contribution_progress`), with the baseline added to the
+    bucket containing ``baseline_date``, so the newest bucket equals
+    this month's contribution sum to the cent.
+    """
+    if goal.period is None or goal.account_id is None:  # pragma: no cover - table CHECK
+        raise StoreError(f"contribution goal {goal.id} is missing account or period")
+    now = (now or datetime.now(tz=UTC)).astimezone(UTC)
+    bounds: list[tuple[datetime, datetime]] = []
+    cursor = now
+    for _ in range(months):
+        start, end = period_bounds(GoalPeriod.MONTH, cursor)
+        bounds.append((start, end))
+        cursor = start - timedelta(microseconds=1)
+    oldest_start = bounds[-1][0]
+    newest_end = bounds[0][1]
+    matched: dict[date, Decimal] = {}
+    if goal.match_type is not None and goal.match_pattern is not None:
+        matched = store.contribution_matched_monthly(
+            goal.account_id,
+            match_type=goal.match_type,
+            pattern=goal.match_pattern,
+            start=oldest_start,
+            end=newest_end,
+        )
+    applied = store.transfer_applications_monthly(
+        goal.account_id, start=oldest_start, end=newest_end
+    )
+    baseline_bucket: date | None = None
+    if goal.baseline_amount is not None and goal.baseline_date is not None:
+        baseline_at = _aware_utc(goal.baseline_date)
+        baseline_bucket = date(baseline_at.year, baseline_at.month, 1)
+    monthly_target = contribution_monthly_target(goal)
+    out: list[ContributionPeriod] = []
+    for start, end in reversed(bounds):
+        key = start.date()
+        actual = matched.get(key, Decimal("0")) + applied.get(key, Decimal("0"))
+        if baseline_bucket == key and goal.baseline_amount is not None:
+            actual += goal.baseline_amount
+        out.append(
+            ContributionPeriod(
+                period_start=start,
+                period_end=end,
+                actual=actual,
+                met=actual >= monthly_target,
+            )
+        )
+    return out
+
+
 def balance_goal_progress(
     goal: Goal,
     account: Account,
@@ -259,11 +461,7 @@ def balance_goal_progress(
     projected_date: date | None = None
     if not met:
         if goal.target_date is not None:
-            days_remaining = (goal.target_date - now.date()).days
-            if days_remaining > 0:
-                required_monthly = (gap / (Decimal(days_remaining) / _DAYS_PER_MONTH)).quantize(
-                    _MONEY_Q
-                )
+            required_monthly = _required_monthly(gap, goal.target_date, now)
         if toward_per_day is not None and toward_per_day > 0:
             days_needed = int(gap / toward_per_day)
             if days_needed <= _PROJECTION_MAX_DAYS:
@@ -346,6 +544,10 @@ def evaluate_goals(store: FinanceStore, *, now: datetime | None = None) -> list[
                     else None,
                 )
             )
+        elif goal.kind is GoalKind.CONTRIBUTION:
+            # Needs no Account row: progress reads the account's own
+            # transactions and ledger, not its balance.
+            out.append(contribution_progress(store, goal, now=now))
         else:
             if goal.account_id is None:  # pragma: no cover - table CHECK
                 raise StoreError(f"balance goal {goal.id} has no account_id")
@@ -397,6 +599,10 @@ def describe_goal(goal: Goal) -> str:
     if goal.kind is GoalKind.SPENDING_CAP:
         period_noun = "month" if goal.period is GoalPeriod.MONTH else "year"
         return f"{goal.category_name} under {goal.amount} per {period_noun}"
+    if goal.kind is GoalKind.CONTRIBUTION:
+        period_noun = "month" if goal.period is GoalPeriod.MONTH else "year"
+        label = goal.account_name or goal.account_id
+        return f"contribute {goal.amount} to {label} per {period_noun}"
     direction = "at least" if goal.direction is GoalDirection.AT_LEAST else "at most"
     label = goal.account_name or goal.account_id
     suffix = f" by {goal.target_date.isoformat()}" if goal.target_date is not None else ""
@@ -421,6 +627,22 @@ def describe_progress(progress: GoalProgress) -> str:
         elif progress.status is GoalStatus.OVER:
             line += ", over the cap"
         return line
+    if goal.kind is GoalKind.CONTRIBUTION:
+        period_noun = "month" if goal.period is GoalPeriod.MONTH else "year"
+        line = (
+            f"{progress.current} of {progress.target} ({progress.percent}%) "
+            f"contributed this {period_noun} — {progress.period_elapsed_percent}% "
+            "of period elapsed"
+        )
+        if progress.status is GoalStatus.MET:
+            line += ", met"
+        elif progress.status is GoalStatus.AT_RISK:
+            line += ", behind pace"
+        if progress.pending_delta:
+            line += f" ({progress.pending_delta:+} pending)"
+        if progress.required_monthly is not None:
+            line += f", need {progress.required_monthly}/mo"
+        return line
     if goal.direction is GoalDirection.AT_MOST:
         line = f"{progress.current} vs ceiling {progress.target}"
     else:
@@ -440,8 +662,12 @@ def describe_progress(progress: GoalProgress) -> str:
 
 
 __all__ = [
+    "ContributionPeriod",
     "SpendingCapPeriod",
     "balance_goal_progress",
+    "contribution_history",
+    "contribution_monthly_target",
+    "contribution_progress",
     "describe_goal",
     "describe_progress",
     "evaluate_goals",
