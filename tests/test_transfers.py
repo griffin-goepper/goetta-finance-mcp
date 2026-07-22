@@ -10,6 +10,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import pytest
+
+from goetta_finance.errors import BalanceTrueUpError
 from goetta_finance.models import Account, AccountType, BalanceSnapshot, Transaction
 from goetta_finance.store.duckdb_store import DuckDBStore
 from goetta_finance.transfers import (
@@ -18,6 +21,7 @@ from goetta_finance.transfers import (
     describe_suggestion,
     pending_transfer_delta,
     transfer_link_suggestions,
+    true_up_manual_balance,
 )
 
 ANCHOR = datetime(2026, 5, 21, 13, 42, tzinfo=UTC)
@@ -212,6 +216,61 @@ def test_true_up_absorbs_past_and_releases_future(store: DuckDBStore) -> None:
     [line] = apply_transfer_links(store)
     assert "+600.00" in line
     assert _balance(store) == Decimal("10600.00")
+
+
+def test_shared_true_up_then_later_transfer_applies_exactly_once(store: DuckDBStore) -> None:
+    """The shared write path (CLI set-balance AND MCP set_account_balance
+    call it): after a true-up, a linked settled transfer posted AFTER the
+    true-up's as_of applies once — and only once — on subsequent syncs."""
+    _seed(store)
+    store.upsert_transactions([_txn("t-early", day=12, amount="-500.00")])
+    store.add_transfer_link("MANUAL-sav", "ACT-chk", match_type="contains", pattern="Apple Savings")
+    apply_transfer_links(store)
+    assert _balance(store) == Decimal("10500.00")
+
+    # Forward true-up (June 20): absorbs t-early, declares 11000.
+    june20 = datetime(2026, 6, 20, tzinfo=UTC)
+    result = true_up_manual_balance(store, "MANUAL-sav", Decimal("11000.00"), as_of=june20)
+    assert result.links_reanchored == 1
+    assert result.applied == []  # nothing posted after June 20 yet
+    assert result.account.balance == Decimal("11000.00")
+    assert result.snapshot.balance == Decimal("11000.00")
+    assert result.snapshot.timestamp == june20
+    assert _balance(store) == Decimal("11000.00")
+
+    # A transfer posted AFTER the true-up rolls forward on the next sync…
+    store.upsert_transactions([_txn("t-late", day=25, amount="-100.00")])
+    [line] = apply_transfer_links(store)
+    assert "+100.00" in line
+    assert _balance(store) == Decimal("11100.00")
+
+    # …and never again: re-running (every sync does) applies nothing, and
+    # the ledger holds exactly one row for it.
+    assert apply_transfer_links(store) == []
+    assert _balance(store) == Decimal("11100.00")
+    ledger = store.conn.execute(
+        "SELECT COUNT(*) FROM transfer_link_applications WHERE transaction_id = 't-late'"
+    ).fetchone()
+    assert ledger is not None and ledger[0] == 1
+
+
+def test_shared_true_up_refusals(store: DuckDBStore) -> None:
+    """Unknown, non-manual, non-finite, and future-dated true-ups are
+    refused by the shared function — both surfaces inherit the gates."""
+    _seed(store)
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    with pytest.raises(BalanceTrueUpError, match="account not found"):
+        true_up_manual_balance(store, "MANUAL-nope", Decimal("1"), as_of=now)
+    with pytest.raises(BalanceTrueUpError, match="non-manual"):
+        true_up_manual_balance(store, "ACT-chk", Decimal("1"), as_of=now)
+    with pytest.raises(BalanceTrueUpError, match="finite"):
+        true_up_manual_balance(store, "MANUAL-sav", Decimal("NaN"), as_of=now)
+    with pytest.raises(BalanceTrueUpError, match="future"):
+        true_up_manual_balance(
+            store, "MANUAL-sav", Decimal("1"), as_of=datetime(2999, 1, 1, tzinfo=UTC)
+        )
+    # No writes happened.
+    assert _balance(store) == Decimal("10000.00")
 
 
 def test_apply_without_links_is_a_noop(store: DuckDBStore) -> None:
