@@ -674,6 +674,9 @@ def _contribution_goal(
     match: str = "contains",
     baseline: str | None = None,
     baseline_date: datetime | None = None,
+    recurring: str | None = None,
+    recurring_interval: str = "biweekly",
+    recurring_anchor: date | None = None,
 ) -> Goal:
     return store.add_goal(
         name,
@@ -685,6 +688,26 @@ def _contribution_goal(
         match_pattern=pattern,
         baseline_amount=Decimal(baseline) if baseline is not None else None,
         baseline_date=baseline_date,
+        recurring_amount=Decimal(recurring) if recurring is not None else None,
+        recurring_interval=recurring_interval if recurring is not None else None,
+        recurring_anchor=recurring_anchor,
+    )
+
+
+def _seed_plain_manual(store: DuckDBStore, *, account_id: str = "g-hsa") -> None:
+    """A manual account with no links and no feed — the HSA shape:
+    everything it accrues is declared."""
+    store.upsert_accounts(
+        [
+            Account(
+                id=account_id,
+                name="Optum HSA",
+                balance=Decimal("4400.00"),
+                balance_date=NOW,
+                type=AccountType.SAVINGS,
+                is_manual=True,
+            )
+        ]
     )
 
 
@@ -982,6 +1005,218 @@ def test_breach_warnings_ignore_contribution_goals(store: DuckDBStore) -> None:
     _contribution_goal(store, name="overfunded", amount="100")
     _contribution_txn(store, "c-over", "-999.00", posted=datetime(2026, 5, 5, tzinfo=UTC))
     assert goal_breach_warnings(store, now=NOW) == []
+
+
+# --- declared recurring contributions (migration 0015) -----------------------
+#
+# The HSA shape: payroll deducts a fixed amount per paycheck straight to
+# the account; no feed can see it, so it accrues by calculation. With
+# NOW = 2026-05-13T12:00Z and a biweekly payday anchor of 2026-01-09,
+# the elapsed biweekly paydays are Jan 9, 23, Feb 6, 20, Mar 6, 20,
+# Apr 3, 17, May 1 — nine of them (May 15 hasn't happened yet) — and
+# 17 more remain in 2026 (May 15 .. Dec 25... through Dec 31).
+
+
+def test_recurring_payday_on_period_start_counts(store: DuckDBStore) -> None:
+    """A payday landing exactly ON period_start belongs to the period."""
+    _seed_plain_manual(store)
+    goal = _contribution_goal(
+        store,
+        name="edge start",
+        account_id="g-hsa",
+        pattern=None,
+        recurring="100.00",
+        recurring_anchor=date(2026, 5, 1),
+    )
+    progress = contribution_progress(store, goal, now=NOW)
+    assert progress.current == Decimal("100.00")  # May 1 counted; May 15 is future
+    assert progress.declared_total == Decimal("100.00")
+
+
+def test_recurring_payday_on_now_counts(store: DuckDBStore) -> None:
+    """A payday landing exactly ON now's date has accrued."""
+    _seed_plain_manual(store)
+    goal = _contribution_goal(
+        store,
+        name="edge now",
+        account_id="g-hsa",
+        pattern=None,
+        recurring="100.00",
+        recurring_anchor=date(2026, 5, 13),  # == NOW.date()
+    )
+    progress = contribution_progress(store, goal, now=NOW)
+    # Backward series: Apr 29 is before the May period; only May 13 counts.
+    assert progress.current == Decimal("100.00")
+
+
+def test_recurring_series_extends_backward_from_late_anchor(store: DuckDBStore) -> None:
+    """An anchor AFTER now still yields the earlier paydays — the
+    series runs both directions (anchor 2026-07-10 → Jan 9 onward)."""
+    _seed_plain_manual(store)
+    goal = _contribution_goal(
+        store,
+        name="late anchor",
+        amount="4400",
+        period="year",
+        account_id="g-hsa",
+        pattern=None,
+        recurring="100.00",
+        recurring_anchor=date(2026, 7, 10),
+    )
+    progress = contribution_progress(store, goal, now=NOW)
+    # Jan 9, 23, Feb 6, 20, Mar 6, 20, Apr 3, 17, May 1 = 9 paydays.
+    assert progress.current == Decimal("900.00")
+
+
+def test_recurring_monthly_clamps_to_month_end(store: DuckDBStore) -> None:
+    """Monthly = the anchor's day-of-month, clamped: an anchor on
+    Jan 31 pays Feb 28 (2026 is not a leap year)."""
+    _seed_plain_manual(store)
+    goal = _contribution_goal(
+        store,
+        name="monthly clamp",
+        account_id="g-hsa",
+        pattern=None,
+        recurring="100.00",
+        recurring_interval="monthly",
+        recurring_anchor=date(2026, 1, 31),
+    )
+    feb_end = datetime(2026, 2, 28, 12, tzinfo=UTC)
+    progress = contribution_progress(store, goal, now=feb_end)
+    assert progress.current == Decimal("100.00")  # Feb 28 payday, clamped
+    history = contribution_history(store, goal, months=3, now=datetime(2026, 3, 31, 12, tzinfo=UTC))
+    assert [h.actual for h in history] == [
+        Decimal("100.00"),  # Jan 31
+        Decimal("100.00"),  # Feb 28 (clamped)
+        Decimal("100.00"),  # Mar 31
+    ]
+
+
+def test_recurring_composes_with_matched_ledger_and_baseline(store: DuckDBStore) -> None:
+    """All four sources stack without double-counting: ledger (800) +
+    own matched row (300) + baseline (100) + declared payday (100)."""
+    _seed_linked_manual(store)
+    _add_txn(store, "t-led-r", "-800.00", category=None)
+    apply_transfer_links(store)
+    _contribution_txn(
+        store,
+        "c-own-r",
+        "-300.00",
+        posted=datetime(2026, 5, 8, tzinfo=UTC),
+        account_id="g-sav",
+        description="DEPOSIT FROM PAYROLL",
+    )
+    goal = _contribution_goal(
+        store,
+        name="all sources",
+        account_id="g-sav",
+        pattern="DEPOSIT FROM PAYROLL",
+        baseline="100",
+        baseline_date=datetime(2026, 5, 2, tzinfo=UTC),
+        recurring="100.00",
+        recurring_anchor=date(2026, 5, 1),
+    )
+    progress = contribution_progress(store, goal, now=NOW)
+    assert progress.current == Decimal("1300.00")
+    assert progress.declared_total == Decimal("100.00")
+    history = contribution_history(store, goal, months=2, now=NOW)
+    assert history[-1].actual == progress.current == Decimal("1300.00")
+
+
+def test_recurring_history_buckets_tick_per_elapsed_payday(store: DuckDBStore) -> None:
+    """Each payday's amount lands in its month bucket; paydays later
+    this month haven't ticked yet — bars step up every payday."""
+    _seed_plain_manual(store)
+    goal = _contribution_goal(
+        store,
+        name="bucket steps",
+        account_id="g-hsa",
+        pattern=None,
+        recurring="100.00",
+        recurring_anchor=date(2026, 5, 1),
+    )
+    progress = contribution_progress(store, goal, now=NOW)
+    history = contribution_history(store, goal, months=2, now=NOW)
+    april, may = history
+    assert april.actual == Decimal("200.00")  # Apr 3 and Apr 17 (backward series)
+    assert may.actual == Decimal("100.00")  # May 1 only; May 15/29 are future
+    assert may.actual == progress.current
+
+
+def test_recurring_required_monthly_nets_future_paydays(store: DuckDBStore) -> None:
+    """The remaining gap subtracts what the schedule will contribute:
+    4400 - 1350.00 accrued - 2550.00 still scheduled = 500.00 over the
+    7.65 mean months left → 65.32/mo of direct transfers needed."""
+    _seed_plain_manual(store)
+    goal = _contribution_goal(
+        store,
+        name="HSA 2026",
+        amount="4400",
+        period="year",
+        account_id="g-hsa",
+        pattern=None,
+        recurring="150.00",
+        recurring_anchor=date(2026, 1, 9),
+    )
+    progress = contribution_progress(store, goal, now=NOW)
+    assert progress.current == Decimal("1350.00")  # 9 paydays
+    assert progress.declared_total == Decimal("1350.00")
+    assert progress.required_monthly == Decimal("65.32")
+    # Schedule + accrued (3900.00) can't reach 4400 and percent (30.7)
+    # trails elapsed (36.3) — genuinely at risk without direct transfers.
+    assert progress.status is GoalStatus.AT_RISK
+
+
+def test_recurring_on_schedule_goal_never_flickers_at_risk(store: DuckDBStore) -> None:
+    """The flicker pin: a goal whose target IS the schedule
+    (26 checks x 150.00 = 3900.00) sits behind linear pace between
+    paydays (34.6% funded at 36.3% elapsed mid-May), but the schedule
+    alone covers the target — on_track, with no required_monthly
+    (nothing beyond the schedule is needed)."""
+    _seed_plain_manual(store)
+    goal = _contribution_goal(
+        store,
+        name="payroll only",
+        amount="3900.00",
+        period="year",
+        account_id="g-hsa",
+        pattern=None,
+        recurring="150.00",
+        recurring_anchor=date(2026, 1, 9),
+    )
+    progress = contribution_progress(store, goal, now=NOW)
+    assert progress.current == Decimal("1350.00")
+    assert progress.percent < progress.period_elapsed_percent  # behind the clock...
+    assert progress.status is GoalStatus.ON_TRACK  # ...but the schedule covers it
+    assert progress.required_monthly is None
+
+
+def test_recurring_prose_discloses_declared_portion(store: DuckDBStore) -> None:
+    """The shared prose formatter names the calculated portion so no
+    surface presents declared accrual as observed money."""
+    _seed_plain_manual(store)
+    goal = _contribution_goal(
+        store,
+        name="HSA prose",
+        amount="4400",
+        period="year",
+        account_id="g-hsa",
+        pattern=None,
+        recurring="150.00",
+        recurring_anchor=date(2026, 1, 9),
+    )
+    progress = contribution_progress(store, goal, now=NOW)
+    line = describe_progress(progress)
+    assert "of which 1350.00 declared recurring" in line
+
+
+def test_contribution_without_recurring_has_no_declared_total(store: DuckDBStore) -> None:
+    """No schedule → declared_total None and prose stays silent."""
+    _seed_plain_manual(store)
+    goal = _contribution_goal(store, name="no schedule", account_id="g-hsa", pattern=None)
+    progress = contribution_progress(store, goal, now=NOW)
+    assert progress.declared_total is None
+    assert "declared recurring" not in describe_progress(progress)
 
 
 def test_describe_contribution_goal_and_progress(store: DuckDBStore) -> None:

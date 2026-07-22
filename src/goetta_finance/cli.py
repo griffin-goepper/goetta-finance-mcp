@@ -73,9 +73,12 @@ from goetta_finance.validators import (
     parse_goal_period,
     parse_goal_target_date,
     parse_match_type,
+    parse_recurring_anchor,
+    parse_recurring_interval,
     validate_goal_amount,
     validate_goal_baseline,
     validate_goal_name,
+    validate_goal_recurring,
     validate_rule_amount_bounds,
     validate_rule_pattern,
 )
@@ -1821,6 +1824,30 @@ def goal_add_contribution(
             "period containing it.",
         ),
     ] = None,
+    recurring: Annotated[
+        str | None,
+        typer.Option(
+            "--recurring",
+            help="DECLARED amount accrued per scheduled payday (e.g. a payroll "
+            "deduction no feed can see); pairs with --recurring-anchor.",
+        ),
+    ] = None,
+    recurring_interval: Annotated[
+        str | None,
+        typer.Option(
+            "--recurring-interval",
+            help="'weekly', 'biweekly' (default when --recurring is given), or "
+            "'monthly' (anchor's day-of-month, clamped to month end).",
+        ),
+    ] = None,
+    recurring_anchor: Annotated[
+        str | None,
+        typer.Option(
+            "--recurring-anchor",
+            help="ISO date of any payday in the schedule (past OK — the series "
+            "extends both directions).",
+        ),
+    ] = None,
     name: Annotated[
         str | None,
         typer.Option("--name", help="Goal name (default: derived from account and target)."),
@@ -1830,8 +1857,10 @@ def goal_add_contribution(
 
     Counted from the account's OWN data: matched settled transactions
     (by ABSOLUTE value — brokerages often sign cash-in negative) plus
-    applied linked transfers, plus the optional baseline. Being ahead
-    of the clock is on_track — the inverse of spending caps.
+    applied linked transfers, plus the optional baseline, plus the
+    optional --recurring schedule (accrued by CALCULATION per elapsed
+    payday — declared, never observed in a feed). Being ahead of the
+    clock is on_track — the inverse of spending caps.
     """
     amount = _parse_decimal(target, field="target")
     try:
@@ -1846,6 +1875,17 @@ def goal_add_contribution(
         )
         parsed_baseline_date = parse_goal_baseline_date(baseline_date)
         validate_goal_baseline(baseline_amount, parsed_baseline_date)
+        recurring_amount = (
+            _parse_decimal(recurring, field="recurring") if recurring is not None else None
+        )
+        interval_value = recurring_interval
+        if interval_value is None and recurring_amount is not None:
+            interval_value = "biweekly"
+        parsed_interval = (
+            parse_recurring_interval(interval_value) if interval_value is not None else None
+        )
+        parsed_anchor = parse_recurring_anchor(recurring_anchor)
+        validate_goal_recurring(recurring_amount, parsed_interval, parsed_anchor)
         goal_name = validate_goal_name(
             name if name is not None else f"{account_id} contribute {amount}/{normalized_period}"
         )
@@ -1869,6 +1909,9 @@ def goal_add_contribution(
             match_pattern=pattern,
             baseline_amount=baseline_amount,
             baseline_date=parsed_baseline_date,
+            recurring_amount=recurring_amount,
+            recurring_interval=parsed_interval,
+            recurring_anchor=parsed_anchor,
         )
         typer.echo(f'Added goal "{goal.name}" (id {goal.id}): {describe_goal(goal)}.')
     except GoettaFinanceError as exc:
