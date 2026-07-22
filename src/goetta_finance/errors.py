@@ -31,6 +31,17 @@ class StoreError(GoettaFinanceError):
     """Storage backend failure (schema, query, or connection)."""
 
 
+class BalanceTrueUpError(GoettaFinanceError):
+    """A manual-balance true-up was refused.
+
+    Raised by ``transfers.true_up_manual_balance`` (the shared write
+    path behind CLI ``account set-balance`` and MCP
+    ``set_account_balance``) for an unknown account, a non-manual
+    account (sync owns those balances), a future ``as_of``, or a
+    non-finite balance. The message is surface-ready: the CLI echoes it
+    verbatim; the MCP tool wraps it in ``{ok: False, error}``."""
+
+
 class CsvImportError(GoettaFinanceError):
     """A normalized-CSV import file is malformed or fails validation.
 
