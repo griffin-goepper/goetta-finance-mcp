@@ -12,6 +12,7 @@ from goetta_finance.tools._serialize import serialize_value
 from goetta_finance.tools.accounts import list_accounts
 from goetta_finance.tools.balance_history import account_balance_history
 from goetta_finance.tools.goals import remove_goal, set_goal
+from goetta_finance.tools.set_account_balance import set_account_balance
 from goetta_finance.tools.spending_by_category import spending_by_category
 from goetta_finance.tools.sql_query import sql_query
 from goetta_finance.tools.sync_now import sync_now
@@ -622,3 +623,132 @@ def test_get_transactions_view_route_perf_under_10k(store: DuckDBStore) -> None:
         f"or 250ms ceiling). All durations: "
         f"{[round(d, 1) for d in durations_ms]}"
     )
+
+
+# --- set_account_balance (manual true-up over MCP) --------------------------
+
+
+def _seed_manual(store: DuckDBStore) -> None:
+    store.upsert_accounts(
+        [
+            Account(
+                id="tu-chk",
+                org_name="Bank",
+                name="Checking",
+                balance=Decimal("100.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.CHECKING,
+            ),
+            Account(
+                id="MANUAL-tu",
+                name="Apple Savings",
+                balance=Decimal("25000.00"),
+                balance_date=datetime(2026, 5, 1, tzinfo=UTC),
+                type=AccountType.SAVINGS,
+                is_manual=True,
+            ),
+        ]
+    )
+
+
+def test_set_account_balance_updates_balance_and_snapshot(store: DuckDBStore) -> None:
+    _seed_manual(store)
+    result = set_account_balance(
+        store, account="MANUAL-tu", balance=Decimal("30450.12"), as_of="2026-06-01"
+    )
+    assert result["ok"] is True, result
+    # Serialized like list_accounts: money as strings.
+    assert result["account"]["id"] == "MANUAL-tu"
+    assert result["account"]["balance"] == "30450.12"
+    assert result["account"]["balance_date"].startswith("2026-06-01")
+    assert result["snapshot"] == {
+        "account_id": "MANUAL-tu",
+        "balance": "30450.12",
+        "timestamp": "2026-06-01T00:00:00+00:00",
+    }
+    assert result["links_reanchored"] == 0
+    assert result["transfers_reapplied"] == []
+    acc = next(a for a in store.get_accounts() if a.id == "MANUAL-tu")
+    assert acc.balance == Decimal("30450.12")
+    assert acc.balance_date == datetime(2026, 6, 1, tzinfo=UTC)
+    snaps = store.conn.execute(
+        "SELECT balance FROM balance_snapshots WHERE account_id = 'MANUAL-tu'"
+    ).fetchall()
+    assert [r[0] for r in snaps] == [Decimal("30450.12")]
+
+
+def test_set_account_balance_resolves_name_case_insensitively(store: DuckDBStore) -> None:
+    _seed_manual(store)
+    result = set_account_balance(store, account="apple savings", balance=Decimal("31000.00"))
+    assert result["ok"] is True, result
+    assert result["account"]["id"] == "MANUAL-tu"
+
+
+def test_set_account_balance_refuses_non_manual(store: DuckDBStore) -> None:
+    _seed_manual(store)
+    result = set_account_balance(store, account="tu-chk", balance=Decimal("1.00"))
+    assert result["ok"] is False
+    assert "non-manual" in result["error"]
+    assert "SimpleFIN" in result["error"]
+    # Nothing written.
+    acc = next(a for a in store.get_accounts() if a.id == "tu-chk")
+    assert acc.balance == Decimal("100.00")
+
+
+def test_set_account_balance_unknown_name_gives_did_you_mean(store: DuckDBStore) -> None:
+    _seed_manual(store)
+    result = set_account_balance(store, account="Aple Savings", balance=Decimal("1.00"))
+    assert result["ok"] is False
+    assert result["error"].startswith("account not found: Aple Savings.")
+    assert 'Did you mean "Apple Savings"?' in result["error"]
+
+
+def test_set_account_balance_rejects_bad_and_future_as_of(store: DuckDBStore) -> None:
+    _seed_manual(store)
+    bad = set_account_balance(
+        store, account="MANUAL-tu", balance=Decimal("1.00"), as_of="06/01/2026"
+    )
+    assert bad["ok"] is False
+    assert "ISO date" in bad["error"]
+
+    future = set_account_balance(
+        store, account="MANUAL-tu", balance=Decimal("1.00"), as_of="2999-01-01"
+    )
+    assert future["ok"] is False
+    assert "future" in future["error"]
+    # Neither attempt wrote anything.
+    acc = next(a for a in store.get_accounts() if a.id == "MANUAL-tu")
+    assert acc.balance == Decimal("25000.00")
+
+
+def test_set_account_balance_reports_reanchor_and_reapply(store: DuckDBStore) -> None:
+    """A true-up on a linked account re-anchors the links and re-applies
+    transfers posted after as_of; the returned account carries the final
+    (post-reapply) balance while the snapshot carries the declared one."""
+    _seed_manual(store)
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="tu-t1",
+                account_id="tu-chk",
+                posted=datetime(2026, 6, 12, 12, tzinfo=UTC),
+                amount=Decimal("-500.00"),
+                description="Transfer to savings",
+                payee="Apple Savings",
+            )
+        ]
+    )
+    store.add_transfer_link("MANUAL-tu", "tu-chk", match_type="contains", pattern="Apple Savings")
+    # Link creation already applied tu-t1 (posted after the May 1 balance
+    # date); a backdated June 1 true-up must release and re-apply it.
+    result = set_account_balance(
+        store, account="MANUAL-tu", balance=Decimal("31000.00"), as_of="2026-06-01"
+    )
+    assert result["ok"] is True, result
+    assert result["links_reanchored"] == 1
+    assert len(result["transfers_reapplied"]) == 1
+    assert "+500.00" in result["transfers_reapplied"][0]
+    assert result["snapshot"]["balance"] == "31000.00"
+    assert result["account"]["balance"] == "31500.00"
+    acc = next(a for a in store.get_accounts() if a.id == "MANUAL-tu")
+    assert acc.balance == Decimal("31500.00")
