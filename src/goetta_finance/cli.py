@@ -68,11 +68,13 @@ from goetta_finance.validators import (
     GoalValidationError,
     RulePatternError,
     format_rule_bounds,
+    parse_goal_baseline_date,
     parse_goal_direction,
     parse_goal_period,
     parse_goal_target_date,
     parse_match_type,
     validate_goal_amount,
+    validate_goal_baseline,
     validate_goal_name,
     validate_rule_amount_bounds,
     validate_rule_pattern,
@@ -1646,9 +1648,9 @@ def transaction_uncategorize(
 
 goal_app = typer.Typer(
     help=(
-        "Spending caps and balance targets, evaluated at read time. "
-        "Progress is never stored — recategorizing transactions or new "
-        "syncs retroactively change it."
+        "Spending caps, balance targets, and contribution goals, evaluated "
+        "at read time. Progress is never stored — recategorizing "
+        "transactions or new syncs retroactively change it."
     ),
     no_args_is_help=True,
 )
@@ -1776,6 +1778,106 @@ def goal_add_balance(
         store.close()
 
 
+@goal_app.command("add-contribution")
+def goal_add_contribution(
+    account_id: Annotated[
+        str, typer.Argument(help="Account id (see `goetta-finance account list`).")
+    ],
+    target: Annotated[
+        str, typer.Option("--target", help="Contribution target per period, e.g. 7500.")
+    ],
+    period: Annotated[
+        str,
+        typer.Option("--period", help="'month' or 'year' — calendar buckets (UTC)."),
+    ] = "month",
+    pattern: Annotated[
+        str | None,
+        typer.Option(
+            "--pattern",
+            help=(
+                "Match the account's own transactions (description OR payee). "
+                "Required for synced accounts; manual accounts fed by transfer "
+                "links may omit it."
+            ),
+        ),
+    ] = None,
+    match: Annotated[
+        str,
+        typer.Option("--match", help="Pattern match type: 'contains' (default) or 'regex'."),
+    ] = "contains",
+    baseline: Annotated[
+        str | None,
+        typer.Option(
+            "--baseline",
+            help="Contributions already made before the feed's history (pairs with "
+            "--baseline-date).",
+        ),
+    ] = None,
+    baseline_date: Annotated[
+        str | None,
+        typer.Option(
+            "--baseline-date",
+            help="ISO date the baseline was reached (not future); counted into the "
+            "period containing it.",
+        ),
+    ] = None,
+    name: Annotated[
+        str | None,
+        typer.Option("--name", help="Goal name (default: derived from account and target)."),
+    ] = None,
+) -> None:
+    """Contribute at least --target into ACCOUNT_ID per calendar --period.
+
+    Counted from the account's OWN data: matched settled transactions
+    (by ABSOLUTE value — brokerages often sign cash-in negative) plus
+    applied linked transfers, plus the optional baseline. Being ahead
+    of the clock is on_track — the inverse of spending caps.
+    """
+    amount = _parse_decimal(target, field="target")
+    try:
+        validate_goal_amount(amount, param_hint="--target")
+        normalized_period = parse_goal_period(period)
+        match_type: str | None = None
+        if pattern is not None:
+            match_type = parse_match_type(match)
+            validate_rule_pattern(pattern, match_type)
+        baseline_amount = (
+            _parse_decimal(baseline, field="baseline") if baseline is not None else None
+        )
+        parsed_baseline_date = parse_goal_baseline_date(baseline_date)
+        validate_goal_baseline(baseline_amount, parsed_baseline_date)
+        goal_name = validate_goal_name(
+            name if name is not None else f"{account_id} contribute {amount}/{normalized_period}"
+        )
+    except GoalValidationError as exc:
+        raise _goal_bad_parameter(exc) from exc
+    except RulePatternError as exc:
+        raise typer.BadParameter(str(exc), param_hint=exc.param_hint) from exc
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"goal add-contribution failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        goal = store.add_goal(
+            goal_name,
+            kind="contribution",
+            amount=amount,
+            account_id=account_id,
+            period=normalized_period,
+            match_type=match_type,
+            match_pattern=pattern,
+            baseline_amount=baseline_amount,
+            baseline_date=parsed_baseline_date,
+        )
+        typer.echo(f'Added goal "{goal.name}" (id {goal.id}): {describe_goal(goal)}.')
+    except GoettaFinanceError as exc:
+        typer.secho(f"goal add-contribution failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
 @goal_app.command("list")
 def goal_list() -> None:
     """List goals with progress, status, and pace (evaluated now)."""
@@ -1788,8 +1890,9 @@ def goal_list() -> None:
         progresses = evaluate_goals(store)
         if not progresses:
             typer.echo(
-                "No goals yet. Add one with `goetta-finance goal add-spending` "
-                "or `goetta-finance goal add-balance`."
+                "No goals yet. Add one with `goetta-finance goal add-spending`, "
+                "`goetta-finance goal add-balance`, or "
+                "`goetta-finance goal add-contribution`."
             )
             return
         for progress in progresses:

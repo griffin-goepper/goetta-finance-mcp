@@ -71,6 +71,7 @@ class Category(BaseModel):
 class GoalKind(StrEnum):
     SPENDING_CAP = "spending_cap"
     BALANCE = "balance"
+    CONTRIBUTION = "contribution"
 
 
 class GoalPeriod(StrEnum):
@@ -90,6 +91,9 @@ class GoalStatus(StrEnum):
     MET | ON_TRACK | AT_RISK, plus OVER for a breached at_most goal
     (owing more than the ceiling). An unmet at_least goal is not a
     failure state -- it's ON_TRACK or AT_RISK depending on pace.
+    Contribution goals use MET | ON_TRACK | AT_RISK and never OVER:
+    funding ahead of the clock is ON_TRACK (the INVERSE of caps, where
+    ahead-of-pace is AT_RISK).
     """
 
     ON_TRACK = "on_track"
@@ -114,11 +118,19 @@ class Goal(BaseModel):
     category_id: int | None = None
     category_name: str | None = None
     period: GoalPeriod | None = None
-    # balance
+    # balance (account_id/account_name shared with contribution)
     account_id: str | None = None
     account_name: str | None = None
     direction: GoalDirection | None = None
     target_date: date | None = None
+    # contribution (migration 0014): optional matcher against the
+    # account's own feed (description OR payee, transfer-link semantics,
+    # ABS amounts) and an optional pre-history baseline counted into the
+    # period containing baseline_date.
+    match_type: str | None = None
+    match_pattern: str | None = None
+    baseline_amount: Decimal | None = None
+    baseline_date: datetime | None = None
     created_at: datetime
 
 

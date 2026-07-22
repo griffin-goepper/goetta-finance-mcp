@@ -75,7 +75,7 @@ Re-running `init` is safe — each step detects existing state and offers to ski
 | `goetta-finance account link\|links\|unlink` | Roll a manual account's balance forward from matching transfers on a synced account. See "Linked transfers" below. |
 | `goetta-finance category list\|add\|set-rule\|remove-rule\|default-rules` | Manage categories and the rules that map descriptions to them. See "Transaction categorization" below. |
 | `goetta-finance transaction categorize\|uncategorize` | Manual per-transaction category overrides. See "Transaction categorization" below. |
-| `goetta-finance goal add-spending\|add-balance\|list\|remove` | Spending caps and balance targets, evaluated at read time. See "Goals" below. |
+| `goetta-finance goal add-spending\|add-balance\|add-contribution\|list\|remove` | Spending caps, balance targets, and contribution goals, evaluated at read time. See "Goals" below. |
 | `goetta-finance import transactions\|balances` | Import historical data from normalized CSVs (e.g. parsed bank statements). See "Importing historical data" below. |
 
 ## Importing historical data
@@ -290,7 +290,7 @@ What that means in practice:
 
 ## Goals
 
-Lightweight thresholds, not envelope budgeting: cap a category's spending per calendar month/year, or track an account balance toward a target. Progress is **computed at read time** — nothing is stored, so recategorizing transactions or a fresh sync changes goal progress retroactively, exactly like the categorization view.
+Lightweight thresholds, not envelope budgeting: cap a category's spending per calendar month/year, track an account balance toward a target, or track contributions into an account per period. Progress is **computed at read time** — nothing is stored, so recategorizing transactions or a fresh sync changes goal progress retroactively, exactly like the categorization view.
 
 ```bash
 # Cap net spending in a category per calendar month (or --period year).
@@ -301,6 +301,12 @@ goetta-finance goal add-spending Groceries --limit 400 --period month
 goetta-finance goal add-balance <account-id> --target 10000 --direction at_least --by 2027-06-01
 goetta-finance goal add-balance <card-id> --target 2000 --direction at_most
 
+# Contribute at least X into an account per month/year, counted from the
+# account's own feed (--pattern) and/or its transfer-link ledger.
+goetta-finance goal add-contribution <ira-id> --target 7500 --period year \
+    --pattern "CASH CONTRIBUTION CURRENT YEAR" --baseline 3000 --baseline-date 2026-03-01
+goetta-finance goal add-contribution <manual-savings-id> --target 800   # linked manual: no pattern needed
+
 goetta-finance goal list          # progress, status, and pace per goal
 goetta-finance goal remove 3      # confirms unless --yes
 ```
@@ -309,7 +315,8 @@ Semantics worth knowing:
 
 - **Cap math matches the pie exactly.** Spending caps reuse the same net-spending SQL as `spending_by_category` and the dashboard pie: refunds reduce the total, hidden accounts are excluded, pending transactions count, and periods are UTC calendar buckets.
 - **Liability accounts evaluate the absolute balance** (amount owed): `--direction at_most --target 2000` on a credit card means "owe under 2000" whichever way the institution signs the balance.
-- **Status** is `on_track` / `at_risk` (ahead of linear pace, or trend projects past `--by`) / `over` (cap blown, ceiling breached) / `met`. Balance goals derive pace from the last 90 days of balance snapshots.
+- **Contribution goals sum absolute values** of settled matched transactions (description OR payee, `contains`/`regex` like transfer links) — brokerages often sign cash-in negative — plus applied linked transfers, plus an optional pre-history `--baseline` counted into the period containing `--baseline-date`. Synced accounts require `--pattern`; manual accounts fed by transfer links need zero extra config. Ahead of the funding clock is `on_track` — the inverse of caps.
+- **Status** is `on_track` / `at_risk` (ahead of linear pace, or trend projects past `--by`; for contributions, *behind* the funding clock) / `over` (cap blown, ceiling breached) / `met`. Balance goals derive pace from the last 90 days of balance snapshots.
 - **Breach summary after sync.** `goetta-finance sync` prints a yellow `goal:` line for each goal at status `over`; the daemon logs the same at WARNING after scheduled syncs. `at_risk` never fires a warning — it's pace noise by design.
 - From Claude: `list_goals` (progress + pace), `set_goal`, `remove_goal`. The dashboard has a **Goals** page with progress bars.
 
@@ -491,7 +498,7 @@ If you want to build your own dashboard UI, the daemon (and `web`) also serve a 
 | `GET /api/v1/spending/by-category?days=` or `?start=&end=` | net spending per category, with display colors |
 | `GET /api/v1/spending/by-month?months=&category=` | month × category matrix (pending **included** — matches goal-cap math) |
 | `GET /api/v1/goals` | goals with computed progress (same shape as the MCP `list_goals` tool) |
-| `GET /api/v1/goals/{id}/history?periods=` | per-period actuals vs a spending cap, or balance snapshots for balance goals |
+| `GET /api/v1/goals/{id}/history?periods=` | per-period actuals vs a spending cap, balance snapshots for balance goals, or monthly contribution buckets vs `monthly_target` for contribution goals |
 | `GET /api/v1/transactions?account_id=&start=&end=&category=&q=&limit=` | filtered transactions with resolved categories |
 | `GET /api/v1/categories` | category names, colors, `is_spending` flags |
 | `GET /api/v1/sync/status?limit=` | recent sync runs with parsed warnings/errors |
