@@ -65,21 +65,18 @@ def get_transactions(
     """MCP-tool wrapper. Always routes through the
     ``transactions_with_category`` view so every returned dict carries a
     resolved ``category`` field. Transactions from hidden accounts are
-    filtered by default (``include_hidden=True`` opts back in)."""
+    filtered by default (``include_hidden=True`` opts back in).
+
+    Every filter — ``search`` included — goes to the store so ``limit``
+    bounds the matches. Don't reintroduce a post-query text filter here;
+    it silently caps a search at the newest ``limit`` transactions."""
     rows = store.get_transactions_with_category(
         account_id=account_id,
         start=start,
         end=end,
         category=category,
+        search=search,
         include_hidden=include_hidden,
         limit=limit,
     )
-    if search:
-        needle = search.lower()
-        rows = [
-            r
-            for r in rows
-            if needle in r["description"].lower()
-            or (r.get("payee") is not None and needle in r["payee"].lower())
-        ]
     return [_serialize_row_with_category(r) for r in rows]

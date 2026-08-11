@@ -435,6 +435,37 @@ def test_api_transactions_filters_and_search(client: TestClient) -> None:
     assert "tx-hidden-dining" not in {t["id"] for t in all_body["transactions"]}
 
 
+def test_api_transactions_search_survives_the_default_limit(
+    store: DuckDBStore, client: TestClient
+) -> None:
+    """Regression (dashboard "search finds nothing older than ~a month"):
+    ``q`` is applied in SQL, so the default limit of 100 bounds matches
+    rather than the newest 100 transactions of any merchant."""
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="tx-old-speedway",
+                account_id="acc-checking",
+                posted=datetime(2019, 5, 13, tzinfo=UTC),
+                amount=Decimal("-31.02"),
+                description="SPEEDWAY 04321",
+            ),
+            *[
+                Transaction(
+                    id=f"tx-noise-{i}",
+                    account_id="acc-checking",
+                    posted=NOW - timedelta(days=i),
+                    amount=Decimal("-5.00"),
+                    description="KROGER #123",
+                )
+                for i in range(150)
+            ],
+        ]
+    )
+    body = client.get("/api/v1/transactions?q=speedway").json()
+    assert [t["id"] for t in body["transactions"]] == ["tx-old-speedway"]
+
+
 def test_api_transactions_limit_clamped(client: TestClient) -> None:
     body = client.get("/api/v1/transactions?limit=0").json()
     assert body["count"] == 1  # limit clamps up to 1

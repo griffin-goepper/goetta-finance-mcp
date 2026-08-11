@@ -54,6 +54,7 @@ class FinanceStore(Protocol):
         start: datetime | None = None,
         end: datetime | None = None,
         category: str | None = None,
+        search: str | None = None,
         include_hidden: bool = False,
         limit: int | None = None,
     ) -> list[dict[str, Any]]: ...

@@ -862,6 +862,7 @@ class DuckDBStore:
         start: datetime | None = None,
         end: datetime | None = None,
         category: str | None = None,
+        search: str | None = None,
         include_hidden: bool = False,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
@@ -875,6 +876,14 @@ class DuckDBStore:
         does not carry one, by design), while this one returns dicts
         carrying the resolved category for callers that want both shapes
         at once (the dashboard, the ``get_transactions`` MCP tool).
+
+        ``search`` is a case-insensitive substring of description or
+        payee, and it belongs HERE rather than in the callers: filtering
+        in Python after the query means ``limit`` bounds the raw feed
+        instead of the matches, so a search only ever sees the newest
+        ``limit`` transactions. That was a live bug — searching a
+        merchant on the dashboard returned the handful of hits inside the
+        most recent 100 rows and nothing older.
         """
         clauses: list[str] = []
         params: list[Any] = []
@@ -890,12 +899,23 @@ class DuckDBStore:
         if category is not None:
             clauses.append("category = ?")
             params.append(category)
+        if search:
+            # ``contains`` is a plain substring test (no LIKE wildcards to
+            # escape), matching the Python ``in`` semantics this replaced.
+            clauses.append(
+                "(contains(lower(COALESCE(description, '')), ?)"
+                " OR contains(lower(COALESCE(payee, '')), ?))"
+            )
+            needle = search.lower()
+            params.extend([needle, needle])
         if not include_hidden:
             clauses.append("COALESCE(account_is_hidden, FALSE) = FALSE")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         limit_clause = f"LIMIT {int(limit)}" if limit is not None else ""
         with self._lock:
-            # ruff S608 / bandit B608: see ``get_transactions``.
+            # ruff S608 / bandit B608: see ``get_transactions``. The search
+            # predicate is likewise a fixed string; the needle binds via
+            # ``params``.
             cur = self.conn.execute(
                 f"""
                 SELECT id, account_id, posted, transacted_at, amount, description,
