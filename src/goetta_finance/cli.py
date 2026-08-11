@@ -233,6 +233,37 @@ def _validate_dash_dir(dash_dir: Path | None) -> Path | None:
     return resolved
 
 
+def _warn_non_loopback_bind(host: str) -> None:
+    """Warn when --host leaves loopback. Shared by ``web`` and ``daemon``
+    so the two cannot drift on a security message.
+
+    A wildcard bind gets a second line: ``trusted_hosts_for`` cannot
+    enumerate the names that reach an all-interfaces bind, so it returns
+    ``("*",)`` and the Host allowlist — the DNS-rebinding defense — is
+    off. Naming a concrete address keeps it on.
+    """
+    if host in ("127.0.0.1", "localhost"):
+        return
+    # Local import: web.app pulls in fastapi/starlette, and cli.py keeps
+    # that off the path of every non-web command.
+    from goetta_finance.web.app import trusted_hosts_for
+
+    typer.secho(
+        f"WARNING: binding to {host}; anyone on this network can read "
+        f"your finances. No auth is enforced.",
+        fg=typer.colors.YELLOW,
+        err=True,
+    )
+    if "*" in trusted_hosts_for(host):
+        typer.secho(
+            f"WARNING: {host} binds every interface, so the Host-header "
+            "allowlist is disabled and DNS-rebinding protection is off. "
+            "Bind a specific address instead if you can.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+
+
 @app.command()
 def web(
     host: Annotated[
@@ -259,13 +290,7 @@ def web(
                 err=True,
             )
             raise typer.Exit(code=1)
-        if host != "127.0.0.1" and host != "localhost":
-            typer.secho(
-                f"WARNING: binding to {host}; anyone on this network can read "
-                f"your finances. No auth is enforced.",
-                fg=typer.colors.YELLOW,
-                err=True,
-            )
+        _warn_non_loopback_bind(host)
         store = DuckDBStore(target_db, read_only=True)
         try:
             import duckdb
@@ -287,9 +312,9 @@ def web(
                 )
                 raise typer.Exit(code=1) from exc
 
-            from goetta_finance.web.app import build_app
+            from goetta_finance.web.app import build_app, trusted_hosts_for
 
-            web_app = build_app(store, dash_dir=dash_dir)
+            web_app = build_app(store, dash_dir=dash_dir, allowed_hosts=trusted_hosts_for(host))
             import uvicorn
 
             typer.echo(f"goetta-finance dashboard at http://{host}:{port}")
@@ -355,13 +380,7 @@ def daemon(
                 err=True,
             )
             raise typer.Exit(code=1)
-        if host != "127.0.0.1" and host != "localhost":
-            typer.secho(
-                f"WARNING: binding to {host}; anyone on this network can read "
-                f"your finances. No auth is enforced.",
-                fg=typer.colors.YELLOW,
-                err=True,
-            )
+        _warn_non_loopback_bind(host)
         store = DuckDBStore(db_path(config))
         try:
             import duckdb

@@ -17,6 +17,12 @@ from goetta_finance.models import (
 from goetta_finance.store.duckdb_store import DuckDBStore
 from goetta_finance.web.app import build_app
 
+# TestClient defaults to Host "testserver", which the Host-header allowlist
+# (the DNS-rebinding defense, see web/app.py) correctly rejects. Drive the
+# tests through a loopback base_url so they exercise the real default
+# posture rather than a version of the app with the check disabled.
+LOOPBACK = "http://127.0.0.1:8765"
+
 
 def _seed(store: DuckDBStore) -> None:
     store.upsert_accounts(
@@ -87,7 +93,7 @@ def _seed(store: DuckDBStore) -> None:
 def client(store: DuckDBStore) -> Iterator[TestClient]:
     _seed(store)
     app = build_app(store)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=LOOPBACK) as c:
         yield c
 
 
@@ -154,7 +160,7 @@ def test_sync_page_renders_with_warnings(client: TestClient) -> None:
 def test_unconfigured_store_renders_empty_state(store: DuckDBStore) -> None:
     """An empty store still serves all pages without error."""
     app = build_app(store)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=LOOPBACK) as c:
         for path in (
             "/",
             "/net-worth",
@@ -185,7 +191,7 @@ def test_spending_by_category_page_renders(client: TestClient) -> None:
 def test_spending_by_category_page_renders_empty_state(store: DuckDBStore) -> None:
     """No transactions = empty state, not a broken page."""
     app = build_app(store)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=LOOPBACK) as c:
         resp = c.get("/spending-by-category")
     assert resp.status_code == 200
     assert "No spending" in resp.text
@@ -382,7 +388,7 @@ def test_goals_page_balance_goal_met(client: TestClient, store: DuckDBStore) -> 
 
 def test_goals_page_empty_state(store: DuckDBStore) -> None:
     app = build_app(store)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=LOOPBACK) as c:
         resp = c.get("/goals")
         assert resp.status_code == 200
         assert "No goals yet" in resp.text
