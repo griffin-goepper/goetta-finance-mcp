@@ -271,16 +271,30 @@ value on the line, not the one that prompted it.
 Findings 2, 3 (the reachable chain), and 7. Gates after the changes: **729 passed, 3 skipped**
 (6 new tests), `ruff check` clean, `ruff format` clean, `mypy --strict` clean.
 
-**One pre-existing problem this pass did not touch and did not cause:** `bandit -r src/ -c
-pyproject.toml` exits **1** on `main` today, so the bandit step of `.github/workflows/security.yml`
-has been failing independently of this work. The cause is that the eight B608 sites carry only
-ruff's `# noqa: S608` and not bandit's `# nosec B608` — the two tools do not share a suppression
-mechanism, and elsewhere in the same file (`duckdb_store.py:1088` and others) both are used
-together. Confirmed by running bandit against a stashed tree. **Do not fix this by adding `# nosec`
-to all eight**: four of them (`629/637/645/696`) are precisely where finding 1 lives, and
-suppressing them would bank a rationale that the audit just showed to be incomplete. Fix finding 1
-first, then suppress what genuinely remains. A security gate that is always red teaches everyone to
-ignore it, so this is worth doing soon.
+**A CI gate that is about to start failing, and is not caused by this pass.**
+`bandit -r src/ -c pyproject.toml` exits **1** anywhere the backup/restore code is present. Measured
+per-ref in a clean worktree:
+
+```
+origin/main                    -> bandit exit 0
+transaction-search-pushdown    -> bandit exit 0   (PR #16, top of the clean run)
+backup-restore                 -> bandit exit 1   (PR #17, where it starts)
+```
+
+So the bandit step of `.github/workflows/security.yml` is green on `main` today and goes red the
+moment PR #17 lands — and stays red through #18, #19 and #20. It has not been failing historically;
+an earlier draft of this document claimed it had, from a measurement taken against the stack tip
+rather than `main`.
+
+The cause is that the eight B608 sites carry only ruff's `# noqa: S608` and not bandit's
+`# nosec B608` — the two tools do not share a suppression mechanism, and elsewhere in the same file
+(`duckdb_store.py:1088` and others) both are used together.
+
+**Do not fix this by adding `# nosec` to all eight**: four of them (`629/637/645/696`) are precisely
+where finding 1 lives, and suppressing them would bank a rationale this audit just showed to be
+incomplete. The honest sequence is to fix finding 1 first — then all eight suppressions are true and
+the gate goes green on its own merits. A security gate that is always red teaches everyone to ignore
+it, so this wants doing before or alongside the #17 merge, not after.
 
 ## Outstanding items
 
