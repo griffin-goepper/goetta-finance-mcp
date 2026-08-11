@@ -6,6 +6,7 @@ import logging
 import re
 import sys
 import uuid
+from collections.abc import Callable
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -17,12 +18,15 @@ from goetta_finance import __version__
 from goetta_finance.backup import (
     create_backup,
     list_backups,
+    maybe_create_daily_backup,
     read_manifest,
     restore_backup,
     verify_backup,
 )
 from goetta_finance.collector import collect
 from goetta_finance.config import (
+    Config,
+    backup_dir,
     config_path,
     db_path,
     home_dir,
@@ -92,6 +96,8 @@ from goetta_finance.validators import (
 )
 
 MANUAL_ID_PREFIX = "MANUAL-"
+
+logger = logging.getLogger(__name__)
 
 app = typer.Typer(
     help="Local-first MCP server that connects SimpleFIN to Claude.",
@@ -385,6 +391,12 @@ def daemon(
                 typer.echo(f"  SPA:       http://{host}:{port}/dash/")
             typer.echo(f"  MCP:       {mcp_url}")
             typer.echo(f"  schedule:  {'(disabled)' if no_schedule else sync_at + ' local'}")
+            backup_hook = _build_backup_hook(store, config)
+            typer.echo(
+                f"  backups:   {backup_dir(config)} (after each sync, max 1/day)"
+                if backup_hook is not None
+                else "  backups:   (disabled)"
+            )
             typer.echo(f"  stop:      create {stop_file} for a graceful shutdown")
             run_daemon(
                 store,
@@ -392,6 +404,7 @@ def daemon(
                 host=host,
                 port=port,
                 sync_at=sync_at,
+                backup_hook=backup_hook,
                 schedule_enabled=not no_schedule,
                 mcp_enabled=not no_mcp,
                 stop_file=stop_file,
@@ -2001,8 +2014,37 @@ backup_app = typer.Typer(
 app.add_typer(backup_app, name="backup")
 
 
-def _default_backup_dir() -> Path:
-    return home_dir() / "backups"
+def _build_backup_hook(store: DuckDBStore, config: Config) -> Callable[[], None] | None:
+    """The daemon's post-sync backup step, or None when disabled.
+
+    Bound here rather than inside the daemon so ``daemon.py`` stays
+    free of config loading and of the concrete store type that
+    ``create_backup`` needs.
+    """
+    if not config.backup.enabled:
+        return None
+    settings = config.backup
+    directory = backup_dir(config)
+
+    def hook() -> None:
+        result = maybe_create_daily_backup(
+            store,
+            directory,
+            config_file=config_path(),
+            prefixes_file=prefixes_path(),
+            include_credentials=settings.include_credentials,
+            keep_daily=settings.keep_daily,
+            keep_monthly=settings.keep_monthly,
+        )
+        if result is not None:
+            logger.info(
+                "post-sync backup: %s (%d rows, %d bytes)",
+                result.path.name,
+                result.total_rows,
+                result.size_bytes,
+            )
+
+    return hook
 
 
 def _open_store_for_backup(target_db: Path) -> DuckDBStore:
@@ -2053,11 +2095,13 @@ def backup_now(
         ),
     ] = False,
     keep_daily: Annotated[
-        int, typer.Option("--keep-daily", help="Most recent archives to keep.")
-    ] = 14,
+        int | None,
+        typer.Option("--keep-daily", help="Most recent archives to keep."),
+    ] = None,
     keep_monthly: Annotated[
-        int, typer.Option("--keep-monthly", help="Months to keep one archive from.")
-    ] = 12,
+        int | None,
+        typer.Option("--keep-monthly", help="Months to keep one archive from."),
+    ] = None,
     skip_verify: Annotated[
         bool,
         typer.Option("--skip-verify", help="Do not test-restore the archive after writing it."),
@@ -2066,7 +2110,10 @@ def backup_now(
     """Write a verified backup archive and prune expired ones."""
     try:
         config = load_config()
-        directory = dest or _default_backup_dir()
+        # Unset options fall through to config.json so a manual run and
+        # the daemon's scheduled one cannot prune to different depths
+        # against the same directory.
+        directory = dest or backup_dir(config)
         store = _open_store_for_backup(db_path(config))
         try:
             result = create_backup(
@@ -2074,10 +2121,10 @@ def backup_now(
                 directory,
                 config_file=config_path(),
                 prefixes_file=prefixes_path(),
-                include_credentials=include_credentials,
+                include_credentials=include_credentials or config.backup.include_credentials,
                 verify=not skip_verify,
-                keep_daily=keep_daily,
-                keep_monthly=keep_monthly,
+                keep_daily=config.backup.keep_daily if keep_daily is None else keep_daily,
+                keep_monthly=(config.backup.keep_monthly if keep_monthly is None else keep_monthly),
             )
         finally:
             store.close()
@@ -2092,7 +2139,7 @@ def backup_now(
         typer.echo("  verified by test-restore")
     else:
         typer.secho("  NOT verified (--skip-verify)", fg=typer.colors.YELLOW)
-    if not include_credentials:
+    if not (include_credentials or config.backup.include_credentials):
         typer.echo("  access_url redacted from config.json")
     for path in result.pruned:
         typer.echo(f"  pruned {path.name}")
@@ -2105,7 +2152,7 @@ def backup_list(
     ] = None,
 ) -> None:
     """List backup archives, newest first."""
-    directory = dest or _default_backup_dir()
+    directory = dest or backup_dir(load_config())
     found = list_backups(directory)
     if not found:
         typer.echo(f"No backups in {directory}")
@@ -2116,6 +2163,64 @@ def backup_list(
             f"  {info.path.name}  {info.created_at:%Y-%m-%d %H:%M UTC}  "
             f"{info.size_bytes / 1024:.1f} KiB"
         )
+
+
+@backup_app.command("configure")
+def backup_configure(
+    directory: Annotated[
+        Path | None,
+        typer.Option(
+            "--dir",
+            help="Where the daemon writes archives. Point this at a folder your "
+            "cloud client already syncs. Unset means $GOETTA_FINANCE_HOME/backups.",
+        ),
+    ] = None,
+    enable: Annotated[
+        bool | None,
+        typer.Option("--enable/--disable", help="Back up after each successful sync."),
+    ] = None,
+    keep_daily: Annotated[
+        int | None, typer.Option("--keep-daily", help="Most recent archives to keep.")
+    ] = None,
+    keep_monthly: Annotated[
+        int | None, typer.Option("--keep-monthly", help="Months to keep one archive from.")
+    ] = None,
+) -> None:
+    """Set backup options in config.json. With no options, shows them."""
+    try:
+        config = load_config()
+        changed = False
+        if directory is not None:
+            config.backup.directory = str(directory.expanduser().resolve())
+            changed = True
+        if enable is not None:
+            config.backup.enabled = enable
+            changed = True
+        if keep_daily is not None:
+            if keep_daily < 0:
+                raise typer.BadParameter("--keep-daily cannot be negative")
+            config.backup.keep_daily = keep_daily
+            changed = True
+        if keep_monthly is not None:
+            if keep_monthly < 0:
+                raise typer.BadParameter("--keep-monthly cannot be negative")
+            config.backup.keep_monthly = keep_monthly
+            changed = True
+        if changed:
+            save_config(config)
+    except GoettaFinanceError as exc:
+        typer.secho(f"Could not update config: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    if changed:
+        typer.secho(f"Updated {config_path()}", fg=typer.colors.GREEN)
+    typer.echo(f"  enabled:      {config.backup.enabled}")
+    typer.echo(f"  directory:    {backup_dir(config)}")
+    typer.echo(f"  keep daily:   {config.backup.keep_daily}")
+    typer.echo(f"  keep monthly: {config.backup.keep_monthly}")
+    typer.echo(f"  credentials:  {'included' if config.backup.include_credentials else 'redacted'}")
+    if config.backup.enabled:
+        typer.echo("The daemon backs up after each successful sync, at most once a day.")
 
 
 @backup_app.command("verify")

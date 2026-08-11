@@ -20,6 +20,7 @@ import pytest
 import uvicorn
 
 from goetta_finance.daemon import build_daemon_app
+from goetta_finance.errors import GoettaFinanceError
 from goetta_finance.store.duckdb_store import DuckDBStore
 
 
@@ -485,3 +486,89 @@ def test_http_fatal_error_returns_500_and_triggers_shutdown(tmp_path: Path) -> N
     assert response.json() == {"error": "database invalidated; daemon is restarting"}
     assert calls == [True]
     store.close()
+
+
+# --- post-sync backup hook -------------------------------------------
+
+
+def test_run_collect_blocking_runs_the_backup_hook_after_a_successful_sync(
+    store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hook runs last, on fresh data, once the sync succeeded."""
+    from datetime import UTC, datetime
+
+    from goetta_finance import daemon as daemon_module
+    from goetta_finance.models import SyncRun
+
+    def fake_collect(s: object, c: object) -> SyncRun:
+        now = datetime.now(tz=UTC)
+        return SyncRun(started_at=now, finished_at=now)
+
+    monkeypatch.setattr(daemon_module, "collect_under_lock", fake_collect)
+    calls: list[int] = []
+    daemon_module._run_collect_blocking(
+        store,
+        _FakeClient(),  # type: ignore[arg-type]
+        None,
+        lambda: calls.append(1),
+    )
+    assert calls == [1]
+
+
+def test_backup_hook_does_not_run_when_the_sync_was_skipped(
+    store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A skipped sync (another one in flight) is not a data change, and
+    ``collect_under_lock`` returning None exits before the post-sync
+    steps — the hook must not fire behind it."""
+    from goetta_finance import daemon as daemon_module
+
+    monkeypatch.setattr(daemon_module, "collect_under_lock", lambda s, c: None)
+    calls: list[int] = []
+    daemon_module._run_collect_blocking(
+        store,
+        _FakeClient(),  # type: ignore[arg-type]
+        None,
+        lambda: calls.append(1),
+    )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(GoettaFinanceError("archive unwritable"), id="goetta-error"),
+        pytest.param(OSError("cloud folder offline"), id="os-error"),
+    ],
+)
+def test_a_failing_backup_does_not_fail_the_sync(
+    store: DuckDBStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: Exception,
+) -> None:
+    """The rows are already committed; a missing copy of them is not a
+    reason to surface the sync as failed, and a cloud-synced destination
+    can be offline or locked at any moment."""
+    import logging
+    from datetime import UTC, datetime
+
+    from goetta_finance import daemon as daemon_module
+    from goetta_finance.models import SyncRun
+
+    def fake_collect(s: object, c: object) -> SyncRun:
+        now = datetime.now(tz=UTC)
+        return SyncRun(started_at=now, finished_at=now)
+
+    def boom() -> None:
+        raise failure
+
+    monkeypatch.setattr(daemon_module, "collect_under_lock", fake_collect)
+    with caplog.at_level(logging.ERROR, logger="goetta_finance.daemon"):
+        daemon_module._run_collect_blocking(
+            store,
+            _FakeClient(),  # type: ignore[arg-type]
+            None,
+            boom,
+        )
+    assert any("backup after scheduled sync" in r.getMessage() for r in caplog.records)
