@@ -300,17 +300,21 @@ _SEQUENCE_OWNERS: dict[str, tuple[str, str]] = {
 
 
 # Tables restore reconciles row-by-row instead of clear-then-insert.
-# Not a preference — ``clear_restorable_tables`` documents the DuckDB
-# catalog defect that makes DELETE on ``categories`` impossible. Keep
-# this set as small as the defect requires.
+#
+# Migration 0016 repaired the catalog defect that made DELETE on
+# ``categories`` impossible, so a current database could be cleared like
+# any other table — but restore cannot rely on that. It migrates the
+# target to the *archive's* stamp before loading, so restoring an archive
+# taken at 0015 or earlier lands in a database that still carries the
+# defect. Keep this set as small as that constraint requires; it can be
+# emptied once archives predating 0016 are no longer supported.
 _RECONCILED_TABLES = frozenset({"categories"})
 
 # Columns of a reconciled table that cannot be written after the fact.
-# ``categories.name`` is UNIQUE, and any statement that makes DuckDB
-# validate a constraint on ``categories`` dereferences the dangling
-# ``transaction_overrides_new`` record and fails. Plain INSERT and
-# UPDATEs that touch no constrained column are unaffected — which is why
-# ``set_category_spending`` still works in production.
+# ``categories.name`` is UNIQUE, so on a pre-0016 target any UPDATE of it
+# dereferences the dangling ``transaction_overrides_new`` record. Plain
+# INSERT and UPDATEs touching no constrained column are unaffected, which
+# is why ``set_category_spending`` worked throughout.
 _UNWRITABLE_RECONCILED_COLUMNS = frozenset({"id", "name"})
 
 
@@ -564,18 +568,16 @@ class DuckDBStore:
         archive is the authority on what the user's rows are, including
         which ones are absent.
 
-        ``categories`` is the one table this cannot empty, and the
-        reason is a DuckDB catalog defect rather than a design choice.
-        Migration 0011 rebuilt ``transaction_overrides`` through a
-        ``transaction_overrides_new`` staging table and renamed it; the
-        rename left ``categories`` holding a foreign-key dependency
-        record that still names the staging table. Every delete against
-        ``categories`` now dereferences it and fails with "Catalog
+        ``categories`` is the one table this skips. Migration 0011's
+        create-copy-drop-RENAME rebuild left ``categories`` holding a
+        foreign-key dependency record naming a staging table that no
+        longer existed, and every delete against it failed with "Catalog
         Error: Table with name transaction_overrides_new does not
-        exist!" — DELETE of one row, DELETE of all rows, and TRUNCATE
-        alike, and closing and reopening the database does not clear it
-        (the record is persisted). ``restore_table`` therefore upserts
-        that table by id instead; see ``_RECONCILED_TABLES``.
+        exist!". Migration 0016 repairs that — but restore migrates the
+        target to the *archive's* stamp before loading, so an archive
+        taken at 0015 or earlier still lands in an unrepaired database.
+        ``restore_table`` reconciles that table row-by-row instead; see
+        ``_RECONCILED_TABLES``.
 
         Returns the tables it actually emptied, so callers can report
         the exception rather than imply a clean sweep.
