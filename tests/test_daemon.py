@@ -23,6 +23,12 @@ from goetta_finance.daemon import build_daemon_app
 from goetta_finance.errors import GoettaFinanceError
 from goetta_finance.store.duckdb_store import DuckDBStore
 
+# TestClient defaults to Host "testserver", which the Host-header allowlist
+# (the DNS-rebinding defense, see web/app.py) correctly rejects. Drive the
+# tests through a loopback base_url so they exercise the real default
+# posture rather than a version of the app with the check disabled.
+LOOPBACK = "http://127.0.0.1:8765"
+
 
 class _FakeClient:
     def __init__(self) -> None:
@@ -480,7 +486,7 @@ def test_http_fatal_error_returns_500_and_triggers_shutdown(tmp_path: Path) -> N
         mcp_enabled=False,
         request_shutdown=lambda: calls.append(True),
     )
-    with TestClient(app, raise_server_exceptions=False) as client:
+    with TestClient(app, raise_server_exceptions=False, base_url=LOOPBACK) as client:
         response = client.get("/health")
     assert response.status_code == 500
     assert response.json() == {"error": "database invalidated; daemon is restarting"}

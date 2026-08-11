@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import (
     AbstractAsyncContextManager,
     AsyncExitStack,
@@ -42,7 +42,7 @@ from goetta_finance.store import FinanceStore
 # backend-agnostic.
 from goetta_finance.store.duckdb_store import is_database_invalidated
 from goetta_finance.transfers import apply_transfer_links
-from goetta_finance.web.app import build_app
+from goetta_finance.web.app import build_app, trusted_hosts_for
 
 logger = logging.getLogger(__name__)
 
@@ -299,6 +299,7 @@ def build_daemon_app(
     stop_poll_seconds: float = 2.0,
     dash_dir: Path | None = None,
     backup_hook: Callable[[], None] | None = None,
+    allowed_hosts: Sequence[str] | None = None,
 ) -> FastAPI:
     """Construct the daemon's FastAPI app without binding a port.
 
@@ -307,6 +308,9 @@ def build_daemon_app(
     ``stop_file`` + ``request_shutdown`` arm the graceful-shutdown watch:
     when the file appears, ``request_shutdown()`` is called (in
     ``run_daemon`` it flips uvicorn's ``should_exit``).
+
+    ``allowed_hosts`` is the ``Host``-header allowlist; ``run_daemon``
+    derives it from the bind address. Defaults to loopback names.
     """
     parse_sync_at(sync_at)  # validate early
     mcp = build_server(store, client=client) if mcp_enabled else None
@@ -325,7 +329,13 @@ def build_daemon_app(
         stop_poll_seconds=stop_poll_seconds,
         backup_hook=backup_hook,
     )
-    app = build_app(store, mcp_server=mcp, lifespan=lifespan, dash_dir=dash_dir)
+    app = build_app(
+        store,
+        mcp_server=mcp,
+        lifespan=lifespan,
+        dash_dir=dash_dir,
+        allowed_hosts=allowed_hosts,
+    )
     if request_shutdown is not None:
         _register_fatal_error_handler(app, request_shutdown)
     return app
@@ -403,6 +413,9 @@ def run_daemon(
         request_shutdown=request_shutdown,
         dash_dir=dash_dir,
         backup_hook=backup_hook,
+        # Derived from the bind address rather than hard-coded: a
+        # deliberate --host stays reachable, a forged Host does not.
+        allowed_hosts=trusted_hosts_for(host),
     )
     logger.info(
         "goetta-finance daemon: http://%s:%d  mcp=%s  schedule=%s @ %s  stop_file=%s",

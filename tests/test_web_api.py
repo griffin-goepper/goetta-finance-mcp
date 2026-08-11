@@ -33,7 +33,13 @@ from goetta_finance.web.aggregations import (
     monthly_income_spending,
     monthly_spending_by_category,
 )
-from goetta_finance.web.app import build_app
+from goetta_finance.web.app import _hostname, build_app, trusted_hosts_for
+
+# TestClient defaults to Host "testserver", which the Host-header allowlist
+# (the DNS-rebinding defense, see web/app.py) correctly rejects. Drive the
+# tests through a loopback base_url so they exercise the real default
+# posture rather than a version of the app with the check disabled.
+LOOPBACK = "http://127.0.0.1:8765"
 
 runner = CliRunner()
 
@@ -150,7 +156,7 @@ def _seed(store: DuckDBStore) -> None:
 @pytest.fixture
 def client(store: DuckDBStore) -> Iterator[TestClient]:
     _seed(store)
-    with TestClient(build_app(store)) as c:
+    with TestClient(build_app(store), base_url=LOOPBACK) as c:
         yield c
 
 
@@ -160,7 +166,7 @@ def test_api_routes_win_over_mcp_mount(store: DuckDBStore) -> None:
     _seed(store)
     mcp = build_server(store)
     app = build_app(store, mcp_server=mcp)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=LOOPBACK) as c:
         resp = c.get("/api/v1/accounts")
     assert resp.status_code == 200
     assert "accounts" in resp.json()
@@ -492,12 +498,12 @@ def test_dash_mount_serves_index_html(store: DuckDBStore, tmp_path: Path) -> Non
     dash = tmp_path / "dist"
     dash.mkdir()
     (dash / "index.html").write_text("<!doctype html><title>companion</title>", encoding="utf-8")
-    with TestClient(build_app(store, dash_dir=dash)) as c:
+    with TestClient(build_app(store, dash_dir=dash), base_url=LOOPBACK) as c:
         resp = c.get("/dash/")
         assert resp.status_code == 200
         assert "companion" in resp.text
         # No dash_dir -> no mount.
-    with TestClient(build_app(store)) as c:
+    with TestClient(build_app(store), base_url=LOOPBACK) as c:
         assert c.get("/dash/").status_code == 404
 
 
@@ -511,3 +517,99 @@ def test_cli_rejects_bad_dash_dir(tmp_path: Path) -> None:
     result = runner.invoke(cli_app, ["web", "--dash-dir", str(empty)])
     assert result.exit_code == 1
     assert "index.html" in result.output
+
+
+# --- Host-header allowlist / DNS rebinding (audit 2026-08, finding 2) ------
+#
+# Binding to loopback is not a defense against DNS rebinding — it is the
+# target of it. A page the user visits re-points its own domain at
+# 127.0.0.1, and from then on the browser treats the daemon as same-origin,
+# so CORS never applies. The Host header is what still carries the
+# attacker's domain, which is why it gets pinned.
+
+
+def test_forged_host_header_is_rejected_on_every_hand_rolled_surface(
+    store: DuckDBStore, tmp_path: Path
+) -> None:
+    """The pre-fix bug: /api/v1/* and the dashboard served full 200s to a
+    forged Host while /api/mcp (FastMCP's own check) returned 421."""
+    _seed(store)
+    dash = tmp_path / "dist"
+    dash.mkdir()
+    (dash / "index.html").write_text("<!doctype html><title>c</title>", encoding="utf-8")
+    with TestClient(
+        build_app(store, dash_dir=dash), base_url="http://evil.attacker.example:8765"
+    ) as c:
+        for path in (
+            "/api/v1/summary",
+            "/api/v1/accounts",
+            "/api/v1/transactions",
+            "/api/v1/goals",
+            "/",
+            "/transactions",
+            "/static/htmx.min.js",
+            "/dash/",
+        ):
+            resp = c.get(path)
+            assert resp.status_code == 421, f"{path} answered a forged Host with {resp.status_code}"
+            assert "Invalid Host header" in resp.text
+
+
+def test_loopback_hosts_are_accepted(store: DuckDBStore) -> None:
+    _seed(store)
+    app = build_app(store)
+    for base in ("http://127.0.0.1:8765", "http://localhost:8765"):
+        with TestClient(app, base_url=base) as c:
+            assert c.get("/api/v1/summary").status_code == 200, base
+    # IPv6 goes through an explicit header rather than base_url: starlette's
+    # TestClient transport splits the netloc on ":" the same way its
+    # TrustedHostMiddleware does, so an IPv6 base_url raises before the
+    # request is ever built. The middleware itself handles it (see
+    # test_hostname_parses_ipv6_literals).
+    with TestClient(app, base_url=LOOPBACK) as c:
+        resp = c.get("/api/v1/summary", headers={"Host": "[::1]:8765"})
+        assert resp.status_code == 200
+
+
+def test_allowed_hosts_admits_a_deliberate_non_loopback_bind(store: DuckDBStore) -> None:
+    """--host 100.85.1.2 (Tailscale) must keep working; a forged Host on
+    that same app must not."""
+    _seed(store)
+    app = build_app(store, allowed_hosts=trusted_hosts_for("100.85.1.2"))
+    with TestClient(app, base_url="http://100.85.1.2:8765") as c:
+        assert c.get("/api/v1/summary").status_code == 200
+    with TestClient(app, base_url="http://evil.attacker.example:8765") as c:
+        assert c.get("/api/v1/summary").status_code == 421
+    # Loopback still reaches it — the user's own browser on the host.
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        assert c.get("/api/v1/summary").status_code == 200
+
+
+def test_trusted_hosts_for_maps_bind_address_to_allowlist() -> None:
+    assert trusted_hosts_for("127.0.0.1") == ("127.0.0.1", "localhost", "::1")
+    assert trusted_hosts_for("localhost") == ("127.0.0.1", "localhost", "::1")
+    assert trusted_hosts_for("100.85.1.2") == ("127.0.0.1", "localhost", "::1", "100.85.1.2")
+    # A wildcard bind cannot enumerate the names that reach it, so the
+    # allowlist switches off and the CLI warns instead.
+    assert trusted_hosts_for("0.0.0.0") == ("*",)  # noqa: S104
+    assert trusted_hosts_for("::") == ("*",)
+
+
+def test_wildcard_allowlist_disables_the_check(store: DuckDBStore) -> None:
+    _seed(store)
+    with TestClient(
+        build_app(store, allowed_hosts=("*",)), base_url="http://anything.example:8765"
+    ) as c:
+        assert c.get("/api/v1/summary").status_code == 200
+
+
+def test_hostname_parses_ipv6_literals() -> None:
+    """The reason this is not starlette's TrustedHostMiddleware: it does
+    host.split(":")[0], which yields "[" for an IPv6 literal, so a
+    --host ::1 bind could never be allowlisted."""
+    assert _hostname("[::1]:8765") == "::1"
+    assert _hostname("[::1]") == "::1"
+    assert _hostname("127.0.0.1:8765") == "127.0.0.1"
+    assert _hostname("LocalHost") == "localhost"
+    assert _hostname("") == ""
+    assert _hostname("[malformed") == ""
