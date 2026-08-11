@@ -2191,9 +2191,11 @@ class DuckDBStore:
         Defense in depth:
 
         1. **Pre-flight whitelist (fast fail).** Strip comments, reject
-           anything that isn't a single statement starting with SELECT/WITH/
-           EXPLAIN/SHOW/DESCRIBE. Cheaper than a DuckDB round-trip and gives
-           a friendlier error than DuckDB's parser errors.
+           anything that isn't a single statement starting with
+           SELECT/WITH/SHOW/DESCRIBE/DESC (``_READ_ONLY_PREFIXES``).
+           Cheaper than a DuckDB round-trip and gives a friendlier error
+           than DuckDB's parser errors. ``EXPLAIN`` is deliberately NOT on
+           the list — see below.
         2. **Read-only transaction (the actual control).** Wrap execution in
            ``BEGIN TRANSACTION READ ONLY``. DuckDB's storage layer refuses
            writes inside it — including ones smuggled through ``WITH cte AS
@@ -2206,8 +2208,20 @@ class DuckDBStore:
         grounds that the transaction is sufficient: the friendly error is
         part of the UX for sql_query. Do not remove the read-only
         transaction on the grounds that the whitelist is sufficient: the
-        whitelist is permissive for ``WITH`` and ``EXPLAIN``, which are
-        legitimate analytical prefixes that can wrap mutating statements.
+        whitelist is permissive for ``WITH``, a legitimate analytical
+        prefix that can wrap a mutating statement.
+
+        **Do not add ``explain`` to the whitelist.** ``EXPLAIN ANALYZE``
+        executes its inner statement, and
+        ``EXPLAIN ANALYZE COPY (SELECT 1) TO '/tmp/leak.csv'`` writes the
+        *filesystem* rather than the database — so the read-only
+        transaction does not refuse it. Excluding the prefix is one of the
+        two layers that stop it (``enable_external_access=false`` is the
+        other). Pinned by
+        ``test_query_sql_rejects_explain_analyze_copy_to_file``; see
+        CLAUDE.md and ``docs/SECURITY_AUDIT_2026-08.md`` finding 7, which
+        is what this paragraph replaced — the previous wording claimed
+        ``EXPLAIN`` *was* whitelisted and invited exactly that change.
         """
         cleaned = _strip_comments(sql)
         statements = [s for s in _STMT_SEP.split(cleaned) if s.strip()]
