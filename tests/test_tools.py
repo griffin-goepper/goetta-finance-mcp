@@ -101,6 +101,38 @@ def test_get_transactions_filters_and_search(store: DuckDBStore) -> None:
     assert {t["id"] for t in payee_match} == {"t1"}
 
 
+def test_get_transactions_search_reaches_past_the_limit_window(store: DuckDBStore) -> None:
+    """Regression: search is a store filter, not a post-query one.
+
+    When it ran in Python after the fetch, ``limit`` bounded the raw feed
+    — so this old match was invisible behind 20 newer unrelated rows.
+    """
+    _seed(store)
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="old-match",
+                account_id="a1",
+                posted=datetime(2019, 5, 13, tzinfo=UTC),
+                amount=Decimal("-31.02"),
+                description="SPEEDWAY 04321",
+            ),
+            *[
+                Transaction(
+                    id=f"noise-{i}",
+                    account_id="a1",
+                    posted=datetime(2026, 6, 1, tzinfo=UTC) + timedelta(days=i),
+                    amount=Decimal("-5.00"),
+                    description="KROGER #123",
+                )
+                for i in range(20)
+            ],
+        ]
+    )
+    hits = get_transactions(store, search="speedway", limit=5)
+    assert [t["id"] for t in hits] == ["old-match"]
+
+
 def test_get_transactions_amount_is_string(store: DuckDBStore) -> None:
     _seed(store)
     txn = get_transactions(store, account_id="a1", limit=1)[0]

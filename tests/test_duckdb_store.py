@@ -559,6 +559,57 @@ def test_get_transactions_with_category_filters_hidden_by_default(
     assert {r["id"] for r in rows} == {"t-vis"}
 
 
+def test_get_transactions_with_category_search_matches_description_and_payee(
+    store: DuckDBStore,
+) -> None:
+    """Case-insensitive substring over description OR payee; a NULL payee
+    is a miss, not an error."""
+    store.upsert_accounts([_account(id="acc-1")])
+    store.upsert_transactions(
+        [
+            _txn("t-desc", "SPEEDWAY 04321", account_id="acc-1"),
+            Transaction(
+                id="t-payee",
+                account_id="acc-1",
+                posted=_utc(2026, 5, 10),
+                amount=Decimal("-31.02"),
+                description="POS PURCHASE",
+                payee="Speedway",
+            ),
+            _txn("t-miss", "KROGER #123", account_id="acc-1"),
+        ]
+    )
+    rows = store.get_transactions_with_category(search="speedway")
+    assert {r["id"] for r in rows} == {"t-desc", "t-payee"}
+
+
+def test_get_transactions_with_category_search_is_not_capped_by_limit(
+    store: DuckDBStore,
+) -> None:
+    """Regression: ``limit`` must bound the MATCHES, not the raw feed.
+
+    The search filter used to run in Python after the query, so it only
+    ever saw the newest ``limit`` rows — an old merchant silently
+    disappeared from search results while its rows sat in the DB.
+    """
+    store.upsert_accounts([_account(id="acc-1")])
+    store.upsert_transactions(
+        [
+            _txn("t-old-match", "SPEEDWAY 04321", account_id="acc-1", posted=_utc(2019, 5, 13)),
+            *[
+                _txn(f"t-noise-{i}", "KROGER #123", account_id="acc-1", posted=_utc(2026, 6, i))
+                for i in range(1, 21)
+            ],
+        ]
+    )
+    rows = store.get_transactions_with_category(search="speedway", limit=5)
+    assert [r["id"] for r in rows] == ["t-old-match"]
+
+    # …and the limit still caps a search that has more matches than it.
+    capped = store.get_transactions_with_category(search="kroger", limit=5)
+    assert len(capped) == 5
+
+
 # --- Regression: whitelist-bypassing payloads must still be refused. ---
 #
 # Scenario: a transaction memo or payee field carries injected SQL. Claude
