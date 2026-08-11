@@ -79,3 +79,54 @@ def test_daemon_without_config_exits_with_hint(
     result = runner.invoke(app, ["daemon"])
     assert result.exit_code == 1
     assert "init" in result.output.lower()
+
+
+# --- backup configure -------------------------------------------------
+
+
+def test_backup_configure_shows_settings_without_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOETTA_FINANCE_HOME", str(tmp_path))
+    result = runner.invoke(app, ["backup", "configure"])
+    assert result.exit_code == 0, result.output
+    assert "enabled:      True" in result.output
+    assert str(tmp_path / "backups") in result.output
+    assert not (tmp_path / "config.json").exists()  # read-only run wrote nothing
+
+
+def test_backup_configure_persists_the_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from goetta_finance.config import load_config
+
+    monkeypatch.setenv("GOETTA_FINANCE_HOME", str(tmp_path))
+    cloud = tmp_path / "OneDrive" / "goetta-backups"
+    cloud.mkdir(parents=True)
+    result = runner.invoke(app, ["backup", "configure", "--dir", str(cloud), "--keep-daily", "30"])
+    assert result.exit_code == 0, result.output
+
+    config = load_config()
+    assert config.backup.directory == str(cloud.resolve())
+    assert config.backup.keep_daily == 30
+    assert config.backup.enabled is True
+
+
+def test_backup_configure_can_disable_scheduled_backups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from goetta_finance.config import load_config
+
+    monkeypatch.setenv("GOETTA_FINANCE_HOME", str(tmp_path))
+    result = runner.invoke(app, ["backup", "configure", "--disable"])
+    assert result.exit_code == 0, result.output
+    assert load_config().backup.enabled is False
+    assert "after each successful sync" not in result.output
+
+
+def test_backup_configure_rejects_a_negative_retention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOETTA_FINANCE_HOME", str(tmp_path))
+    result = runner.invoke(app, ["backup", "configure", "--keep-daily", "-1"])
+    assert result.exit_code != 0

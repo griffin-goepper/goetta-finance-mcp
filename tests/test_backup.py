@@ -12,6 +12,7 @@ from goetta_finance.backup import (
     BackupInfo,
     create_backup,
     list_backups,
+    maybe_create_daily_backup,
     read_manifest,
     restore_backup,
     select_for_retention,
@@ -623,3 +624,35 @@ def _rewrite_member(
     with zipfile.ZipFile(target, "w") as dst:
         for name, raw in members.items():
             dst.writestr(name, raw)
+
+
+# --- the daemon's once-a-day guard ------------------------------------
+
+
+def test_daily_backup_skips_when_today_already_has_one(seeded: DuckDBStore, tmp_path: Path) -> None:
+    """The daemon calls this after every successful sync. Without the
+    guard, a day of catch-up syncs writes a day of near-identical
+    archives and pushes genuinely older ones out of retention."""
+    dest = tmp_path / "backups"
+    morning = datetime(2026, 8, 11, 6, 0, tzinfo=UTC)
+    first = maybe_create_daily_backup(seeded, dest, now=morning)
+    assert first is not None
+
+    later = maybe_create_daily_backup(seeded, dest, now=morning + timedelta(hours=9))
+    assert later is None
+    assert len(list_backups(dest)) == 1
+
+
+def test_daily_backup_runs_again_the_next_day(seeded: DuckDBStore, tmp_path: Path) -> None:
+    dest = tmp_path / "backups"
+    maybe_create_daily_backup(seeded, dest, now=datetime(2026, 8, 11, 23, 0, tzinfo=UTC))
+    second = maybe_create_daily_backup(seeded, dest, now=datetime(2026, 8, 12, 1, 0, tzinfo=UTC))
+    assert second is not None
+    assert len(list_backups(dest)) == 2
+
+
+def test_daily_backup_writes_the_first_one_into_an_empty_directory(
+    seeded: DuckDBStore, tmp_path: Path
+) -> None:
+    result = maybe_create_daily_backup(seeded, tmp_path / "never-used")
+    assert result is not None and result.verified

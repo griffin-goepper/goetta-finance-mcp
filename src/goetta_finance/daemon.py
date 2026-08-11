@@ -75,6 +75,7 @@ def _run_collect_blocking(
     store: FinanceStore,
     client: SimpleFinClient,
     on_fatal: Callable[[], None] | None = None,
+    backup_hook: Callable[[], None] | None = None,
 ) -> None:
     """Worker-thread entry. Eats exceptions so the scheduler keeps running —
     except a fatal store error, which triggers ``on_fatal``: once DuckDB
@@ -107,6 +108,21 @@ def _run_collect_blocking(
                 logger.warning("goal breach: %s", line)
         except GoettaFinanceError:
             logger.exception("goal evaluation after scheduled sync failed")
+        # Backup last, on fresh data. Like the two steps above it, a
+        # failure here must not make a successful sync look failed —
+        # the rows are already safely committed; what's missing is a
+        # copy of them, which the next sync will retry.
+        if backup_hook is not None:
+            try:
+                backup_hook()
+            except GoettaFinanceError:
+                logger.exception("backup after scheduled sync failed")
+            except OSError:
+                # The destination is often a cloud-synced folder: it can
+                # be offline, full, or transiently locked by the sync
+                # client. None of that is a reason to take the daemon
+                # down.
+                logger.exception("backup after scheduled sync could not write its archive")
     except Exception as exc:
         logger.exception("scheduled sync raised")
         if on_fatal is not None and is_database_invalidated(exc):
@@ -122,6 +138,7 @@ async def _scheduler_loop(
     client: SimpleFinClient,
     sync_at: str,
     on_fatal: Callable[[], None] | None = None,
+    backup_hook: Callable[[], None] | None = None,
 ) -> None:
     """Run a sync at ``sync_at`` local time every day.
 
@@ -142,7 +159,7 @@ async def _scheduler_loop(
                 last_tick.isoformat(timespec="minutes"),
                 last.isoformat(timespec="minutes") if last else "never",
             )
-            await asyncio.to_thread(_run_collect_blocking, store, client, on_fatal)
+            await asyncio.to_thread(_run_collect_blocking, store, client, on_fatal, backup_hook)
             now = datetime.now().astimezone()
         next_tick = _next_tick(now, hour, minute)
         sleep_seconds = max(0.0, (next_tick - now).total_seconds())
@@ -153,7 +170,7 @@ async def _scheduler_loop(
         )
         await asyncio.sleep(sleep_seconds)
         logger.info("scheduler: running scheduled sync")
-        await asyncio.to_thread(_run_collect_blocking, store, client, on_fatal)
+        await asyncio.to_thread(_run_collect_blocking, store, client, on_fatal, backup_hook)
 
 
 async def _stop_file_watch_loop(
@@ -205,6 +222,7 @@ def _build_lifespan(
     stop_file: Path | None = None,
     request_shutdown: Callable[[], None] | None = None,
     stop_poll_seconds: float = 2.0,
+    backup_hook: Callable[[], None] | None = None,
 ) -> Callable[[FastAPI], AbstractAsyncContextManager[Any]]:
     """Build a FastAPI lifespan that owns the scheduler task AND the MCP
     session manager.
@@ -239,7 +257,13 @@ def _build_lifespan(
                         # hatch: an invalidated database is unrecoverable
                         # in-process, so the sync loop asks for the same
                         # graceful exit the stop file would.
-                        _scheduler_loop(store, client, sync_at, on_fatal=request_shutdown),
+                        _scheduler_loop(
+                            store,
+                            client,
+                            sync_at,
+                            on_fatal=request_shutdown,
+                            backup_hook=backup_hook,
+                        ),
                         name="goetta-finance-scheduler",
                     )
                 )
@@ -274,6 +298,7 @@ def build_daemon_app(
     request_shutdown: Callable[[], None] | None = None,
     stop_poll_seconds: float = 2.0,
     dash_dir: Path | None = None,
+    backup_hook: Callable[[], None] | None = None,
 ) -> FastAPI:
     """Construct the daemon's FastAPI app without binding a port.
 
@@ -298,6 +323,7 @@ def build_daemon_app(
         stop_file=stop_file,
         request_shutdown=request_shutdown,
         stop_poll_seconds=stop_poll_seconds,
+        backup_hook=backup_hook,
     )
     app = build_app(store, mcp_server=mcp, lifespan=lifespan, dash_dir=dash_dir)
     if request_shutdown is not None:
@@ -348,6 +374,7 @@ def run_daemon(
     mcp_enabled: bool = True,
     stop_file: Path | None = None,
     dash_dir: Path | None = None,
+    backup_hook: Callable[[], None] | None = None,
 ) -> None:
     """Run the goetta-finance daemon: dashboard + MCP HTTP + scheduler.
 
@@ -375,6 +402,7 @@ def run_daemon(
         stop_file=stop_file,
         request_shutdown=request_shutdown,
         dash_dir=dash_dir,
+        backup_hook=backup_hook,
     )
     logger.info(
         "goetta-finance daemon: http://%s:%d  mcp=%s  schedule=%s @ %s  stop_file=%s",
