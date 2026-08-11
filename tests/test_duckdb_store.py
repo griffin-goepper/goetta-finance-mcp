@@ -2589,3 +2589,104 @@ def test_same_id_settlement_flips_pending_and_preserves_row(store: DuckDBStore) 
     assert row["pending"] is False
     assert row["posted"] == _utc(2026, 5, 14)
     assert row["category"] == "Dining"
+
+
+# --- migration 0016: repair the categories catalog dependency ---------
+
+
+def test_migration_0016_applied(store: DuckDBStore) -> None:
+    rows = store.conn.execute("SELECT name FROM schema_migrations").fetchall()
+    assert ("0016_repair_categories_catalog.sql",) in rows
+    # The stand-in table exists only inside the migration.
+    assert (
+        store.conn.execute(
+            "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'transaction_overrides_new'"
+        ).fetchone()[0]
+        == 0
+    )
+
+
+def test_migration_0016_pins_the_defect_it_repairs(tmp_path: Path) -> None:
+    """Prove the bug exists at 0015 and is gone at 0016.
+
+    0011 rebuilt transaction_overrides via a staging table and renamed it,
+    leaving categories holding a foreign-key dependency naming a table
+    that no longer exists. Every constraint validation on categories then
+    dereferenced it — including for a category nothing references.
+    """
+    store = DuckDBStore(tmp_path / "defect.duckdb")
+    try:
+        _apply_migrations_through(store, "0015_recurring_contributions.sql")
+        store.add_category("Unreferenced")
+        target = store.conn.execute(
+            "SELECT id FROM categories WHERE name = 'Unreferenced'"
+        ).fetchone()[0]
+
+        with pytest.raises(duckdb.CatalogException, match="transaction_overrides_new"):
+            store.conn.execute("DELETE FROM categories WHERE id = ?", [target])
+
+        store.init()  # applies exactly 0016
+
+        store.conn.execute("DELETE FROM categories WHERE id = ?", [target])
+        assert (
+            store.conn.execute("SELECT count(*) FROM categories WHERE id = ?", [target]).fetchone()[
+                0
+            ]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+def test_migration_0016_lets_an_unreferenced_category_be_renamed(store: DuckDBStore) -> None:
+    """UPDATE of the UNIQUE `name` column was blocked by the same defect."""
+    category = store.add_category("Rename me")
+    store.conn.execute("UPDATE categories SET name = 'Renamed' WHERE id = ?", [category.id])
+    assert (
+        store.conn.execute("SELECT name FROM categories WHERE id = ?", [category.id]).fetchone()[0]
+        == "Renamed"
+    )
+
+
+def test_migration_0016_preserves_override_rows_and_keeps_the_fk(tmp_path: Path) -> None:
+    """The repair touches catalog metadata, not rows — and must not
+    weaken the referential integrity 0011's FK provides."""
+    store = DuckDBStore(tmp_path / "preserve.duckdb")
+    try:
+        _apply_migrations_through(store, "0015_recurring_contributions.sql")
+        store.upsert_accounts([_account(id="acc-1")])
+        store.upsert_transactions([_transaction("t-1")])
+        store.add_category("Kept")
+        store.set_transaction_override("t-1", "Kept")
+        before = store.conn.execute(
+            "SELECT transaction_id, category_id FROM transaction_overrides"
+        ).fetchall()
+
+        store.init()  # applies 0016
+
+        assert (
+            store.conn.execute(
+                "SELECT transaction_id, category_id FROM transaction_overrides"
+            ).fetchall()
+            == before
+        )
+        # FK to categories still enforced after the repair.
+        with pytest.raises(duckdb.ConstraintException):
+            store.conn.execute(
+                "INSERT INTO transaction_overrides (transaction_id, category_id) "
+                "VALUES ('t-orphan', 999999)"
+            )
+    finally:
+        store.close()
+
+
+def test_a_referenced_category_still_cannot_be_deleted(store: DuckDBStore) -> None:
+    """0016 restores normal foreign-key semantics; it does not remove
+    them. A category a rule points at is still protected — that is
+    DuckDB's real FK rule, not the catalog defect, and any future
+    `category delete` command needs its own reference guard."""
+    category = store.add_category("Has a rule")
+    store.add_rule("Has a rule", match_type="contains", pattern="ZZZ")
+    with pytest.raises(duckdb.ConstraintException) as excinfo:
+        store.conn.execute("DELETE FROM categories WHERE id = ?", [category.id])
+    assert "transaction_overrides_new" not in str(excinfo.value)

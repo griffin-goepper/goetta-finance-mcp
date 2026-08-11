@@ -282,11 +282,16 @@ def test_restore_replays_newer_migrations_on_top_of_an_older_archive(
 
     target = tmp_path / "restored.duckdb"
     restored_result = restore_backup(result.path, target)
-    assert restored_result.migrations_applied_after == 1
 
     store = DuckDBStore(target)
     try:
-        assert "0015_recurring_contributions.sql" in store.applied_migrations()
+        applied = store.applied_migrations()
+        # Counted, not hardcoded: every migration newer than the archive's
+        # stamp must have run, however many exist by the time this is read.
+        later = [name for name in applied if name > "0014_contribution_goals.sql"]
+        assert restored_result.migrations_applied_after == len(later)
+        assert later, "expected at least one migration newer than the archive's stamp"
+        assert "0015_recurring_contributions.sql" in applied
         # The column 0015 adds exists, and the older row survived.
         assert store.conn.execute("SELECT recurring_amount FROM goals").fetchall() == []
         assert store.conn.execute("SELECT count(*) FROM accounts").fetchone()[0] == 1
