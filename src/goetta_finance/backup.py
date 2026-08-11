@@ -399,6 +399,30 @@ def create_backup(
     )
 
 
+def maybe_create_daily_backup(
+    store: DuckDBStore,
+    directory: Path,
+    *,
+    now: datetime | None = None,
+    **kwargs: Any,
+) -> BackupResult | None:
+    """``create_backup``, unless today already has one. Returns ``None``
+    when it skipped.
+
+    The daemon calls this after every successful sync rather than on its
+    own clock, so archives track actual data change. The once-a-day
+    guard is what keeps a day of catch-up syncs from writing a day of
+    near-identical archives and pushing older ones out of the retention
+    window. Dates are UTC, matching the archive filenames.
+    """
+    moment = (now or datetime.now(UTC)).astimezone(UTC)
+    existing = list_backups(directory)
+    if existing and existing[0].created_at.date() >= moment.date():
+        logger.debug("backup skipped: %s already covers today", existing[0].path.name)
+        return None
+    return create_backup(store, directory, now=moment, **kwargs)
+
+
 # --- read / verify / restore -----------------------------------------
 
 

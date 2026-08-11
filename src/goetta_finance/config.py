@@ -8,7 +8,7 @@ import re
 import stat
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from goetta_finance.errors import ConfigError
 
@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 CONFIG_FILE = "config.json"
 DB_FILE = "data.duckdb"
 PREFIXES_FILE = "prefixes.txt"
+BACKUPS_DIR = "backups"
 HOME_ENV = "GOETTA_FINANCE_HOME"
 XDG_ENV = "XDG_DATA_HOME"
 
@@ -65,6 +66,29 @@ AplPay\\s+(SP|DK)?\\s*
 """
 
 
+class BackupConfig(BaseModel):
+    """Scheduled-backup settings, read by the daemon after each sync.
+
+    ``directory`` is where archives land. Leave it unset for
+    ``$GOETTA_FINANCE_HOME/backups``; point it at a folder your cloud
+    client already syncs to get offsite copies without goetta-finance
+    making any network call of its own.
+
+    ``include_credentials`` defaults to False because an archive bound
+    for cloud storage should not carry the SimpleFIN access URL — it is
+    a live credential for the bank feed, and re-claiming a setup token
+    is cheap.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    directory: str | None = None
+    keep_daily: int = 14
+    keep_monthly: int = 12
+    include_credentials: bool = False
+
+
 class Config(BaseModel):
     """User configuration. The access_url is sensitive — never log it."""
 
@@ -73,6 +97,7 @@ class Config(BaseModel):
     access_url: str | None = None
     backend: str = "duckdb"
     db_filename: str = DB_FILE
+    backup: BackupConfig = Field(default_factory=BackupConfig)
 
 
 def home_dir() -> Path:
@@ -98,6 +123,13 @@ def db_path(config: Config | None = None) -> Path:
 
 def prefixes_path() -> Path:
     return home_dir() / PREFIXES_FILE
+
+
+def backup_dir(config: Config | None = None) -> Path:
+    """Where backup archives are written."""
+    if config is not None and config.backup.directory:
+        return Path(config.backup.directory).expanduser()
+    return home_dir() / BACKUPS_DIR
 
 
 def write_default_prefixes_file(*, overwrite: bool = False) -> Path:

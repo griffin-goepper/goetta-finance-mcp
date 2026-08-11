@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 
 from goetta_finance.config import (
+    BackupConfig,
     Config,
+    backup_dir,
     config_path,
     db_path,
     home_dir,
@@ -150,3 +152,55 @@ def test_write_default_prefixes_file_is_idempotent(
     path.write_text("MY CUSTOM PREFIX\\s*\n", encoding="utf-8")
     write_default_prefixes_file()
     assert path.read_text(encoding="utf-8") == "MY CUSTOM PREFIX\\s*\n"
+
+
+# --- backup settings --------------------------------------------------
+
+
+def test_backup_settings_default_without_being_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Config files written before backups existed must keep loading —
+    the nested block fills itself in."""
+    monkeypatch.setenv("GOETTA_FINANCE_HOME", str(tmp_path))
+    config_path().write_text('{"access_url": "https://example/x"}', encoding="utf-8")
+    config = load_config()
+    assert config.backup.enabled is True
+    assert config.backup.directory is None
+    assert config.backup.include_credentials is False
+    assert backup_dir(config) == tmp_path / "backups"
+
+
+def test_backup_directory_overrides_the_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOETTA_FINANCE_HOME", str(tmp_path))
+    cloud = tmp_path / "OneDrive" / "goetta-backups"
+    config = Config(backup=BackupConfig(directory=str(cloud)))
+    assert backup_dir(config) == cloud
+
+
+def test_backup_settings_survive_a_save_load_round_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOETTA_FINANCE_HOME", str(tmp_path))
+    save_config(
+        Config(
+            access_url="https://example/x",
+            backup=BackupConfig(enabled=False, directory=str(tmp_path / "cloud"), keep_daily=30),
+        )
+    )
+    loaded = load_config()
+    assert loaded.backup.enabled is False
+    assert loaded.backup.directory == str(tmp_path / "cloud")
+    assert loaded.backup.keep_daily == 30
+    assert loaded.backup.keep_monthly == 12  # untouched default
+
+
+def test_unknown_backup_key_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """extra='forbid' on the nested model too — a typo'd key must not be
+    silently ignored, leaving the user thinking they configured it."""
+    monkeypatch.setenv("GOETTA_FINANCE_HOME", str(tmp_path))
+    config_path().write_text('{"backup": {"keep_dailies": 3}}', encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_config()
