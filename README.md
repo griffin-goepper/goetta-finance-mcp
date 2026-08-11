@@ -77,6 +77,7 @@ Re-running `init` is safe — each step detects existing state and offers to ski
 | `goetta-finance transaction categorize\|uncategorize` | Manual per-transaction category overrides. See "Transaction categorization" below. |
 | `goetta-finance goal add-spending\|add-balance\|add-contribution\|list\|remove` | Spending caps, balance targets, and contribution goals, evaluated at read time. See "Goals" below. |
 | `goetta-finance import transactions\|balances` | Import historical data from normalized CSVs (e.g. parsed bank statements). See "Importing historical data" below. |
+| `goetta-finance backup now\|list\|verify\|restore` | Write, inspect, and restore verified backup archives. See "Backups" below. |
 
 ## Importing historical data
 
@@ -525,12 +526,62 @@ Default paths (XDG-compliant on Linux/macOS, follows the same layout on Windows)
 ```
 ~/.local/share/goetta-finance/
 ├── config.json          # mode 0600 on POSIX; contains your SimpleFIN access URL
-└── data.duckdb          # the database
+├── data.duckdb          # the database
+├── prefixes.txt         # description-prefix strip list (see CUSTOMIZATION.md)
+└── backups/             # default destination for `backup now`
 ```
 
 Override the location with `GOETTA_FINANCE_HOME=/some/other/dir` or `$XDG_DATA_HOME`.
 
 The SimpleFIN access URL is sensitive — it grants read access to your bank data. The default `chmod 0600` keeps it owner-only on Linux/macOS; on Windows, file ACLs apply.
+
+## Backups
+
+```bash
+goetta-finance backup now --dest ~/OneDrive/goetta-backups
+goetta-finance backup list --dest ~/OneDrive/goetta-backups
+goetta-finance backup verify ~/OneDrive/goetta-backups/goetta-backup-20260811T132403Z.zip
+goetta-finance backup restore ~/OneDrive/goetta-backups/goetta-backup-20260811T132403Z.zip
+```
+
+`backup now` writes a single self-contained `.zip`: your rows as JSON Lines, a
+manifest (versions, schema-migration stamp, row counts, a sha256 per file), and
+`prefixes.txt`. It defaults to `$GOETTA_FINANCE_HOME/backups`, keeps the last 14
+archives plus one per month for a year, and prunes the rest. Archives compress
+well — a few years of transactions is typically a fraction of the DuckDB file.
+
+**Every archive is verified before it counts.** The zip is staged under a
+temporary name, restored into a throwaway database, checked against its own
+manifest (checksums, row counts, and the sum of every transaction amount), and
+only then moved into place. An archive that fails any of those never appears in
+the directory — so a cloud-sync client watching the folder can never upload a
+partial or unrestorable file.
+
+**Getting it off the machine is your sync client's job, not goetta-finance's.**
+Point `--dest` at a folder OneDrive/Dropbox/Drive already syncs. Uploading
+directly would mean network calls beyond SimpleFIN and cloud credentials to
+store, which this project doesn't do.
+
+**Your SimpleFIN access URL is not included.** `config.json` travels with
+`access_url` stripped, because an archive bound for cloud storage should not
+carry a live credential to your bank feed. Re-claim a setup token and re-run
+`init` after a restore. `--include-credentials` opts in if you're backing up
+somewhere you trust with it.
+
+Why a logical dump instead of a copy of `data.duckdb`: while the daemon is
+running — exactly when an automated backup has to work — DuckDB's exclusive
+lock denies every other read handle on the file, so it cannot be copied, and the
+store's connection has `enable_external_access=false`, which blocks
+`EXPORT DATABASE` and `COPY ... TO`. Rows therefore come out through the open
+connection and are written by Python. That artifact is also more durable: JSON
+Lines is readable without DuckDB and survives the binary corruption modes this
+project has actually hit.
+
+`backup restore` never overwrites in place — it moves the existing database to
+`data.duckdb.pre-restore-<timestamp>` and builds a fresh one. It replays
+migrations to the archive's stamp, loads the rows, then applies any newer
+migrations on top, so an archive from an older version still restores into a
+current install. Stop the daemon first (via `daemon.stop`).
 
 ## Privacy and security
 
@@ -549,6 +600,8 @@ The SimpleFIN access URL is sensitive — it grants read access to your bank dat
 - **Pending transactions are a snapshot, not history.** They're stored and counted (see "Pending transactions" above), but ids are bank-unstable: per-transaction category overrides on pending rows may not survive settlement, and a long-lived hold can temporarily vanish between syncs.
 - **No cross-currency arithmetic.** Each account row displays its own currency, and aggregate labels (net worth, chart axes) derive from your accounts — a GBP-only install shows GBP, mixed-currency installs show "mixed". But cross-account totals still sum raw numbers without FX conversion, so a mixed-currency net worth is not meaningful. Manual accounts default to USD; pass `--currency EUR` to `account add` to override.
 - **Categorization is flat and rule-based.** No hierarchy, no transaction splits, no LLM auto-categorization, no transfer dedup (transfers between your own accounts show up in both balances). The default rules are USA-merchant biased; you'll add your own — see "Transaction categorization" above.
+- **Backups are manual for now.** `backup now` has to be run (or scheduled by you); the daemon does not yet take one after each sync. It also cannot run while the daemon holds the database lock — it will tell you so and exit.
+- **Seeded categories cannot be removed by a restore.** Migration 0011 rebuilt `transaction_overrides` through a staging table, and the rename left `categories` holding a foreign-key dependency record naming a table that no longer exists. Any statement that makes DuckDB validate a constraint on `categories` — `DELETE`, `TRUNCATE`, an upsert, or an `UPDATE` touching the UNIQUE `name` — now fails with `Catalog Error: Table with name transaction_overrides_new does not exist!`. Restore works within that limit (it inserts missing categories and updates the unconstrained columns) and reports anything it could not write. No user-facing surface deletes or renames a category today, so this is currently unreachable in practice; it needs a schema-repair migration to fix properly.
 - **No inline category editing in the dashboard.** Recategorize via the `goetta-finance transaction categorize` CLI; the transactions page surfaces the exact command in each badge's tooltip.
 
 ## Development

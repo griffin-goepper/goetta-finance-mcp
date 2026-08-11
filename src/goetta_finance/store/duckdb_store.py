@@ -7,6 +7,7 @@ import os
 import re
 import threading
 from collections.abc import Collection, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from importlib.resources import files
@@ -238,6 +239,94 @@ def is_database_invalidated(exc: BaseException) -> bool:
     return isinstance(exc, duckdb.FatalException)
 
 
+# --- Logical backup/restore inventory ---------------------------------
+#
+# A backup is a logical dump (rows out through the open connection,
+# written by Python) rather than a file copy, because neither is
+# available while the daemon runs: DuckDB's exclusive lock denies even a
+# read handle on the file, and this store's connection sets
+# ``enable_external_access=false``, which blocks EXPORT DATABASE,
+# COPY ... TO, and ATTACH. Those two facts are what make the dump the
+# only automatable shape. See ``backup.py``.
+#
+# ``RESTORE_ORDER`` is FK-safe: every table lands after the tables it
+# references (transactions/balance_snapshots/transfer_links after
+# accounts; category_rules/transaction_overrides/goals after
+# categories). ``snapshot_tables`` refuses to run when the database
+# holds a table missing from these sets, so a future migration that adds
+# one fails loudly here instead of silently omitting it from every
+# backup thereafter — same structural posture as
+# ``_USER_OWNED_COLUMNS``.
+RESTORE_ORDER: tuple[str, ...] = (
+    "accounts",
+    "transactions",
+    "balance_snapshots",
+    "sync_runs",
+    "categories",
+    "category_rules",
+    "transaction_overrides",
+    "goals",
+    "transfer_links",
+    "transfer_link_applications",
+)
+
+# Rebuilt from the restored rows, never dumped: it holds one row per
+# categorized transaction, so dumping it would roughly double the
+# archive to carry bookkeeping that
+# ``rebuild_category_match_cache`` recomputes in one statement.
+_DERIVED_TABLES = frozenset({"category_match_cache"})
+
+# Written by the migration runner itself; travels in the manifest as the
+# schema stamp rather than as dumped rows.
+_METADATA_TABLES = frozenset({"schema_migrations"})
+
+# sequence name -> (table, id column) it hands out values for.
+#
+# DuckDB cannot reposition a sequence that a column DEFAULT depends on:
+# CREATE OR REPLACE SEQUENCE and DROP SEQUENCE both raise
+# DependencyException, and ALTER SEQUENCE ... RESTART is unimplemented
+# (verified on 1.5.4). So ``advance_sequence`` burns it forward with
+# nextval() instead. Without that, a restored database hands out id 1
+# while the restored rows already occupy that id and everything above
+# it, so the first new rule/category/goal after a restore dies on the
+# primary key.
+_SEQUENCE_OWNERS: dict[str, tuple[str, str]] = {
+    "sync_runs_id_seq": ("sync_runs", "id"),
+    "categories_id_seq": ("categories", "id"),
+    "category_rules_id_seq": ("category_rules", "id"),
+    "goals_id_seq": ("goals", "id"),
+    "transfer_links_id_seq": ("transfer_links", "id"),
+}
+
+
+# Tables restore reconciles row-by-row instead of clear-then-insert.
+# Not a preference — ``clear_restorable_tables`` documents the DuckDB
+# catalog defect that makes DELETE on ``categories`` impossible. Keep
+# this set as small as the defect requires.
+_RECONCILED_TABLES = frozenset({"categories"})
+
+# Columns of a reconciled table that cannot be written after the fact.
+# ``categories.name`` is UNIQUE, and any statement that makes DuckDB
+# validate a constraint on ``categories`` dereferences the dangling
+# ``transaction_overrides_new`` record and fails. Plain INSERT and
+# UPDATEs that touch no constrained column are unaffected — which is why
+# ``set_category_spending`` still works in production.
+_UNWRITABLE_RECONCILED_COLUMNS = frozenset({"id", "name"})
+
+
+@dataclass(frozen=True)
+class TableSnapshot:
+    """One table's rows plus the column names and DuckDB types needed to
+    put them back. ``types`` carries the declared type per column (e.g.
+    ``DECIMAL(18,2)``) so the restore side can rebuild Decimals and
+    datetimes exactly rather than guessing from the JSON value shape."""
+
+    name: str
+    columns: tuple[str, ...]
+    types: tuple[str, ...]
+    rows: tuple[tuple[Any, ...], ...]
+
+
 class DuckDBStore:
     """DuckDB-backed FinanceStore.
 
@@ -317,7 +406,20 @@ class DuckDBStore:
                     logger.warning("store close skipped: database already invalidated")
                 self._conn = None
 
-    def init(self) -> None:
+    def init(self, *, up_to: str | None = None) -> None:
+        """Apply pending migrations.
+
+        ``up_to`` stops after the named migration file (inclusive),
+        which is what restore uses: rows dumped under an older schema
+        load into that same older schema, and the remaining migrations
+        then run normally on top. That ordering matters because
+        migrations transform data as well as shape — 0006 flips
+        ``is_spending`` on two categories, 0007 demotes seeded rules,
+        0014 rewrites goals — and loading old rows straight into the
+        current schema would skip every one of those transformations.
+        Comparison is lexicographic, which is total and correct for the
+        zero-padded ``000N_name.sql`` convention.
+        """
         if self.read_only:
             # Read-only stores can't apply migrations. Callers (e.g. the web
             # dashboard) are expected to require a pre-migrated DB.
@@ -339,6 +441,8 @@ class DuckDBStore:
             for name in sql_files:
                 if name in applied:
                     continue
+                if up_to is not None and name > up_to:
+                    break
                 sql_text = migrations_dir.joinpath(name).read_text()
                 try:
                     self.conn.execute("BEGIN")
@@ -355,8 +459,11 @@ class DuckDBStore:
                 # default rules), so a full rebuild after applying is the
                 # blanket safety net. No-migration opens skip it — the
                 # cache persists on disk and the write paths keep it
-                # current.
-                self.rebuild_category_match_cache()
+                # current. Guarded on the table existing because ``up_to``
+                # can legitimately stop short of 0013, which is what
+                # creates it.
+                if self._table_exists("category_match_cache"):
+                    self.rebuild_category_match_cache()
                 # Flush freshly applied DDL out of the WAL immediately.
                 # DuckDB's WAL replay chokes on CREATE OR REPLACE VIEW
                 # entries ("GetDefaultDatabase with no default database
@@ -367,6 +474,274 @@ class DuckDBStore:
                 # here closes that window — migration DDL never outlives
                 # init() in the WAL.
                 self.conn.execute("CHECKPOINT")
+
+    # --- Logical backup / restore ---------------------------------
+    #
+    # These live on DuckDBStore rather than the FinanceStore Protocol on
+    # purpose: sequences, declared column types and the migration stamp
+    # are backend shape, not storage-interface shape, and a future
+    # sqlite/jsonl backend would express its own dump differently. Same
+    # deliberate coupling as ``is_database_invalidated`` in daemon.py.
+
+    def applied_migrations(self) -> list[str]:
+        """Migration filenames recorded in this database, sorted."""
+        with self._lock:
+            rows = self.conn.execute("SELECT name FROM schema_migrations ORDER BY name").fetchall()
+        return [str(row[0]) for row in rows]
+
+    def snapshot_tables(self) -> list[TableSnapshot]:
+        """Read every user table as one point-in-time snapshot.
+
+        The whole dump runs inside a single ``BEGIN TRANSACTION READ
+        ONLY`` under the store lock, so the tables agree with each other
+        — a sync landing mid-dump cannot produce an archive whose
+        transactions reference an account that isn't in it.
+
+        Raises ``StoreError`` if the database holds a table that is in
+        neither ``RESTORE_ORDER`` nor the derived/metadata sets: a new
+        migration must classify its table deliberately, because the
+        failure mode of guessing is a backup that silently omits it.
+        """
+        with self._lock:
+            present = {
+                str(row[0])
+                for row in self.conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()
+            }
+            known = set(RESTORE_ORDER) | _DERIVED_TABLES | _METADATA_TABLES
+            if unclassified := sorted(present - known):
+                raise StoreError(
+                    f"Tables not classified for backup: {', '.join(unclassified)}. "
+                    "Add each to RESTORE_ORDER (in FK order), _DERIVED_TABLES, "
+                    "or _METADATA_TABLES in duckdb_store.py."
+                )
+            snapshots: list[TableSnapshot] = []
+            self.conn.execute("BEGIN TRANSACTION READ ONLY")
+            try:
+                for table in RESTORE_ORDER:
+                    if table not in present:
+                        # Older database, restored from an older backup and
+                        # not yet migrated forward. Nothing to dump.
+                        continue
+                    # ruff S608 / bandit B608: ``table`` is not user input —
+                    # it comes from RESTORE_ORDER, a module-level literal
+                    # tuple, and is additionally intersected with the
+                    # table names DuckDB itself reports. No caller can
+                    # reach this with an arbitrary string.
+                    described = self.conn.execute(f"DESCRIBE {table}").fetchall()
+                    columns = tuple(str(row[0]) for row in described)
+                    types = tuple(str(row[1]) for row in described)
+                    rows = self.conn.execute(f"SELECT * FROM {table}").fetchall()  # noqa: S608
+                    snapshots.append(
+                        TableSnapshot(
+                            name=table,
+                            columns=columns,
+                            types=types,
+                            rows=tuple(rows),
+                        )
+                    )
+                self.conn.execute("COMMIT")
+            except duckdb.Error as exc:
+                self.conn.execute("ROLLBACK")
+                raise StoreError(f"Snapshot failed: {exc}") from exc
+        return snapshots
+
+    def sequence_positions(self) -> dict[str, int | None]:
+        """Last value handed out per sequence (``None`` if never used)."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT sequence_name, last_value FROM duckdb_sequences()"
+            ).fetchall()
+        return {str(row[0]): (int(row[1]) if row[1] is not None else None) for row in rows}
+
+    def clear_restorable_tables(self) -> list[str]:
+        """Empty every dumpable table, in reverse foreign-key order.
+
+        Restore runs this between migrating and loading because
+        migrations *seed* rows — 0004 alone inserts the default
+        categories and rule set. Without the clear, a restore collides
+        on those primary keys; worse, if it did not collide, a user who
+        had deleted a seeded rule would silently get it back. The
+        archive is the authority on what the user's rows are, including
+        which ones are absent.
+
+        ``categories`` is the one table this cannot empty, and the
+        reason is a DuckDB catalog defect rather than a design choice.
+        Migration 0011 rebuilt ``transaction_overrides`` through a
+        ``transaction_overrides_new`` staging table and renamed it; the
+        rename left ``categories`` holding a foreign-key dependency
+        record that still names the staging table. Every delete against
+        ``categories`` now dereferences it and fails with "Catalog
+        Error: Table with name transaction_overrides_new does not
+        exist!" — DELETE of one row, DELETE of all rows, and TRUNCATE
+        alike, and closing and reopening the database does not clear it
+        (the record is persisted). ``restore_table`` therefore upserts
+        that table by id instead; see ``_RECONCILED_TABLES``.
+
+        Returns the tables it actually emptied, so callers can report
+        the exception rather than imply a clean sweep.
+        """
+        emptied: list[str] = []
+        with self._lock:
+            self.conn.execute("BEGIN")
+            try:
+                # The derived cache goes first: it carries a foreign key
+                # onto categories, so clearing it later would be blocked
+                # by its own reference.
+                self.conn.execute("DELETE FROM category_match_cache")
+                for table in reversed(RESTORE_ORDER):
+                    if table in _RECONCILED_TABLES:
+                        continue
+                    self.conn.execute(f"DELETE FROM {table}")  # noqa: S608
+                    emptied.append(table)
+                self.conn.execute("COMMIT")
+            except duckdb.Error as exc:
+                self.conn.execute("ROLLBACK")
+                raise StoreError(f"Clearing tables before restore failed: {exc}") from exc
+        return emptied
+
+    def reconcile_table(self, snapshot: TableSnapshot) -> list[int]:
+        """Bring a seeded table in line with a snapshot, insert-first.
+
+        Restores what the catalog defect allows: rows the archive has and
+        the table lacks are INSERTed; rows that exist but differ get an
+        UPDATE of every column outside
+        ``_UNWRITABLE_RECONCILED_COLUMNS``. Returns the ids whose
+        remaining difference could not be written — today only a renamed
+        seeded category, which no surface can produce, but reported
+        rather than silently dropped.
+        """
+        id_index = snapshot.columns.index("id")
+        writable = [
+            (index, column)
+            for index, column in enumerate(snapshot.columns)
+            if column not in _UNWRITABLE_RECONCILED_COLUMNS
+        ]
+        columns = ", ".join(f'"{c}"' for c in snapshot.columns)
+        placeholders = ", ".join("?" for _ in snapshot.columns)
+        assignments = ", ".join(f'"{c}" = ?' for _index, c in writable)
+        unwritable: list[int] = []
+        with self._lock:
+            existing = {
+                row[0]: row[1:]
+                for row in self.conn.execute(
+                    f"SELECT {columns} FROM {snapshot.name}"  # noqa: S608
+                ).fetchall()
+            }
+            try:
+                for row in snapshot.rows:
+                    row_id = row[id_index]
+                    if row_id not in existing:
+                        self.conn.execute(
+                            f"INSERT INTO {snapshot.name} ({columns}) "  # noqa: S608
+                            f"VALUES ({placeholders})",
+                            list(row),
+                        )
+                        continue
+                    if existing[row_id] == row[1:]:
+                        continue
+                    self.conn.execute(
+                        f"UPDATE {snapshot.name} SET {assignments} WHERE id = ?",  # noqa: S608
+                        [row[index] for index, _column in writable] + [row_id],
+                    )
+                    if any(
+                        row[index] != existing[row_id][index - 1]
+                        for index, column in enumerate(snapshot.columns)
+                        if column in _UNWRITABLE_RECONCILED_COLUMNS and index != id_index
+                    ):
+                        unwritable.append(int(row_id))
+            except duckdb.Error as exc:
+                raise StoreError(f"Reconciling {snapshot.name} failed: {exc}") from exc
+        return unwritable
+
+    def unrestored_category_ids(self, keep_ids: Collection[int]) -> list[int]:
+        """Category ids present in this database but absent from a
+        restore's archive — rows ``clear_restorable_tables`` could not
+        remove. Empty in practice today (no surface deletes a category),
+        but reported rather than hidden."""
+        with self._lock:
+            rows = self.conn.execute("SELECT id FROM categories").fetchall()
+        keep = set(keep_ids)
+        return sorted(int(row[0]) for row in rows if int(row[0]) not in keep)
+
+    def _table_exists(self, name: str) -> bool:
+        with self._lock:
+            found = self.conn.execute(
+                "SELECT 1 FROM duckdb_tables() WHERE table_name = ?", [name]
+            ).fetchone()
+        return found is not None
+
+    def restore_table(self, snapshot: TableSnapshot) -> int:
+        """Insert a snapshot's rows into the matching (empty) table.
+
+        Columns are named explicitly rather than relying on positional
+        order, so a column added by a later migration takes its DEFAULT
+        instead of shifting every value one place left.
+
+        Tables in ``_RECONCILED_TABLES`` go through ``reconcile_table``
+        instead, because the migration seed is still sitting in them —
+        see ``clear_restorable_tables``.
+        """
+        if snapshot.name in _RECONCILED_TABLES:
+            self.reconcile_table(snapshot)
+            return len(snapshot.rows)
+        if not snapshot.rows:
+            return 0
+        columns = ", ".join(f'"{c}"' for c in snapshot.columns)
+        placeholders = ", ".join("?" for _ in snapshot.columns)
+        with self._lock:
+            try:
+                self.conn.executemany(
+                    f"INSERT INTO {snapshot.name} ({columns}) VALUES ({placeholders})",  # noqa: S608
+                    [list(row) for row in snapshot.rows],
+                )
+            except duckdb.Error as exc:
+                raise StoreError(f"Restoring {snapshot.name} failed: {exc}") from exc
+        return len(snapshot.rows)
+
+    def align_sequences(self, recorded: dict[str, int | None]) -> dict[str, int]:
+        """Position every sequence past the ids its table already holds.
+
+        Takes the max of the backed-up position and the highest id
+        actually restored, so a manifest that predates the last few
+        inserts still cannot hand out a colliding id. Sequences whose
+        table was not restored are left alone.
+        """
+        aligned: dict[str, int] = {}
+        with self._lock:
+            for name, (table, column) in _SEQUENCE_OWNERS.items():
+                row = self.conn.execute(
+                    f"SELECT max({column}) FROM {table}"  # noqa: S608
+                ).fetchone()
+                observed = int(row[0]) if row is not None and row[0] is not None else 0
+                target = max(int(recorded.get(name) or 0), observed)
+                if target > 0:
+                    self.advance_sequence(name, target)
+                    aligned[name] = target
+        return aligned
+
+    def advance_sequence(self, name: str, target: int) -> None:
+        """Burn ``name`` forward until its next value exceeds ``target``.
+
+        The only way to reposition a DuckDB sequence that a column
+        DEFAULT depends on — see ``_SEQUENCE_OWNERS``. Consuming N
+        values costs one statement, not N.
+        """
+        with self._lock:
+            current = self.conn.execute(
+                "SELECT last_value FROM duckdb_sequences() WHERE sequence_name = ?", [name]
+            ).fetchone()
+            if current is None:
+                raise StoreError(f"No such sequence: {name}")
+            position = int(current[0]) if current[0] is not None else 0
+            if position >= target:
+                return
+            # ruff S608 / bandit B608: ``name`` was just matched against
+            # duckdb_sequences() above (an unknown name raises), and the
+            # range bound is arithmetic on two ints. Neither is caller
+            # text. nextval() cannot be bound as a parameter.
+            self.conn.execute(
+                f"SELECT nextval('{name}') FROM range({target - position})"  # noqa: S608
+            )
 
     def rebuild_category_match_cache(self) -> None:
         """Recompute ``category_match_cache`` for every transaction.

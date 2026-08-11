@@ -14,12 +14,20 @@ from typing import Annotated
 import typer
 
 from goetta_finance import __version__
+from goetta_finance.backup import (
+    create_backup,
+    list_backups,
+    read_manifest,
+    restore_backup,
+    verify_backup,
+)
 from goetta_finance.collector import collect
 from goetta_finance.config import (
     config_path,
     db_path,
     home_dir,
     load_config,
+    prefixes_path,
     save_config,
     write_default_prefixes_file,
 )
@@ -1984,6 +1992,204 @@ def goal_remove(
         raise typer.Exit(code=1) from exc
     finally:
         store.close()
+
+
+backup_app = typer.Typer(
+    help="Create, inspect, and restore local backups of your finance data.",
+    no_args_is_help=True,
+)
+app.add_typer(backup_app, name="backup")
+
+
+def _default_backup_dir() -> Path:
+    return home_dir() / "backups"
+
+
+def _open_store_for_backup(target_db: Path) -> DuckDBStore:
+    """Open the live database read-only, failing fast if it is locked.
+
+    A backup only reads, so it takes the read-only handle — but DuckDB's
+    lock is exclusive on Windows regardless, so a running daemon still
+    blocks this. Say so plainly instead of surfacing a raw DuckDB error.
+    """
+    if not target_db.exists():
+        typer.secho(
+            f"No DuckDB store at {target_db}. Run `goetta-finance init` first.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    import duckdb
+
+    store = DuckDBStore(target_db, read_only=True)
+    try:
+        _ = store.conn  # force-open so a locked DB fails fast
+    except duckdb.Error as exc:
+        store.close()
+        typer.secho(f"Cannot open {target_db}: {exc}", fg=typer.colors.RED, err=True)
+        typer.secho(
+            "A goetta-finance daemon (or serve/web) holds the DB lock. Stop it "
+            "first: create a file named `daemon.stop` next to data.duckdb and "
+            "wait a few seconds. Never force-kill it.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+    return store
+
+
+@backup_app.command("now")
+def backup_now(
+    dest: Annotated[
+        Path | None,
+        typer.Option("--dest", help="Directory to write the archive into."),
+    ] = None,
+    include_credentials: Annotated[
+        bool,
+        typer.Option(
+            "--include-credentials",
+            help="Include the SimpleFIN access URL. It is a live bank-feed "
+            "credential; leave this off for anything bound for cloud storage.",
+        ),
+    ] = False,
+    keep_daily: Annotated[
+        int, typer.Option("--keep-daily", help="Most recent archives to keep.")
+    ] = 14,
+    keep_monthly: Annotated[
+        int, typer.Option("--keep-monthly", help="Months to keep one archive from.")
+    ] = 12,
+    skip_verify: Annotated[
+        bool,
+        typer.Option("--skip-verify", help="Do not test-restore the archive after writing it."),
+    ] = False,
+) -> None:
+    """Write a verified backup archive and prune expired ones."""
+    try:
+        config = load_config()
+        directory = dest or _default_backup_dir()
+        store = _open_store_for_backup(db_path(config))
+        try:
+            result = create_backup(
+                store,
+                directory,
+                config_file=config_path(),
+                prefixes_file=prefixes_path(),
+                include_credentials=include_credentials,
+                verify=not skip_verify,
+                keep_daily=keep_daily,
+                keep_monthly=keep_monthly,
+            )
+        finally:
+            store.close()
+    except GoettaFinanceError as exc:
+        typer.secho(f"Backup failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.secho(f"Wrote {result.path}", fg=typer.colors.GREEN)
+    typer.echo(f"  {result.total_rows} rows across {len(result.table_rows)} tables")
+    typer.echo(f"  {result.size_bytes / 1024:.1f} KiB")
+    if result.verified:
+        typer.echo("  verified by test-restore")
+    else:
+        typer.secho("  NOT verified (--skip-verify)", fg=typer.colors.YELLOW)
+    if not include_credentials:
+        typer.echo("  access_url redacted from config.json")
+    for path in result.pruned:
+        typer.echo(f"  pruned {path.name}")
+
+
+@backup_app.command("list")
+def backup_list(
+    dest: Annotated[
+        Path | None, typer.Option("--dest", help="Directory to list archives from.")
+    ] = None,
+) -> None:
+    """List backup archives, newest first."""
+    directory = dest or _default_backup_dir()
+    found = list_backups(directory)
+    if not found:
+        typer.echo(f"No backups in {directory}")
+        return
+    typer.echo(f"{len(found)} backup(s) in {directory}:")
+    for info in found:
+        typer.echo(
+            f"  {info.path.name}  {info.created_at:%Y-%m-%d %H:%M UTC}  "
+            f"{info.size_bytes / 1024:.1f} KiB"
+        )
+
+
+@backup_app.command("verify")
+def backup_verify(
+    archive: Annotated[Path, typer.Argument(help="Archive to test-restore.")],
+) -> None:
+    """Test-restore an archive into a throwaway database and check it."""
+    try:
+        tables = verify_backup(archive)
+    except GoettaFinanceError as exc:
+        typer.secho(f"{exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    typer.secho(f"{archive.name} restores cleanly.", fg=typer.colors.GREEN)
+    for table, rows in sorted(tables.items()):
+        typer.echo(f"  {table}: {rows} rows")
+
+
+@backup_app.command("restore")
+def backup_restore(
+    archive: Annotated[Path, typer.Argument(help="Archive to restore from.")],
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
+) -> None:
+    """Rebuild the database from an archive.
+
+    The current database is moved aside, never deleted.
+    """
+    try:
+        config = load_config()
+        target_db = db_path(config)
+        manifest = read_manifest(archive)
+        rows = sum(int(meta["rows"]) for meta in manifest.get("tables", {}).values())
+
+        typer.echo(f"Restoring {archive.name}")
+        typer.echo(f"  taken:  {manifest.get('created_at', 'unknown')}")
+        typer.echo(f"  rows:   {rows}")
+        typer.echo(f"  target: {target_db}")
+
+        moved: Path | None = None
+        if target_db.exists():
+            # Prove the file is not locked before moving anything: a
+            # half-done restore against a running daemon would be worse
+            # than a refused one.
+            _open_store_for_backup(target_db).close()
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            moved = target_db.with_name(f"{target_db.name}.pre-restore-{stamp}")
+            typer.secho(f"  existing database will be moved to {moved.name}", bold=True)
+
+        if not yes and not typer.confirm("Proceed?", default=False):
+            typer.echo("Aborted.")
+            raise typer.Exit(code=1)
+
+        if moved is not None:
+            target_db.rename(moved)
+            wal = target_db.with_name(f"{target_db.name}.wal")
+            if wal.exists():
+                wal.rename(moved.with_name(f"{moved.name}.wal"))
+
+        result = restore_backup(archive, target_db)
+    except GoettaFinanceError as exc:
+        typer.secho(f"Restore failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.secho(f"Restored {sum(result.table_rows.values())} rows.", fg=typer.colors.GREEN)
+    typer.echo(f"  migrations replayed to the archive's stamp: {result.migrations_replayed}")
+    if result.migrations_applied_after:
+        typer.echo(
+            f"  newer migrations applied on top:            {result.migrations_applied_after}"
+        )
+    if moved is not None:
+        typer.echo(f"  previous database kept at {moved.name}")
+    typer.secho(
+        "Re-run `goetta-finance init` to restore your SimpleFIN credentials.",
+        fg=typer.colors.YELLOW,
+    )
 
 
 import_app = typer.Typer(
