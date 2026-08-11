@@ -1,7 +1,7 @@
 {% if rows %}
   {% for r in rows %}
-    <tr>
-      <td>{{ r.posted }}</td>
+    <tr{% if r.pending %} class="pending-row"{% endif %}>
+      <td>{{ r.posted }}{% if r.pending %} <span class="badge badge-pending">pending</span>{% endif %}</td>
       <td>{{ r.account_id }}</td>
       <td>{{ r.description }}</td>
       <td>{{ r.payee or "" }}</td>

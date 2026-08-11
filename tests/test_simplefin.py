@@ -19,6 +19,7 @@ from goetta_finance.simplefin import (
     SimpleFinClient,
     parse_accounts,
     parse_transactions,
+    transaction_bearing_account_ids,
 )
 
 
@@ -39,13 +40,71 @@ def test_parse_accounts_maps_fields(demo_response: dict) -> None:
     assert vg.extra == {"yield": 0.0312}
 
 
-def test_parse_transactions_drops_pending(demo_response: dict) -> None:
+def test_parse_transactions_keeps_pending(demo_response: dict) -> None:
     txns = parse_transactions(demo_response)
-    ids = {t.id for t in txns}
-    assert "TX-3-PENDING" not in ids
-    assert ids == {"TX-1", "TX-2", "TX-VG-1"}
-    for t in txns:
-        assert t.pending is False
+    by_id = {t.id: t for t in txns}
+    assert set(by_id) == {"TX-1", "TX-2", "TX-3-PENDING", "TX-4-PENDING-UNPOSTED", "TX-VG-1"}
+    assert by_id["TX-3-PENDING"].pending is True
+    assert by_id["TX-4-PENDING-UNPOSTED"].pending is True
+    for settled_id in ("TX-1", "TX-2", "TX-VG-1"):
+        assert by_id[settled_id].pending is False
+
+
+def test_parse_pending_posted_zero_falls_back_to_transacted_at(demo_response: dict) -> None:
+    """Pending rows may carry posted=0 with only the transaction time set;
+    the parser dates them by transacted_at so posted (NOT NULL in the
+    schema) stays intact until settlement supplies the real value."""
+    txns = parse_transactions(demo_response)
+    hold = next(t for t in txns if t.id == "TX-4-PENDING-UNPOSTED")
+    assert hold.posted == datetime.fromtimestamp(1747926000, tz=UTC)
+    assert hold.transacted_at == datetime.fromtimestamp(1747926000, tz=UTC)
+
+
+def test_parse_pending_with_no_dates_is_skipped() -> None:
+    raw = {
+        "accounts": [
+            {
+                "id": "ACT-X",
+                "transactions": [
+                    {"id": "TX-DATELESS", "amount": "-1.00", "pending": True},
+                ],
+            }
+        ]
+    }
+    assert parse_transactions(raw) == []
+
+
+def test_parse_posted_transaction_still_requires_posted() -> None:
+    """The date fallback is pending-only, deliberately: a settled row
+    without a posted timestamp is malformed feed data and should crash
+    loudly, not get silently dated by transaction time."""
+    raw = {
+        "accounts": [
+            {
+                "id": "ACT-X",
+                "transactions": [
+                    {"id": "TX-NO-POSTED", "amount": "-1.00", "pending": False},
+                ],
+            }
+        ]
+    }
+    with pytest.raises(KeyError):
+        parse_transactions(raw)
+
+
+def test_transaction_bearing_account_ids_requires_a_list(demo_response: dict) -> None:
+    """Accounts whose entry has a missing/null transactions field didn't
+    report transactions this sync — they must be excluded from pending
+    reconciliation or an institution hiccup would wipe their holds."""
+    assert transaction_bearing_account_ids(demo_response) == {"ACT-CHK-1", "ACT-VG-1"}
+    raw = {
+        "accounts": [
+            {"id": "ACT-OK", "transactions": []},
+            {"id": "ACT-NULL", "transactions": None},
+            {"id": "ACT-ABSENT"},
+        ]
+    }
+    assert transaction_bearing_account_ids(raw) == {"ACT-OK"}
 
 
 def test_parse_transactions_amounts_are_decimal(demo_response: dict) -> None:
@@ -107,7 +166,7 @@ def test_fetch_includes_basic_auth_and_dates() -> None:
     sent = route.calls.last.request
     assert sent.url.params["start-date"] == str(int(start.timestamp()))
     assert sent.url.params["end-date"] == str(int(end.timestamp()))
-    assert sent.url.params["pending"] == "0"
+    assert sent.url.params["pending"] == "1"
     auth_header = sent.headers["authorization"]
     expected = base64.b64encode(b"user:pass").decode("ascii")
     assert auth_header == f"Basic {expected}"

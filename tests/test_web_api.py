@@ -260,6 +260,51 @@ def test_api_goals_matches_list_goals_tool(client: TestClient, store: DuckDBStor
     assert body["goals"] == list_goals(store)
 
 
+def test_api_goals_pending_delta_field(client: TestClient, store: DuckDBStore) -> None:
+    """Balance goals carry pending_delta as a decimal string — the
+    preview of still-pending linked transfers; null when the account has
+    no links, and always null on spending caps."""
+    store.upsert_accounts(
+        [
+            Account(
+                id="acc-fund",
+                name="Vacation Fund",
+                balance=Decimal("1000.00"),
+                balance_date=NOW - timedelta(days=30),  # link anchors here
+                type=AccountType.SAVINGS,
+                is_manual=True,
+            )
+        ]
+    )
+    store.add_transfer_link(
+        "acc-fund", "acc-checking", match_type="contains", pattern="Vacation Fund"
+    )
+    store.upsert_transactions(
+        [
+            Transaction(
+                id="tx-fund-pending",
+                account_id="acc-checking",
+                posted=IN_MONTH,
+                amount=Decimal("-800.00"),
+                description="Web Authorized Pmt Vacation Fund",
+                payee="Vacation Fund",
+                pending=True,
+            )
+        ]
+    )
+    store.add_goal(
+        "fund-goal",
+        kind="balance",
+        amount=Decimal("5000.00"),
+        account_id="acc-fund",
+        direction="at_least",
+    )
+    goals = {g["name"]: g for g in client.get("/api/v1/goals").json()["goals"]}
+    assert goals["fund-goal"]["pending_delta"] == "800.00"
+    assert goals["card-paydown"]["pending_delta"] is None
+    assert goals["dining-cap"]["pending_delta"] is None
+
+
 def test_spending_cap_history_current_period_matches_progress(store: DuckDBStore) -> None:
     """Cent pin: newest history bucket == the goal card's ``current``,
     including the pending transaction."""

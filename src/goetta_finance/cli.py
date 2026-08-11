@@ -1606,8 +1606,16 @@ def transaction_categorize(
         typer.secho(f"transaction categorize failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
     try:
-        store.set_transaction_override(transaction_id, category_name)
+        was_pending = store.set_transaction_override(transaction_id, category_name)
         typer.echo(f"Categorized {transaction_id} as {category_name}.")
+        if was_pending:
+            typer.secho(
+                "Note: this transaction is still pending — if the bank issues "
+                "a new id when it settles, this override will not carry over. "
+                "A category rule (category set-rule) is durable across "
+                "settlement.",
+                fg=typer.colors.YELLOW,
+            )
     except GoettaFinanceError as exc:
         suffix = _suggest_category(store, category_name) if _is_category_not_found(exc) else ""
         typer.secho(

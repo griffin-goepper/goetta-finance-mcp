@@ -89,23 +89,47 @@ def parse_transactions(raw: dict[str, Any]) -> list[Transaction]:
     for a in raw.get("accounts", []):
         account_id = a["id"]
         for tx in a.get("transactions") or []:
-            if tx.get("pending"):
-                continue
+            pending = bool(tx.get("pending", False))
+            if pending:
+                # Pending rows may carry posted=0/absent with only the
+                # transaction time set; fall back so ``posted`` (NOT NULL
+                # in the schema, non-optional on the model) stays intact.
+                # The real settlement time replaces it when the row posts.
+                ts = tx.get("posted") or tx.get("transacted_at")
+                if not ts:
+                    logger.debug(
+                        "skipping pending transaction %s: no posted or transacted_at",
+                        tx.get("id"),
+                    )
+                    continue
+                posted = _ts_to_utc(ts)
+            else:
+                posted = _ts_to_utc(tx["posted"])
             out.append(
                 Transaction(
                     id=tx["id"],
                     account_id=account_id,
-                    posted=_ts_to_utc(tx["posted"]),
+                    posted=posted,
                     transacted_at=_maybe_ts_to_utc(tx.get("transacted_at")),
                     amount=_to_decimal(tx["amount"], "amount", tx.get("id")),
                     description=tx.get("description", ""),
                     payee=tx.get("payee"),
                     memo=tx.get("memo") or None,
-                    pending=False,
+                    pending=pending,
                     extra=dict(tx.get("extra") or {}),
                 )
             )
     return out
+
+
+def transaction_bearing_account_ids(raw: dict[str, Any]) -> set[str]:
+    """Ids of accounts whose response entry carried a transactions LIST.
+
+    An account present with a missing/null ``transactions`` didn't report
+    transactions this sync (institution hiccup) — its pending rows must
+    not be reconciled against an empty feed.
+    """
+    return {a["id"] for a in raw.get("accounts", []) if isinstance(a.get("transactions"), list)}
 
 
 class SimpleFinClient:
@@ -150,7 +174,7 @@ class SimpleFinClient:
         params = {
             "start-date": int(start.timestamp()),
             "end-date": int(end.timestamp()),
-            "pending": 0,
+            "pending": 1,
         }
         try:
             response = httpx.get(

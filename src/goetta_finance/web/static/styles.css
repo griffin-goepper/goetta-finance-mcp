@@ -87,6 +87,8 @@ code { background: #f3f4f6; padding: 1px 6px; border-radius: 3px; font-size: 13p
 }
 .badge-manual { background: #fef3c7; color: #92400e; }
 .badge-liability { background: #fee2e2; color: #991b1b; }
+.badge-pending { background: #e0e7ff; color: #3730a3; }
+.pending-row td { color: #6b7280; font-style: italic; }
 .badge-category {
   margin-left: 0;
   background: #e5e7eb;

@@ -2,8 +2,9 @@
 
 `simplefin_demo_response.json` is a synthetic SimpleFIN `/accounts` response
 that mirrors the shape returned by the public SimpleFIN Bridge demo. It
-contains two accounts (one checking, one brokerage), one pending transaction
-to exercise the drop-pending path, and a mix of fields present/absent.
+contains two accounts (one checking, one brokerage), two pending transactions
+(one dated normally, one with `posted: 0` to exercise the transacted_at date
+fallback), and a mix of fields present/absent.
 
 To capture a fresh response from the live demo:
 

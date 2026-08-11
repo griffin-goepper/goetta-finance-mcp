@@ -5,7 +5,10 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+import pytest
+
 from goetta_finance.collector import INITIAL_LOOKBACK_DAYS, collect
+from goetta_finance.errors import SimpleFinError
 from goetta_finance.models import Account, AccountType, BalanceSnapshot
 from goetta_finance.simplefin import SimpleFinClient
 from goetta_finance.store.duckdb_store import DuckDBStore
@@ -48,12 +51,12 @@ def test_first_run_records_data(store: DuckDBStore, demo_response: dict) -> None
     run = collect(store, client, now=now)
 
     assert _count(store, "accounts") == 2
-    assert _count(store, "transactions") == 3  # pending dropped
+    assert _count(store, "transactions") == 5  # includes the 2 pending rows
     assert _count(store, "balance_snapshots") == 2
     # The 90-day initial lookback splits into two chunks; the stub replays
     # the same data on both, so chunk 2 sees the rows as "updated".
     # What matters: every unique row was counted "new" exactly once.
-    assert run.transactions_new == 3
+    assert run.transactions_new == 5
     assert run.accounts_touched == 2
     assert run.finished_at is not None
     assert run.errors == []
@@ -67,12 +70,13 @@ def test_second_run_is_idempotent(store: DuckDBStore, demo_response: dict) -> No
     run2 = collect(store, client, now=now2)
 
     # Row counts unchanged: balance_date in the fixture is constant,
-    # so the snapshot PK dedups.
+    # so the snapshot PK dedups. The pending rows survive because their
+    # ids are still in the feed (reconcile keep-set).
     assert _count(store, "accounts") == 2
-    assert _count(store, "transactions") == 3
+    assert _count(store, "transactions") == 5
     assert _count(store, "balance_snapshots") == 2
     assert run2.transactions_new == 0
-    assert run2.transactions_updated == 3
+    assert run2.transactions_updated == 5
 
 
 def test_subsequent_run_uses_overlap_window(store: DuckDBStore, demo_response: dict) -> None:
@@ -168,3 +172,143 @@ def test_collect_does_not_touch_manual_accounts(store: DuckDBStore, demo_respons
     assert snap_count is not None and snap_count[0] == 1, (
         "collect() must not record balance_snapshots for manual accounts"
     )
+
+
+# --- Pending snapshot reconciliation ---------------------------------------------
+
+
+def _txn_ids(store: DuckDBStore) -> set[str]:
+    return {row[0] for row in store.conn.execute("SELECT id FROM transactions").fetchall()}
+
+
+class SequenceStubClient(SimpleFinClient):
+    """Replays one response per fetch call, in order (one per chunk window)."""
+
+    def __init__(self, responses: list[dict[str, Any]]) -> None:
+        self.responses = list(responses)
+        self.windows: list[tuple[datetime, datetime]] = []
+
+    def fetch(  # type: ignore[override]
+        self, start: datetime, end: datetime
+    ) -> dict[str, Any]:
+        self.windows.append((start, end))
+        return copy.deepcopy(self.responses.pop(0))
+
+
+def test_pending_settled_under_new_id_is_reconciled(
+    store: DuckDBStore, demo_response: dict
+) -> None:
+    """Lifecycle (a): the bank reissues the id at settlement. The stale
+    pending row must go; the posted row arrives as a fresh insert."""
+    client = StubClient(demo_response)
+    now1 = datetime(2026, 5, 23, tzinfo=UTC)
+    collect(store, client, now=now1)
+    assert "TX-3-PENDING" in _txn_ids(store)
+
+    settled = copy.deepcopy(demo_response)
+    chk = next(a for a in settled["accounts"] if a["id"] == "ACT-CHK-1")
+    chk["transactions"] = [t for t in chk["transactions"] if t["id"] != "TX-3-PENDING"]
+    chk["transactions"].append(
+        {
+            "id": "TX-3-SETTLED",
+            "posted": 1748016000,
+            "amount": "-15.99",
+            "description": "Pending hold",
+            "pending": False,
+        }
+    )
+    client.response = settled
+    collect(store, client, now=now1 + timedelta(hours=6))
+
+    ids = _txn_ids(store)
+    assert "TX-3-PENDING" not in ids
+    assert "TX-3-SETTLED" in ids
+    assert "TX-4-PENDING-UNPOSTED" in ids  # still pending, still in the feed
+
+
+def test_pending_hold_evaporation_is_reconciled(store: DuckDBStore, demo_response: dict) -> None:
+    """Lifecycle (c): an auth hold released without posting vanishes from
+    the feed and must vanish from the store."""
+    client = StubClient(demo_response)
+    now1 = datetime(2026, 5, 23, tzinfo=UTC)
+    collect(store, client, now=now1)
+
+    released = copy.deepcopy(demo_response)
+    chk = next(a for a in released["accounts"] if a["id"] == "ACT-CHK-1")
+    chk["transactions"] = [t for t in chk["transactions"] if t["id"] != "TX-3-PENDING"]
+    client.response = released
+    collect(store, client, now=now1 + timedelta(hours=6))
+
+    ids = _txn_ids(store)
+    assert "TX-3-PENDING" not in ids
+    assert ids == {"TX-1", "TX-2", "TX-4-PENDING-UNPOSTED", "TX-VG-1"}
+
+
+def test_reconcile_unions_ids_across_chunks(store: DuckDBStore, demo_response: dict) -> None:
+    """A multi-chunk sync sees pending rows only in the recent window.
+    Reconciling per-chunk would delete them while processing the older
+    window; the reconcile must run once over the union of all chunks."""
+    client = StubClient(demo_response)
+    now1 = datetime(2026, 5, 23, tzinfo=UTC)
+    collect(store, client, now=now1)
+
+    old_window = copy.deepcopy(demo_response)
+    for a in old_window["accounts"]:
+        a["transactions"] = []
+    seq = SequenceStubClient([old_window, demo_response])
+    collect(store, seq, now=now1 + timedelta(days=90))
+
+    assert len(seq.windows) == 2, "expected the sync to span two chunk windows"
+    ids = _txn_ids(store)
+    assert "TX-3-PENDING" in ids
+    assert "TX-4-PENDING-UNPOSTED" in ids
+
+
+def test_account_with_null_transactions_is_not_reconciled(
+    store: DuckDBStore, demo_response: dict
+) -> None:
+    """An institution hiccup (account present, ``transactions: null``)
+    must not wipe that account's pending rows against an empty feed."""
+    client = StubClient(demo_response)
+    now1 = datetime(2026, 5, 23, tzinfo=UTC)
+    collect(store, client, now=now1)
+
+    outage = copy.deepcopy(demo_response)
+    next(a for a in outage["accounts"] if a["id"] == "ACT-CHK-1")["transactions"] = None
+    client.response = outage
+    collect(store, client, now=now1 + timedelta(hours=6))
+
+    ids = _txn_ids(store)
+    assert "TX-3-PENDING" in ids
+    assert "TX-4-PENDING-UNPOSTED" in ids
+
+
+def test_failed_sync_does_not_reconcile(store: DuckDBStore, demo_response: dict) -> None:
+    """A sync that dies mid-chunks has a partial view of the feed and must
+    not delete pending rows based on it."""
+    client = StubClient(demo_response)
+    now1 = datetime(2026, 5, 23, tzinfo=UTC)
+    collect(store, client, now=now1)
+
+    empty = copy.deepcopy(demo_response)
+    for a in empty["accounts"]:
+        a["transactions"] = []
+
+    class FailsOnSecondChunk(SimpleFinClient):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def fetch(  # type: ignore[override]
+            self, start: datetime, end: datetime
+        ) -> dict[str, Any]:
+            self.calls += 1
+            if self.calls >= 2:
+                raise SimpleFinError("bridge fell over mid-sync")
+            return copy.deepcopy(empty)
+
+    with pytest.raises(SimpleFinError):
+        collect(store, FailsOnSecondChunk(), now=now1 + timedelta(days=90))
+
+    ids = _txn_ids(store)
+    assert "TX-3-PENDING" in ids
+    assert "TX-4-PENDING-UNPOSTED" in ids

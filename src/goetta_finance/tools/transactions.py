@@ -21,6 +21,7 @@ def serialize_transaction(t: Transaction) -> dict[str, Any]:
         "description": t.description,
         "payee": t.payee,
         "memo": t.memo,
+        "pending": t.pending,
     }
 
 
@@ -44,6 +45,7 @@ def _serialize_row_with_category(row: dict[str, Any]) -> dict[str, Any]:
         "description": row["description"],
         "payee": row.get("payee"),
         "memo": row.get("memo"),
+        "pending": bool(row["pending"]),
         "category": row["category"],
         "category_color": row.get("category_color"),
     }

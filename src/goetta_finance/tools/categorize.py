@@ -43,17 +43,24 @@ def categorize_transaction(
 ) -> dict[str, Any]:
     """Apply a manual per-transaction category override."""
     try:
-        store.set_transaction_override(transaction_id, category_name)
+        was_pending = store.set_transaction_override(transaction_id, category_name)
     except StoreError as exc:
         message = str(exc)
         if "category not found" in message.lower():
             message += _suggest_category(store, category_name)
         return {"ok": False, "error": message}
-    return {
-        "ok": True,
-        "message": f"Categorized {transaction_id} as {category_name}. "
-        "The override beats any rule and applies immediately to all reads.",
-    }
+    message = (
+        f"Categorized {transaction_id} as {category_name}. "
+        "The override beats any rule and applies immediately to all reads."
+    )
+    if was_pending:
+        message += (
+            " Note: this transaction is still pending — if the bank issues a "
+            "new id when it settles, this override will not carry over (it is "
+            "cleaned up with the stale pending row). add_category_rule is "
+            "durable across settlement."
+        )
+    return {"ok": True, "message": message}
 
 
 def uncategorize_transaction(store: FinanceStore, transaction_id: str) -> dict[str, Any]:

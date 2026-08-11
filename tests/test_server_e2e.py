@@ -405,6 +405,7 @@ def test_schema_hint_mentions_categorization_tables() -> None:
         "max_amount",
         "transfer_links",
         "transfer_link_applications",
+        "pending",
     ):
         assert marker in SQL_SCHEMA_HINT, f"SQL_SCHEMA_HINT missing {marker!r}"
 
@@ -438,6 +439,8 @@ def test_schema_hint_communicates_categorization_semantics() -> None:
         "rolls FORWARD",  # transfer links are write-time bookkeeping (0012)
         "link_account_transfers",  # link write path (NOT sql_query)
         "true-up",  # set-balance stays authoritative; captures interest
+        "in-flight snapshot",  # pending rows are replaced each sync, not history
+        "reissue the id",  # pending id instability → prefer rules over overrides
     ]
     for phrase in expected_phrases:
         assert phrase in SQL_SCHEMA_HINT, (

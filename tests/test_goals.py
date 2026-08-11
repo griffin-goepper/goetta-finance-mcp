@@ -414,6 +414,29 @@ def test_balance_at_most_non_liability_over() -> None:
     assert progress.status is GoalStatus.OVER
 
 
+def test_balance_pending_delta_default_is_none() -> None:
+    progress = balance_goal_progress(_balance_goal(), _acct("6500"), [], now=NOW)
+    assert progress.pending_delta is None
+
+
+def test_balance_pending_delta_at_least_keeps_sign() -> None:
+    progress = balance_goal_progress(
+        _balance_goal(), _acct("6500"), [], pending_raw=Decimal("800"), now=NOW
+    )
+    assert progress.pending_delta == Decimal("800.00")
+    assert progress.current == Decimal("6500")
+    assert progress.status is GoalStatus.ON_TRACK  # preview never moves status
+
+
+def test_balance_pending_delta_at_most_negates() -> None:
+    """Same orientation as monthly_delta: positive = approaching. A
+    pending -300 on an at_most goal is money leaving the balance —
+    approaching the ceiling from above."""
+    goal = _balance_goal(amount="2000", direction=GoalDirection.AT_MOST)
+    progress = balance_goal_progress(goal, _acct("2500"), [], pending_raw=Decimal("-300"), now=NOW)
+    assert progress.pending_delta == Decimal("300.00")
+
+
 # --- evaluate_goals (store-backed) -------------------------------------------
 
 
@@ -450,6 +473,44 @@ def test_evaluate_goals_mixed_kinds_and_hidden_balance_account(
     assert cap_progress.status is GoalStatus.AT_RISK
     assert balance_progress.status is GoalStatus.MET
     assert balance_progress.current == Decimal("12000.00")
+
+
+def test_evaluate_goals_pending_delta_via_transfer_links(store: DuckDBStore) -> None:
+    """A linked balance goal previews pending source transfers; a goal
+    whose account has no links carries None (the concept doesn't apply)."""
+    _seed_account(store)
+    store.upsert_accounts(
+        [
+            Account(
+                id="g-sav",
+                name="Goal Savings",
+                balance=Decimal("5000.00"),
+                balance_date=NOW - timedelta(days=30),  # link anchors here
+                type=AccountType.SAVINGS,
+                is_manual=True,
+            )
+        ]
+    )
+    store.add_transfer_link("g-sav", "g-a1", match_type="contains", pattern="goal test txn")
+    _add_txn(store, "t-pending-transfer", "-800.00", pending=True, category=None)
+    store.add_goal(
+        "A linked fund",
+        kind="balance",
+        amount=Decimal("10000"),
+        account_id="g-sav",
+        direction="at_least",
+    )
+    store.add_goal(
+        "B unlinked floor",
+        kind="balance",
+        amount=Decimal("500"),
+        account_id="g-a1",
+        direction="at_least",
+    )
+    linked, unlinked = evaluate_goals(store, now=NOW)
+    assert linked.pending_delta == Decimal("800.00")
+    assert linked.current == Decimal("5000.00")  # preview never touches the balance
+    assert unlinked.pending_delta is None
 
 
 def test_evaluate_goals_empty_store(store: DuckDBStore) -> None:

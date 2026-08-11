@@ -9,6 +9,7 @@ from goetta_finance.simplefin import (
     SimpleFinClient,
     parse_accounts,
     parse_transactions,
+    transaction_bearing_account_ids,
 )
 from goetta_finance.store import FinanceStore
 
@@ -97,6 +98,8 @@ def collect(
 
     run = SyncRun(started_at=end)
     touched: set[str] = set()
+    seen_txn_ids: set[str] = set()
+    reconcile_accounts: set[str] = set()
 
     try:
         for chunk in client.fetch_chunked(start, end):
@@ -113,6 +116,9 @@ def collect(
                 run.transactions_new += result.new
                 run.transactions_updated += result.updated
 
+            seen_txn_ids.update(t.id for t in txns)
+            reconcile_accounts.update(transaction_bearing_account_ids(chunk))
+
             for acct in accounts:
                 touched.add(acct.id)
                 store.record_balance_snapshot(
@@ -122,6 +128,17 @@ def collect(
                         timestamp=acct.balance_date,
                     )
                 )
+
+        # Pending rows are a snapshot of the feed, not history: any pending
+        # row the feed no longer reports either settled (possibly under a
+        # new id — the posted row was upserted above) or evaporated. Runs
+        # once over the union of all chunks' ids — never per-chunk (a
+        # 60-day window without the recent chunk would delete still-pending
+        # rows) and never after a failed sync (the except path below —
+        # don't reconcile against a partial view of the feed).
+        removed = store.delete_stale_pending(reconcile_accounts, seen_txn_ids)
+        if removed:
+            logger.info("Removed %d stale pending transaction(s)", removed)
     except Exception as exc:
         run.errors.append(f"{type(exc).__name__}: {exc}")
         run.accounts_touched = len(touched)
