@@ -42,6 +42,16 @@ class BalanceTrueUpError(GoettaFinanceError):
     verbatim; the MCP tool wraps it in ``{ok: False, error}``."""
 
 
+class BackupError(GoettaFinanceError):
+    """A backup could not be written, verified, or restored.
+
+    Covers a malformed or truncated archive, a manifest from a newer
+    goetta-finance than the one restoring it, and a verification pass
+    whose restored row counts disagree with the source. The message is
+    surface-ready: the CLI echoes it verbatim.
+    """
+
+
 class CsvImportError(GoettaFinanceError):
     """A normalized-CSV import file is malformed or fails validation.
 
