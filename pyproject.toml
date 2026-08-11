@@ -1,9 +1,10 @@
 [build-system]
 # setuptools is not a runtime dep, but pip pulls it in transitively during
-# editable installs. Pin to >=78.1.1 to clear PYSEC-2022-43012, PYSEC-2025-49,
-# and CVE-2024-6345 in setuptools' package_index / URL-fetching code paths.
-# See docs/SECURITY_AUDIT_2026-05.md.
-requires = ["hatchling", "setuptools>=78.1.1"]
+# editable installs. Pin to clear PYSEC-2022-43012, PYSEC-2025-49 and
+# CVE-2024-6345 in setuptools' package_index / URL-fetching code paths
+# (>=78.1.1, docs/SECURITY_AUDIT_2026-05.md), and PYSEC-2026-3447
+# (>=83.0.0), which CI's pip-audit began failing on once 79.0.1 resolved.
+requires = ["hatchling", "setuptools>=83.0.0"]
 build-backend = "hatchling.build"
 
 [project]
