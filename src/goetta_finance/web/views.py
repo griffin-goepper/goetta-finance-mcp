@@ -261,8 +261,8 @@ def _query_transactions(
     """Read transactions through the view so each row carries its
     resolved category (badge rendering + CLI-command tooltip).
 
-    Search/text filter still runs in Python after the DB call — same
-    as before, just on dict keys instead of Transaction attributes."""
+    The text filter runs in SQL alongside the other filters, so ``limit``
+    bounds the matches rather than the raw feed."""
     # include_hidden=False (the default) filters transactions belonging to
     # hidden accounts. The dashboard mirrors the MCP tool semantic.
     rows = store.get_transactions_with_category(
@@ -270,16 +270,9 @@ def _query_transactions(
         start=_parse_iso(start),
         end=_parse_iso(end),
         category=category or None,
+        search=q or None,
         limit=max(1, min(limit, 1000)),
     )
-    if q:
-        needle = q.lower()
-        rows = [
-            r
-            for r in rows
-            if needle in r["description"].lower()
-            or (r.get("payee") is not None and needle in r["payee"].lower())
-        ]
     return [
         {
             "id": r["id"],
