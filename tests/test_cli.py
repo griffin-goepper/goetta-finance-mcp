@@ -108,8 +108,17 @@ def test_daemon_passes_allow_host_through_to_the_allowlist(
         "box.tailnet.ts.net",
         "finance.example",
     )
-    # And the user can see what will be accepted.
-    assert "box.tailnet.ts.net" in result.output
+    # And the user can see exactly what will be accepted. Compared as a
+    # whole line rather than a substring search for the hostname: CodeQL's
+    # py/incomplete-url-substring-sanitization reads `"host.example" in s`
+    # as a URL check with a bypass, and an exact line is the stronger
+    # assertion anyway.
+    host_line = next(
+        line.split(":", 1)[1].strip()
+        for line in result.output.splitlines()
+        if line.strip().startswith("Host ok:")
+    )
+    assert host_line == "127.0.0.1, localhost, ::1, box.tailnet.ts.net, finance.example"
 
 
 def test_daemon_without_config_exits_with_hint(
