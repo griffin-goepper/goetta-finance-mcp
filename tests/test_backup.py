@@ -661,3 +661,56 @@ def test_daily_backup_writes_the_first_one_into_an_empty_directory(
 ) -> None:
     result = maybe_create_daily_backup(seeded, tmp_path / "never-used")
     assert result is not None and result.verified
+
+
+# --- archive column names are untrusted input (audit 2026-08, finding 1) ---
+#
+# Restore reads column names out of the archive's own JSONL header and
+# interpolates them as SQL identifiers, because a column name cannot be
+# bound as a parameter. Quoting alone does not make that safe: a name
+# containing a double quote closes the identifier early and the rest
+# parses as SQL, which DuckDB runs — its execute() accepts multiple
+# statements. Archives are designed to live in a cloud-synced folder, so
+# "someone could have edited this file" is the realistic case.
+
+
+def _tampered_column_snapshot(store: DuckDBStore, table: str, evil: str) -> TableSnapshot:
+    """A real snapshot of ``table`` with one column name replaced."""
+    snap = next(s for s in store.snapshot_tables() if s.name == table)
+    columns = tuple(evil if i == 1 else c for i, c in enumerate(snap.columns))
+    return TableSnapshot(name=snap.name, columns=columns, types=snap.types, rows=snap.rows)
+
+
+@pytest.mark.parametrize(
+    "evil",
+    [
+        # Break out of the quoted identifier and append statements.
+        'name" FROM categories; CREATE TABLE pwned(x INT); --',
+        # Same shape against the plain-INSERT path.
+        'name") ; CREATE TABLE pwned(x INT); --',
+        # A name that simply is not in the table.
+        "no_such_column",
+    ],
+)
+def test_restore_refuses_column_names_the_table_does_not_have(
+    seeded: DuckDBStore, evil: str
+) -> None:
+    snapshot = _tampered_column_snapshot(seeded, "categories", evil)
+    with pytest.raises(StoreError, match="not present in categories"):
+        seeded.restore_table(snapshot)
+    tables = {
+        row[0] for row in seeded.conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()
+    }
+    assert "pwned" not in tables, "injected DDL executed despite the column check"
+
+
+def test_restore_still_accepts_a_faithful_snapshot(seeded: DuckDBStore) -> None:
+    """The guard must not reject legitimate archives.
+
+    ``categories`` goes through the reconcile path, which is
+    insert-or-update and therefore idempotent — restoring a snapshot of
+    the table over itself is a no-op that still exercises the column
+    check on every name.
+    """
+    snapshot = next(s for s in seeded.snapshot_tables() if s.name == "categories")
+    assert seeded.restore_table(snapshot) == len(snapshot.rows)
