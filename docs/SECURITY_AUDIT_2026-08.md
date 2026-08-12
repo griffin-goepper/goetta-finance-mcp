@@ -238,6 +238,29 @@ in practice.
    chose, so low — but it shares a trust boundary with finding 1 and would be fixed by the same
    "treat archives as untrusted input" pass.
 
+### CodeQL — dismissed alerts, with rationale
+
+GitHub Advanced Security raised two `py/redos` alerts ("inefficient regular expression") during this
+work, both on the pattern `(a+)+$`:
+
+- `tests/test_validators.py:358` — `test_goal_match_pattern_goes_through_rule_pattern_validator`
+- `tests/test_tools.py:283` — the `set_goal` MCP-surface equivalent
+
+Both are **adversarial input asserting rejection**, not patterns the code runs. Each passes the
+canonical catastrophic-backtracking shape to `validators.validate_rule_pattern` and asserts it
+raises `RulePatternError("nested quantifier")`. The string never reaches a regex engine against
+untrusted text — the whole point of the test is that it does not. This is the same category as the
+`tests/** = ["S101", "S105", "S608"]` per-file-ignores in `pyproject.toml`: the test tree exercises
+the security boundary deliberately.
+
+Dismissed as **"used in tests"** with that reasoning attached to each alert. **If this pattern ever
+appears outside a test asserting its rejection, that is a real finding** — the dismissal is scoped to
+these two call sites, and a new occurrence will alert again.
+
+Worth noting the alerts were surfaced as inline PR review comments by `github-advanced-security[bot]`
+rather than in the `code-scanning/alerts` list for the default branch, which is why a
+`state=open` query against the repo returns nothing; they are scoped to `refs/pull/N/head`.
+
 ### Clean / re-confirmed
 
 - **gitleaks:** full history (43 commits), no leaks. No personal data found in `src/`.
