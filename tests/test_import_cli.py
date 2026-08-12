@@ -210,7 +210,10 @@ def test_import_before_conflicts_with_allow_overlap(fresh_home: Path) -> None:
         ],
     )
     assert result.exit_code != 0
-    assert "mutually exclusive" in result.output
+    # Whitespace-normalized: Rich wraps the usage error to the terminal
+    # width, which is 80 on CI's Linux runners and splits the phrase
+    # across lines. The assertion is about the message, not the layout.
+    assert "mutually exclusive" in " ".join(result.output.split())
 
 
 def test_import_dry_run_writes_nothing_and_prints_plan(fresh_home: Path) -> None:
