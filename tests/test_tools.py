@@ -450,7 +450,7 @@ def _seed_cat(store: DuckDBStore) -> None:
                 account_id="cat-a1",
                 posted=datetime(2026, 5, 15, tzinfo=UTC),
                 amount=Decimal("3000.00"),
-                description="GE AEROSPACE PAYROLL",
+                description="DEPOSIT FROM PAYROLL",
             ),
         ]
     )
