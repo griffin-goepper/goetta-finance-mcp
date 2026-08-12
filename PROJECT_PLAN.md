@@ -88,33 +88,36 @@ Pydantic models on the wire, projected onto whatever storage backend is configur
 
 ```python
 class Account(BaseModel):
-    id: str                    # SimpleFIN account ID, primary key
+    id: str  # SimpleFIN account ID, primary key
     org_id: str | None
-    org_name: str | None       # e.g. "Chase", "Vanguard"
-    name: str                  # e.g. "Checking 1234"
+    org_name: str | None  # e.g. "Chase", "Vanguard"
+    name: str  # e.g. "Checking 1234"
     currency: str = "USD"
     balance: Decimal
     available_balance: Decimal | None
     balance_date: datetime
-    type: AccountType | None   # checking/savings/credit/investment/loan/other
-    extra: dict[str, Any] = {} # raw passthrough, for future use
+    type: AccountType | None  # checking/savings/credit/investment/loan/other
+    extra: dict[str, Any] = {}  # raw passthrough, for future use
+
 
 class Transaction(BaseModel):
-    id: str                    # SimpleFIN transaction ID, primary key
+    id: str  # SimpleFIN transaction ID, primary key
     account_id: str
     posted: datetime
     transacted_at: datetime | None
-    amount: Decimal            # signed; negative = money out
+    amount: Decimal  # signed; negative = money out
     description: str
-    payee: str | None          # extracted/cleaned downstream
+    payee: str | None  # extracted/cleaned downstream
     memo: str | None
     pending: bool = False
     extra: dict[str, Any] = {}
+
 
 class BalanceSnapshot(BaseModel):
     account_id: str
     balance: Decimal
     timestamp: datetime
+
 
 class SyncRun(BaseModel):
     started_at: datetime
@@ -196,13 +199,16 @@ class FinanceStore(Protocol):
     # Read side (used by MCP tools)
     def last_sync_time(self) -> datetime | None: ...
     def get_accounts(self) -> list[Account]: ...
-    def get_transactions(self, *, account_id: str | None = None,
-                         start: datetime | None = None,
-                         end: datetime | None = None,
-                         limit: int | None = None) -> list[Transaction]: ...
-    def get_balance_history(self, account_id: str,
-                            since: datetime) -> list[BalanceSnapshot]: ...
-    def query_sql(self, sql: str) -> list[dict]: ...   # read-only, see §7
+    def get_transactions(
+        self,
+        *,
+        account_id: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[Transaction]: ...
+    def get_balance_history(self, account_id: str, since: datetime) -> list[BalanceSnapshot]: ...
+    def query_sql(self, sql: str) -> list[dict]: ...  # read-only, see §7
 ```
 
 `query_sql` is the read-only escape hatch for Claude to run arbitrary analytical queries against the store. Crucial for the natural-language UX — see §7.
@@ -246,8 +252,9 @@ class SimpleFinClient:
     def __init__(self, access_url: str): ...
     def claim(setup_token: str) -> str: ...  # @classmethod
     def fetch(self, start: datetime, end: datetime) -> SimpleFinResponse: ...
-    def fetch_chunked(self, start: datetime, end: datetime,
-                      chunk_days: int = 60) -> Iterator[SimpleFinResponse]: ...
+    def fetch_chunked(
+        self, start: datetime, end: datetime, chunk_days: int = 60
+    ) -> Iterator[SimpleFinResponse]: ...
 ```
 
 Note: chunk at 60 days, not 90, to leave headroom for the 45-day "recommended" cap SimpleFIN is signaling they may enforce.
