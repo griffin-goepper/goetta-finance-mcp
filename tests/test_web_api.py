@@ -585,6 +585,25 @@ def test_allowed_hosts_admits_a_deliberate_non_loopback_bind(store: DuckDBStore)
         assert c.get("/api/v1/summary").status_code == 200
 
 
+def test_allowed_hosts_admits_a_reverse_proxy_hostname(store: DuckDBStore) -> None:
+    """The 2026-08-12 regression: with the daemon on 127.0.0.1 behind
+    `tailscale serve`, the proxied request arrives on loopback but carries
+    the tailnet hostname in Host, so the bind-derived allowlist 421'd every
+    phone request. --allow-host names it; nothing else is admitted."""
+    _seed(store)
+    app = build_app(
+        store,
+        allowed_hosts=trusted_hosts_for("127.0.0.1", ["box.example-tailnet.ts.net"]),
+    )
+    with TestClient(app, base_url="https://box.example-tailnet.ts.net") as c:
+        assert c.get("/api/v1/summary").status_code == 200
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        assert c.get("/api/v1/summary").status_code == 200
+    for forged in ("http://evil.attacker.example:8765", "http://other.example-tailnet.ts.net"):
+        with TestClient(app, base_url=forged) as c:
+            assert c.get("/api/v1/summary").status_code == 421, forged
+
+
 def test_trusted_hosts_for_maps_bind_address_to_allowlist() -> None:
     assert trusted_hosts_for("127.0.0.1") == ("127.0.0.1", "localhost", "::1")
     assert trusted_hosts_for("localhost") == ("127.0.0.1", "localhost", "::1")
@@ -593,6 +612,27 @@ def test_trusted_hosts_for_maps_bind_address_to_allowlist() -> None:
     # allowlist switches off and the CLI warns instead.
     assert trusted_hosts_for("0.0.0.0") == ("*",)  # noqa: S104
     assert trusted_hosts_for("::") == ("*",)
+
+
+def test_trusted_hosts_for_normalizes_extra_hosts() -> None:
+    """--allow-host takes whatever the user pasted: a URL authority with a
+    port, mixed case, stray whitespace, a duplicate of the bind address."""
+    assert trusted_hosts_for("127.0.0.1", ["Box.Example-Tailnet.TS.net:443"]) == (
+        "127.0.0.1",
+        "localhost",
+        "::1",
+        "box.example-tailnet.ts.net",
+    )
+    assert trusted_hosts_for("100.85.1.2", ["100.85.1.2", " ", "proxy.example"]) == (
+        "127.0.0.1",
+        "localhost",
+        "::1",
+        "100.85.1.2",
+        "proxy.example",
+    )
+    # An explicit --allow-host '*' disables the check, same as a wildcard
+    # bind; the CLI warns.
+    assert trusted_hosts_for("127.0.0.1", ["*"]) == ("*",)
 
 
 def test_wildcard_allowlist_disables_the_check(store: DuckDBStore) -> None:

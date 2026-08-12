@@ -72,6 +72,55 @@ def test_daemon_exposes_expected_flags() -> None:
     assert {"--host", "--port", "--sync-at", "--no-schedule", "--no-mcp"} <= _option_flags("daemon")
 
 
+def test_host_allowlist_flag_on_both_serving_commands() -> None:
+    """`web` and `daemon` must not drift: both need --allow-host for a
+    reverse-proxied deployment."""
+    assert "--allow-host" in _option_flags("daemon")
+    assert "--allow-host" in _option_flags("web")
+
+
+def test_daemon_passes_allow_host_through_to_the_allowlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wiring, end to end: --allow-host on the command line must reach
+    the Host-header allowlist the middleware enforces. Repeatable, and the
+    loopback names survive alongside it."""
+    from goetta_finance.config import Config, save_config
+    from goetta_finance.web.app import trusted_hosts_for
+
+    monkeypatch.setenv("GOETTA_FINANCE_HOME", str(tmp_path))
+    save_config(Config(access_url="https://user:pass@bridge.example/simplefin"))
+    captured: dict[str, object] = {}
+
+    def fake_run_daemon(store: object, client: object, **kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("goetta_finance.cli.run_daemon", fake_run_daemon)
+    result = runner.invoke(
+        app,
+        ["daemon", "--allow-host", "box.tailnet.ts.net", "--allow-host", "finance.example:443"],
+    )
+    assert result.exit_code == 0, result.output
+    assert trusted_hosts_for("127.0.0.1", captured["allow_hosts"]) == (  # type: ignore[arg-type]
+        "127.0.0.1",
+        "localhost",
+        "::1",
+        "box.tailnet.ts.net",
+        "finance.example",
+    )
+    # And the user can see exactly what will be accepted. Compared as a
+    # whole line rather than a substring search for the hostname: CodeQL's
+    # py/incomplete-url-substring-sanitization reads `"host.example" in s`
+    # as a URL check with a bypass, and an exact line is the stronger
+    # assertion anyway.
+    host_line = next(
+        line.split(":", 1)[1].strip()
+        for line in result.output.splitlines()
+        if line.strip().startswith("Host ok:")
+    )
+    assert host_line == "127.0.0.1, localhost, ::1, box.tailnet.ts.net, finance.example"
+
+
 def test_daemon_without_config_exits_with_hint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

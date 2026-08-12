@@ -385,6 +385,7 @@ def run_daemon(
     stop_file: Path | None = None,
     dash_dir: Path | None = None,
     backup_hook: Callable[[], None] | None = None,
+    allow_hosts: Sequence[str] = (),
 ) -> None:
     """Run the goetta-finance daemon: dashboard + MCP HTTP + scheduler.
 
@@ -393,6 +394,10 @@ def run_daemon(
     process (a hard kill can freeze DDL in the WAL and brick the DB;
     see the 0009 incident note in duckdb_store.init). Releases the
     scheduler task and closes the store cleanly on shutdown.
+
+    ``allow_hosts`` extends the ``Host``-header allowlist beyond what
+    ``host`` implies — needed when a reverse proxy forwards its own
+    hostname to a loopback bind (see :func:`trusted_hosts_for`).
     """
     # Late-bound so the lifespan (built before the server object exists)
     # can flip uvicorn's should_exit. uvicorn polls it in its main loop
@@ -415,7 +420,8 @@ def run_daemon(
         backup_hook=backup_hook,
         # Derived from the bind address rather than hard-coded: a
         # deliberate --host stays reachable, a forged Host does not.
-        allowed_hosts=trusted_hosts_for(host),
+        # --allow-host adds proxy hostnames the bind cannot imply.
+        allowed_hosts=trusted_hosts_for(host, allow_hosts),
     )
     logger.info(
         "goetta-finance daemon: http://%s:%d  mcp=%s  schedule=%s @ %s  stop_file=%s",
