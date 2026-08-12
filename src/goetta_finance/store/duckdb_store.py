@@ -534,7 +534,7 @@ class DuckDBStore:
                     described = self.conn.execute(f"DESCRIBE {table}").fetchall()
                     columns = tuple(str(row[0]) for row in described)
                     types = tuple(str(row[1]) for row in described)
-                    rows = self.conn.execute(f"SELECT * FROM {table}").fetchall()  # noqa: S608
+                    rows = self.conn.execute(f"SELECT * FROM {table}").fetchall()  # noqa: S608  # nosec B608
                     snapshots.append(
                         TableSnapshot(
                             name=table,
@@ -593,13 +593,41 @@ class DuckDBStore:
                 for table in reversed(RESTORE_ORDER):
                     if table in _RECONCILED_TABLES:
                         continue
-                    self.conn.execute(f"DELETE FROM {table}")  # noqa: S608
+                    self.conn.execute(f"DELETE FROM {table}")  # noqa: S608  # nosec B608
                     emptied.append(table)
                 self.conn.execute("COMMIT")
             except duckdb.Error as exc:
                 self.conn.execute("ROLLBACK")
                 raise StoreError(f"Clearing tables before restore failed: {exc}") from exc
         return emptied
+
+    def _assert_known_columns(self, table: str, columns: Sequence[str]) -> None:
+        """Refuse column names the table does not actually have.
+
+        Restore reads these out of the archive's own JSONL header, so
+        they are file content, not code — and they get interpolated into
+        statements as identifiers, because a column name cannot be bound
+        as a parameter. Quoting alone does not make that safe: a name
+        containing a double quote closes the identifier early and
+        everything after it parses as SQL, which DuckDB will happily run
+        (its ``execute`` accepts multiple statements). Checking every
+        name against ``DESCRIBE`` means only identifiers the live table
+        already has can ever reach a statement, which is what makes the
+        interpolation below sound.
+
+        Also the better error for the ordinary case: an archive written
+        against a schema this install does not have now says so, instead
+        of surfacing as a parser error.
+
+        ``table`` is never caller text — it comes from ``RESTORE_ORDER``.
+        """
+        with self._lock:
+            actual = {str(row[0]) for row in self.conn.execute(f"DESCRIBE {table}").fetchall()}
+        if unknown := [c for c in columns if c not in actual]:
+            raise StoreError(
+                f"Archive column(s) not present in {table}: {', '.join(repr(c) for c in unknown)}. "
+                "The archive does not match this schema, or it has been tampered with."
+            )
 
     def reconcile_table(self, snapshot: TableSnapshot) -> list[int]:
         """Bring a seeded table in line with a snapshot, insert-first.
@@ -612,6 +640,7 @@ class DuckDBStore:
         seeded category, which no surface can produce, but reported
         rather than silently dropped.
         """
+        self._assert_known_columns(snapshot.name, snapshot.columns)
         id_index = snapshot.columns.index("id")
         writable = [
             (index, column)
@@ -626,7 +655,7 @@ class DuckDBStore:
             existing = {
                 row[0]: row[1:]
                 for row in self.conn.execute(
-                    f"SELECT {columns} FROM {snapshot.name}"  # noqa: S608
+                    f"SELECT {columns} FROM {snapshot.name}"  # noqa: S608  # nosec B608
                 ).fetchall()
             }
             try:
@@ -634,7 +663,7 @@ class DuckDBStore:
                     row_id = row[id_index]
                     if row_id not in existing:
                         self.conn.execute(
-                            f"INSERT INTO {snapshot.name} ({columns}) "  # noqa: S608
+                            f"INSERT INTO {snapshot.name} ({columns}) "  # noqa: S608  # nosec B608
                             f"VALUES ({placeholders})",
                             list(row),
                         )
@@ -642,7 +671,7 @@ class DuckDBStore:
                     if existing[row_id] == row[1:]:
                         continue
                     self.conn.execute(
-                        f"UPDATE {snapshot.name} SET {assignments} WHERE id = ?",  # noqa: S608
+                        f"UPDATE {snapshot.name} SET {assignments} WHERE id = ?",  # noqa: S608  # nosec B608
                         [row[index] for index, _column in writable] + [row_id],
                     )
                     if any(
@@ -688,12 +717,13 @@ class DuckDBStore:
             return len(snapshot.rows)
         if not snapshot.rows:
             return 0
+        self._assert_known_columns(snapshot.name, snapshot.columns)
         columns = ", ".join(f'"{c}"' for c in snapshot.columns)
         placeholders = ", ".join("?" for _ in snapshot.columns)
         with self._lock:
             try:
                 self.conn.executemany(
-                    f"INSERT INTO {snapshot.name} ({columns}) VALUES ({placeholders})",  # noqa: S608
+                    f"INSERT INTO {snapshot.name} ({columns}) VALUES ({placeholders})",  # noqa: S608  # nosec B608
                     [list(row) for row in snapshot.rows],
                 )
             except duckdb.Error as exc:
@@ -712,7 +742,7 @@ class DuckDBStore:
         with self._lock:
             for name, (table, column) in _SEQUENCE_OWNERS.items():
                 row = self.conn.execute(
-                    f"SELECT max({column}) FROM {table}"  # noqa: S608
+                    f"SELECT max({column}) FROM {table}"  # noqa: S608  # nosec B608
                 ).fetchone()
                 observed = int(row[0]) if row is not None and row[0] is not None else 0
                 target = max(int(recorded.get(name) or 0), observed)
@@ -742,7 +772,7 @@ class DuckDBStore:
             # range bound is arithmetic on two ints. Neither is caller
             # text. nextval() cannot be bound as a parameter.
             self.conn.execute(
-                f"SELECT nextval('{name}') FROM range({target - position})"  # noqa: S608
+                f"SELECT nextval('{name}') FROM range({target - position})"  # noqa: S608  # nosec B608
             )
 
     def rebuild_category_match_cache(self) -> None:
