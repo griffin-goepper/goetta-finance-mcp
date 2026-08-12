@@ -132,6 +132,17 @@ in practice.
    `TestClient` sites now drive a loopback `base_url` so the suite exercises the real default posture
    rather than an app with the check disabled.
 
+   **Follow-up 2026-08-12 — the fix broke a legitimate deployment shape.** A reverse proxy in front
+   of a loopback bind is invisible to `trusted_hosts_for`: `tailscale serve` forwards the request to
+   `127.0.0.1:8765` but preserves the tailnet hostname in `Host`, so every phone request to
+   `https://<host>.<tailnet>.ts.net/dash/` started answering 421 the morning after this landed. The
+   deployment was not misconfigured and no bind-derived allowlist can cover it — the name lives at
+   the proxy. Remediation: `trusted_hosts_for(bind_host, extra_hosts)` plus a repeatable
+   `--allow-host` on `daemon` and `web` (port tolerated, hostname compared, loopback always kept).
+   Opt-in by name rather than a heuristic: trusting `X-Forwarded-Host`, or trusting any request whose
+   peer is loopback, would hand the bypass straight back — a rebound request also arrives on loopback,
+   which is the entire premise of finding 2. `--allow-host '*'` is accepted and warns.
+
 3. **36 known vulnerabilities across 9 packages in the local venv, several runtime-reachable.**
    ⚠️ **PARTIALLY FIXED** — the reachable chain is closed; the unreachable remainder is left, see
    "Remediation" at the end of this finding.

@@ -492,6 +492,15 @@ The MCP server exposes eighteen tools:
 
 The dashboard binds to `127.0.0.1` only by default. If you pass a non-loopback `--host`, the CLI prints a warning — **there is no auth**. Don't expose this to a network you don't fully trust.
 
+Every surface also pins the `Host` header to the address it was bound to (the DNS-rebinding defense — see "Privacy and security"), so a request arriving under any other name gets `421 Invalid Host header`. Behind a reverse proxy that forwards its own hostname, name it explicitly:
+
+```bash
+# daemon on loopback, reached from a phone through `tailscale serve`
+goetta-finance daemon --allow-host mybox.tailnet.ts.net
+```
+
+`--allow-host` is repeatable, accepts an optional port (`host.example:443`), and always keeps loopback working.
+
 ## Companion frontends (`/api/v1` + `--dash-dir`)
 
 If you want to build your own dashboard UI, the daemon (and `web`) also serve a **read-only JSON API** under `/api/v1` — the same data the HTML pages render, machine-readable:
@@ -517,7 +526,7 @@ goetta-finance daemon --dash-dir /path/to/your-spa/dist
 # → your app at http://127.0.0.1:8765/dash/, calling /api/v1 same-origin
 ```
 
-`--dash-dir` mounts any static single-page-app build (a folder containing `index.html`) at `/dash`. Use hash-based routing in the SPA — unknown deep paths under a static mount 404. The API has the same security posture as the HTML dashboard: no auth, whoever can reach the port can read your finances. For phone access, bind to a VPN/Tailscale interface rather than your LAN.
+`--dash-dir` mounts any static single-page-app build (a folder containing `index.html`) at `/dash`. Use hash-based routing in the SPA — unknown deep paths under a static mount 404. The API has the same security posture as the HTML dashboard: no auth, whoever can reach the port can read your finances. For phone access, reach it over a VPN rather than your LAN — either bind the daemon to the VPN interface (`--host 100.85.1.2`) or keep it on loopback and put a tunnel in front of it (`tailscale serve https / http://127.0.0.1:8765`). A tunnel forwards its own hostname in `Host`, so pass `--allow-host <that hostname>` or every proxied request gets `421`.
 
 ## Where your data lives
 
@@ -604,6 +613,7 @@ current install. Stop the daemon first (via `daemon.stop`).
   3. The DuckDB connection is opened with `enable_external_access=false` (immutable at runtime), which blocks `read_csv`, `read_blob`, `COPY ... TO 'file'`, and `httpfs` URLs — closing the information-disclosure and filesystem-exfiltration vectors.
 
   See [`CLAUDE.md`](./CLAUDE.md) "Things to avoid" for the full threat model and regression tests.
+- **The `Host` header is pinned on every HTTP surface** (dashboard, `/api/v1`, `/dash`, `/api/mcp`). Binding to loopback is not protection by itself: a web page you visit can re-point its own domain at `127.0.0.1`, after which the browser treats this server as same-origin and CORS never applies. Checking `Host` breaks that — the rebound request still carries the attacker's domain and gets `421`. The allowlist is derived from the bind address plus any `--allow-host` names you add for a reverse proxy; a wildcard bind (`0.0.0.0`) can't be enumerated, so it disables the check and the CLI says so.
 
 ## Known limitations
 

@@ -33,18 +33,29 @@ _LOOPBACK_HOSTS: tuple[str, ...] = ("127.0.0.1", "localhost", "::1")
 _WILDCARD_BINDS = frozenset({"0.0.0.0", "::", "*"})  # noqa: S104  # nosec B104
 
 
-def trusted_hosts_for(bind_host: str) -> tuple[str, ...]:
+def trusted_hosts_for(bind_host: str, extra_hosts: Sequence[str] = ()) -> tuple[str, ...]:
     """``Host`` header values to accept when uvicorn binds ``bind_host``.
 
     Loopback names are always included. A non-loopback bind adds its own
     literal, so ``--host 100.85.1.2`` keeps working over Tailscale. A
     wildcard bind returns ``("*",)`` — allowlist disabled, because there
     is no way to know which names reach us.
+
+    ``extra_hosts`` (CLI ``--allow-host``) adds names the bind address
+    cannot imply. The case that needs it is a **reverse proxy**: a
+    loopback-bound daemon behind ``tailscale serve`` (or nginx, Caddy,
+    Cloudflare Tunnel) receives the request on 127.0.0.1 but carrying the
+    *proxy's* public hostname in ``Host``, which no bind-derived allowlist
+    can contain. Values may be given with a port (``host.example:443``);
+    only the hostname is compared. Not derivable and not defaulted — the
+    whole point of pinning ``Host`` is that only names the user named are
+    accepted.
     """
     host = bind_host.strip().lower()
-    if host in _WILDCARD_BINDS:
+    extra = tuple(_hostname(value) for value in extra_hosts if value.strip())
+    if host in _WILDCARD_BINDS or "*" in extra:
         return ("*",)
-    return tuple(dict.fromkeys((*_LOOPBACK_HOSTS, host)))
+    return tuple(dict.fromkeys((*_LOOPBACK_HOSTS, host, *extra)))
 
 
 def _hostname(host_header: str) -> str:
@@ -138,7 +149,9 @@ def build_app(
     ``allowed_hosts`` is the ``Host``-header allowlist (see
     :class:`HostAllowlistMiddleware`). Defaults to loopback names; callers
     that bind elsewhere should pass :func:`trusted_hosts_for` of their bind
-    address. ``("*",)`` disables the check.
+    address, plus its ``extra_hosts`` for any reverse-proxy hostname that
+    reaches this app (``tailscale serve`` forwards its own tailnet name).
+    ``("*",)`` disables the check.
 
     Security posture (audited 2026-05 and 2026-08, see ``docs/SECURITY_AUDIT_*.md``):
 

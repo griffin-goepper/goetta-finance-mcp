@@ -264,6 +264,36 @@ def _warn_non_loopback_bind(host: str) -> None:
         )
 
 
+_ALLOW_HOST_HELP = (
+    "Extra Host header value to accept (repeatable). Needed behind a "
+    "reverse proxy — `tailscale serve`, nginx, Caddy — which forwards its "
+    "own hostname to this loopback bind, e.g. "
+    "--allow-host box.tailnet.ts.net. Without it those requests get 421."
+)
+
+
+def _host_allowlist(host: str, allow_host: list[str] | None) -> tuple[str, ...]:
+    """Resolve the ``Host``-header allowlist for ``web`` and ``daemon``.
+
+    Shared so the two commands cannot drift on the security surface. The
+    bind address implies loopback plus its own literal; ``--allow-host``
+    is the only way a proxy hostname gets in, because a proxied request
+    arrives on loopback carrying a name nothing local can derive.
+    """
+    # Local import: web.app pulls in fastapi/starlette (see
+    # _warn_non_loopback_bind).
+    from goetta_finance.web.app import trusted_hosts_for
+
+    if allow_host and any(value.strip() == "*" for value in allow_host):
+        typer.secho(
+            "WARNING: --allow-host '*' accepts any Host header, which turns "
+            "off DNS-rebinding protection. Name the proxy's hostname instead.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+    return trusted_hosts_for(host, allow_host or ())
+
+
 @app.command()
 def web(
     host: Annotated[
@@ -276,6 +306,10 @@ def web(
             "--dash-dir",
             help="Serve a static single-page-app build (a folder with index.html) at /dash.",
         ),
+    ] = None,
+    allow_host: Annotated[
+        list[str] | None,
+        typer.Option("--allow-host", help=_ALLOW_HOST_HELP),
     ] = None,
 ) -> None:
     """Start the local web dashboard at http://<host>:<port>."""
@@ -312,9 +346,13 @@ def web(
                 )
                 raise typer.Exit(code=1) from exc
 
-            from goetta_finance.web.app import build_app, trusted_hosts_for
+            from goetta_finance.web.app import build_app
 
-            web_app = build_app(store, dash_dir=dash_dir, allowed_hosts=trusted_hosts_for(host))
+            web_app = build_app(
+                store,
+                dash_dir=dash_dir,
+                allowed_hosts=_host_allowlist(host, allow_host),
+            )
             import uvicorn
 
             typer.echo(f"goetta-finance dashboard at http://{host}:{port}")
@@ -362,6 +400,10 @@ def daemon(
             help="Serve a static single-page-app build (a folder with index.html) at /dash.",
         ),
     ] = None,
+    allow_host: Annotated[
+        list[str] | None,
+        typer.Option("--allow-host", help=_ALLOW_HOST_HELP),
+    ] = None,
 ) -> None:
     """Run the long-lived daemon: dashboard + MCP HTTP + scheduled sync.
 
@@ -381,6 +423,7 @@ def daemon(
             )
             raise typer.Exit(code=1)
         _warn_non_loopback_bind(host)
+        allowed_hosts = _host_allowlist(host, allow_host)
         store = DuckDBStore(db_path(config))
         try:
             import duckdb
@@ -416,6 +459,8 @@ def daemon(
                 if backup_hook is not None
                 else "  backups:   (disabled)"
             )
+            if allow_host:
+                typer.echo(f"  Host ok:   {', '.join(allowed_hosts)}")
             typer.echo(f"  stop:      create {stop_file} for a graceful shutdown")
             run_daemon(
                 store,
@@ -428,6 +473,7 @@ def daemon(
                 mcp_enabled=not no_mcp,
                 stop_file=stop_file,
                 dash_dir=dash_dir,
+                allow_hosts=allow_host or (),
             )
         finally:
             store.close()
