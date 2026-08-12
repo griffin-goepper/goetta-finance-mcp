@@ -70,6 +70,13 @@ dev = [
     "mypy>=1.10",
     "bandit>=1.7",
     "pip-audit>=2.7",
+    # Not a build dep here — that is [build-system].requires, which only
+    # provisions the isolated build environment and never reaches the
+    # venv `pip install -e ".[dev]"` creates. pip-audit scans that venv,
+    # where setuptools arrives from actions/setup-python, so the floor
+    # has to be declared here too or the advisory is simply never fixed.
+    # PYSEC-2026-3447 needs >=83.0.0.
+    "setuptools>=83.0.0",
 ]
 
 [project.scripts]
