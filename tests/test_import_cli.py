@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -15,6 +16,23 @@ from goetta_finance.models import Account, Transaction
 from goetta_finance.store.duckdb_store import DuckDBStore
 
 runner = CliRunner()
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _letters(output: str) -> str:
+    """CLI output reduced to its letters and digits.
+
+    Rich renders usage errors inside a bordered panel wrapped to the
+    terminal width. CI's Linux runners are narrow enough that it breaks
+    *within* a word — "mutually exclusive" arrives as "mutually excl",
+    a box border, then "usive" — so neither a plain substring match nor
+    whitespace normalization survives. Dropping ANSI codes, box drawing
+    and spacing leaves an assertion about the message rather than the
+    layout, which is what the test is actually for.
+    """
+    return "".join(ch for ch in _ANSI_RE.sub("", output) if ch.isalnum())
+
 
 ACCOUNT_ID = "ACT-test-checking"
 TXN_HEADER_LINE = ",".join(TRANSACTIONS_HEADER)
@@ -210,10 +228,7 @@ def test_import_before_conflicts_with_allow_overlap(fresh_home: Path) -> None:
         ],
     )
     assert result.exit_code != 0
-    # Whitespace-normalized: Rich wraps the usage error to the terminal
-    # width, which is 80 on CI's Linux runners and splits the phrase
-    # across lines. The assertion is about the message, not the layout.
-    assert "mutually exclusive" in " ".join(result.output.split())
+    assert "mutuallyexclusive" in _letters(result.output)
 
 
 def test_import_dry_run_writes_nothing_and_prints_plan(fresh_home: Path) -> None:
