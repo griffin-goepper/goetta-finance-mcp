@@ -444,7 +444,12 @@ cd goetta-finance-mcp
 # Data lives outside the repo, bind-mounted into the container.
 mkdir -p ~/data/goetta-finance
 cp .env.example ~/data/goetta-finance/.env
-nano ~/data/goetta-finance/.env      # set TZ
+nano ~/data/goetta-finance/.env      # set TZ, and GOETTA_FINANCE_ALLOW_HOST if you're behind a reverse proxy
+
+# Optional: serve the goetta-dash companion SPA too. Drop its build
+# output (the folder containing index.html) here and --dash-dir picks
+# it up automatically; skip this if you don't use the dashboard SPA.
+# cp -r /path/to/goetta-dash/dist ~/data/goetta-finance/dash
 
 # The container runs as a fixed non-root UID (1000). Match it so the
 # bind mount is writable — skip this if your user is already uid 1000.
@@ -462,10 +467,12 @@ To redeploy on every push, point a `post-receive`/`post-merge` hook (or your CI 
 
 What the compose setup does, and why:
 
-- **Loopback only, via host networking.** `network_mode: host` — the container shares the host's network namespace, and the daemon binds `127.0.0.1` inside it (`command: daemon --host 127.0.0.1 --port 8765`), same as it would running directly on the host. Nothing is published beyond the host's own loopback. This also means the app's own `Host`-header allowlist (`trusted_hosts_for` in `web/app.py`) stays active — a bridge-networked container would need the process to listen on `0.0.0.0` for Docker's port forwarding to work at all, which disables that allowlist (it can't enumerate valid `Host` values on a wildcard bind). Reach it remotely the same way the non-container install documents under "The web dashboard": a VPN (Tailscale) or a reverse proxy terminating on `127.0.0.1`. If you put a reverse proxy in front, it'll forward its own hostname in `Host`, so add `--allow-host <its hostname>` to the `command:` in a `docker-compose.override.yml` (a `command:` override replaces the compose file's `command:` entirely, so repeat `--host`/`--port` too) — same reasoning as `--allow-host` everywhere else in this README, or every proxied request gets `421`.
+- **Loopback only, via host networking.** `network_mode: host` — the container shares the host's network namespace, and the daemon binds `127.0.0.1` inside it, same as it would running directly on the host. Nothing is published beyond the host's own loopback. This also means the app's own `Host`-header allowlist (`trusted_hosts_for` in `web/app.py`) stays active — a bridge-networked container would need the process to listen on `0.0.0.0` for Docker's port forwarding to work at all, which disables that allowlist (it can't enumerate valid `Host` values on a wildcard bind).
+- **Reverse proxy support without committing a hostname.** `entrypoint`/`command` build the daemon's flags from a small shell script instead of a fixed list, so `--allow-host <hostname>` is only added when `GOETTA_FINANCE_ALLOW_HOST` is set in your `.env` (see `.env.example`) — same reasoning as `--allow-host` everywhere else in this README: a reverse proxy (Tailscale serve, nginx, Caddy) forwards its own hostname in `Host`, and without it every proxied request gets `421`. Nothing hostname-specific ever needs to touch this public repo.
+- **`--dash-dir` from a bind-mounted path.** The same script adds `--dash-dir /data/dash` only if that directory exists — i.e. only if you dropped a `goetta-dash` build at `~/data/goetta-finance/dash` (see the setup steps above). The image never bakes in a specific SPA build, so a stranger without one still gets a daemon that starts.
 - **Non-root.** The image runs as uid 1000, not root.
 - **duckdb version pinned in the image** (see the `Dockerfile` comment) — a `docker compose up --build` never silently upgrades your on-disk database's storage format.
-- **Everything stateful lives outside the repo**, at `~/data/goetta-finance` (`config.json`, `data.duckdb`, `backups/`, `.env`) — a `git pull` + rebuild never touches it, and there is nothing in the repo for `git push` to leak.
+- **Everything stateful lives outside the repo**, at `~/data/goetta-finance` (`config.json`, `data.duckdb`, `dash/`, `backups/`, `.env`) — a `git pull` + rebuild never touches it, and there is nothing in the repo for `git push` to leak.
 
 ## Claude clients
 

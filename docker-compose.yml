@@ -17,7 +17,27 @@ services:
     # the non-container install does (Tailscale/VPN, or a reverse proxy
     # terminating on 127.0.0.1 — see README "Docker deploy").
     network_mode: host
-    command: ["daemon", "--host", "127.0.0.1", "--port", "8765"]
+    # entrypoint/command together replace the image's plain `goetta-finance
+    # daemon ...` CMD with a shell so two things can be assembled at
+    # container start instead of baked into the image:
+    #   --dash-dir  added only if a dash build was dropped in the data
+    #               bind mount at $HOME/data/goetta-finance/dash — a
+    #               stranger installing this has no such build, and a
+    #               hardcoded --dash-dir would fail to start for them
+    #               (_validate_dash_dir requires the path to exist).
+    #   --allow-host added only if GOETTA_FINANCE_ALLOW_HOST is set, read
+    #               from env_file below — the reverse-proxy hostname this
+    #               reaches through cannot be committed to a public repo.
+    # `$$` escapes past Compose's own interpolation so the literal `$` and
+    # variable reach the shell running inside the container, not Compose
+    # on the host.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        args="--host 127.0.0.1 --port 8765";
+        if [ -d /data/dash ]; then args="$$args --dash-dir /data/dash"; fi;
+        if [ -n "$$GOETTA_FINANCE_ALLOW_HOST" ]; then args="$$args --allow-host $$GOETTA_FINANCE_ALLOW_HOST"; fi;
+        exec goetta-finance daemon $$args
     volumes:
       - ${HOME}/data/goetta-finance:/data
     env_file:
