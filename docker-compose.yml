@@ -1,0 +1,50 @@
+# Deploy: `docker compose up -d --build`. Requires $HOME to be set in the
+# shell that runs this (true for any normal login/deploy-hook shell) — it
+# resolves the data dir and secrets, and neither is ever baked into the
+# image or this repo.
+services:
+  goetta-finance:
+    build: .
+    restart: unless-stopped
+    # Host networking, not a bridge + port mapping: the container shares
+    # the host's network namespace directly, so the app binds the host's
+    # actual 127.0.0.1 (see `command:` below) instead of needing 0.0.0.0
+    # for Docker to forward traffic in. That keeps this app's own
+    # Host-header allowlist (trusted_hosts_for in web/app.py) active — a
+    # 0.0.0.0 bind disables it, since it can't enumerate which Host
+    # values are legitimate on a wildcard bind. Nothing publishes this
+    # port beyond the host's own loopback; reach it remotely the same way
+    # the non-container install does (Tailscale/VPN, or a reverse proxy
+    # terminating on 127.0.0.1 — see README "Docker deploy").
+    network_mode: host
+    # entrypoint/command together replace the image's plain `goetta-finance
+    # daemon ...` CMD with a shell so two things can be assembled at
+    # container start instead of baked into the image:
+    #   --dash-dir  added only if a dash build was dropped in the data
+    #               bind mount at $HOME/data/goetta-finance/dash — a
+    #               stranger installing this has no such build, and a
+    #               hardcoded --dash-dir would fail to start for them
+    #               (_validate_dash_dir requires the path to exist).
+    #   --allow-host added only if GOETTA_FINANCE_ALLOW_HOST is set, read
+    #               from env_file below — the reverse-proxy hostname this
+    #               reaches through cannot be committed to a public repo.
+    # `$$` escapes past Compose's own interpolation so the literal `$` and
+    # variable reach the shell running inside the container, not Compose
+    # on the host.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        args="--host 127.0.0.1 --port 8765";
+        if [ -d /data/dash ]; then args="$$args --dash-dir /data/dash"; fi;
+        if [ -n "$$GOETTA_FINANCE_ALLOW_HOST" ]; then args="$$args --allow-host $$GOETTA_FINANCE_ALLOW_HOST"; fi;
+        exec goetta-finance daemon $$args
+    volumes:
+      - ${HOME}/data/goetta-finance:/data
+    env_file:
+      - ${HOME}/data/goetta-finance/.env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8765/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

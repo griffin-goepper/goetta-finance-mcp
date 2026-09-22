@@ -433,6 +433,47 @@ schtasks /Create /TN "goetta-finance daemon" `
   /SC ONLOGON
 ```
 
+## Docker deploy
+
+For running the daemon always-on on a home server instead of a laptop. The image runs `goetta-finance daemon`, so everything in "Daemon mode" above applies.
+
+```bash
+git clone https://github.com/griffin-goepper/goetta-finance-mcp.git
+cd goetta-finance-mcp
+
+# Data lives outside the repo, bind-mounted into the container.
+mkdir -p ~/data/goetta-finance
+cp .env.example ~/data/goetta-finance/.env
+nano ~/data/goetta-finance/.env      # set TZ, and GOETTA_FINANCE_ALLOW_HOST if you're behind a reverse proxy
+
+# Optional: serve the goetta-dash companion SPA too. Drop its build
+# output (the folder containing index.html) here and --dash-dir picks
+# it up automatically; skip this if you don't use the dashboard SPA.
+# cp -r /path/to/goetta-dash/dist ~/data/goetta-finance/dash
+
+# The container runs as a fixed non-root UID (1000). Match it so the
+# bind mount is writable — skip this if your user is already uid 1000.
+sudo chown -R 1000:1000 ~/data/goetta-finance
+
+# One-time interactive setup (SimpleFIN token, initial pull) — writes
+# config.json and data.duckdb straight into the bind mount.
+docker compose run --rm --build goetta-finance init
+
+docker compose up -d --build
+curl http://127.0.0.1:8765/health
+```
+
+To redeploy on every push, point a `post-receive`/`post-merge` hook (or your CI runner) at the server and have it run `docker compose up -d --build` in the repo checkout — the compose file itself has no host-specific detail, so the hook is just that one line.
+
+What the compose setup does, and why:
+
+- **Loopback only, via host networking.** `network_mode: host` — the container shares the host's network namespace, and the daemon binds `127.0.0.1` inside it, same as it would running directly on the host. Nothing is published beyond the host's own loopback. This also means the app's own `Host`-header allowlist (`trusted_hosts_for` in `web/app.py`) stays active — a bridge-networked container would need the process to listen on `0.0.0.0` for Docker's port forwarding to work at all, which disables that allowlist (it can't enumerate valid `Host` values on a wildcard bind).
+- **Reverse proxy support without committing a hostname.** `entrypoint`/`command` build the daemon's flags from a small shell script instead of a fixed list, so `--allow-host <hostname>` is only added when `GOETTA_FINANCE_ALLOW_HOST` is set in your `.env` (see `.env.example`) — same reasoning as `--allow-host` everywhere else in this README: a reverse proxy (Tailscale serve, nginx, Caddy) forwards its own hostname in `Host`, and without it every proxied request gets `421`. Nothing hostname-specific ever needs to touch this public repo.
+- **`--dash-dir` from a bind-mounted path.** The same script adds `--dash-dir /data/dash` only if that directory exists — i.e. only if you dropped a `goetta-dash` build at `~/data/goetta-finance/dash` (see the setup steps above). The image never bakes in a specific SPA build, so a stranger without one still gets a daemon that starts.
+- **Non-root.** The image runs as uid 1000, not root.
+- **duckdb version pinned in the image** (see the `Dockerfile` comment) — a `docker compose up --build` never silently upgrades your on-disk database's storage format.
+- **Everything stateful lives outside the repo**, at `~/data/goetta-finance` (`config.json`, `data.duckdb`, `dash/`, `backups/`, `.env`) — a `git pull` + rebuild never touches it, and there is nothing in the repo for `git push` to leak.
+
 ## Claude clients
 
 `goetta-finance serve` is a stdio MCP server — it talks to a Claude client over a local pipe. Which clients work:
