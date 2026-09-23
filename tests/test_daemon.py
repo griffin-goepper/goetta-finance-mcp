@@ -178,6 +178,80 @@ def test_daemon_mcp_endpoint_handles_real_initialize(
     )
 
 
+def test_daemon_mcp_endpoint_accepts_proxied_allowed_host(tmp_path: Path) -> None:
+    """The 2026-09-22 regression: PR #25 taught HostAllowlistMiddleware to
+    accept a --allow-host reverse-proxy hostname (test_web_api.py ::
+    test_allowed_hosts_admits_a_reverse_proxy_hostname), but /api/mcp runs
+    a SEPARATE, independent Host/Origin check inside FastMCP itself
+    (mcp.server.transport_security) that was never told about it. A
+    daemon behind tailscale serve answered every other route (/, /api/v1,
+    /health) through the proxy hostname but 421'd every MCP request. This
+    connects on loopback (what the proxy actually dials) while carrying
+    the proxy's hostname in Host (what it forwards from the real client)
+    — the same shape as the middleware-level regression test, applied to
+    the one route that middleware doesn't cover.
+    """
+    db = tmp_path / "daemon_proxy_host.duckdb"
+    store = DuckDBStore(db)
+    store.init()
+    client = _FakeClient()
+    proxy_host = "box.example-tailnet.ts.net"
+    app = build_daemon_app(
+        store,
+        client,  # type: ignore[arg-type]
+        sync_at="23:59",
+        schedule_enabled=False,
+        mcp_enabled=True,
+        allowed_hosts=("127.0.0.1", "localhost", "::1", proxy_host),
+    )
+    port = _free_port()
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        _wait_for_health(f"http://127.0.0.1:{port}/health", timeout=8.0)
+        response = httpx.post(
+            f"http://127.0.0.1:{port}/api/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "proxy-host-test", "version": "0"},
+                },
+            },
+            headers={
+                "accept": "application/json, text/event-stream",
+                "host": proxy_host,
+            },
+            timeout=5.0,
+        )
+        assert response.status_code == 200, (
+            f"proxied MCP request with an allowed Host was rejected "
+            f"(status {response.status_code}): {response.text[:400]!r}"
+        )
+        assert '"error"' not in response.text or '"result"' in response.text
+        # A Host that was never named must still be rejected -- this
+        # proves the fix threads the real allowlist through, not "*".
+        forged = httpx.post(
+            f"http://127.0.0.1:{port}/api/mcp",
+            json={"jsonrpc": "2.0", "id": 2, "method": "initialize"},
+            headers={
+                "accept": "application/json, text/event-stream",
+                "host": "evil.attacker.example",
+            },
+            timeout=5.0,
+        )
+        assert forged.status_code == 421, forged.text[:400]
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5.0)
+        store.close()
+
+
 def test_daemon_no_mcp_disables_endpoint(tmp_path: Path) -> None:
     """With --no-mcp the /api/mcp route should not be mounted."""
     db = tmp_path / "daemon2.duckdb"

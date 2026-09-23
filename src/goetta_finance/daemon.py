@@ -313,7 +313,11 @@ def build_daemon_app(
     derives it from the bind address. Defaults to loopback names.
     """
     parse_sync_at(sync_at)  # validate early
-    mcp = build_server(store, client=client) if mcp_enabled else None
+    # Same allowed_hosts feeds both: HostAllowlistMiddleware (via
+    # build_app below) for the dashboard/api/v1/health, and FastMCP's own
+    # independent transport_security check for /api/mcp (see
+    # server._transport_security_for). They must not drift.
+    mcp = build_server(store, client=client, allowed_hosts=allowed_hosts) if mcp_enabled else None
     # Order matters: build_app mounts mcp.streamable_http_app() (which
     # lazily creates session_manager). _build_lifespan then enters
     # session_manager.run() — must happen *after* the mount so the
