@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
 from goetta_finance.collector import collect_lock, trigger_background_collect
@@ -271,13 +273,68 @@ visualized as an inline chart artifact when the user asks for a visualization.
 """
 
 
+def _transport_security_for(
+    allowed_hosts: Sequence[str] | None,
+) -> TransportSecuritySettings | None:
+    """Translate the same ``Host``-header allowlist that feeds
+    ``HostAllowlistMiddleware`` (web/app.py) into FastMCP's own
+    ``TransportSecuritySettings``.
+
+    FastMCP's streamable-HTTP transport runs an INDEPENDENT DNS-rebinding
+    check, unrelated to our middleware. Since ``build_server`` never
+    passes ``host=`` to ``FastMCP(...)``, its constructor default of
+    ``host="127.0.0.1"`` triggers FastMCP's own auto-enable path (see
+    ``mcp.server.fastmcp.server.FastMCP.__init__``), which hardcodes
+    ``allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"]`` with no
+    way to learn about ``--allow-host`` / ``GOETTA_FINANCE_ALLOW_HOST``.
+    A reverse-proxied request (tailscale serve, nginx, ...) that
+    ``HostAllowlistMiddleware`` correctly accepts on every other route —
+    dashboard, ``/api/v1``, ``/health`` — still 421s on ``/api/mcp``
+    specifically, because that check was never threaded through. This is
+    the fix: build FastMCP's allowlist from the identical source.
+
+    ``allowed_hosts=None`` (the stdio ``serve`` command, and any test
+    call site that doesn't pass it) preserves the prior behavior exactly
+    — ``None`` flows straight to ``FastMCP()``, which falls back to its
+    own loopback-only default. A wildcard bind (``"*"`` in the allowlist,
+    meaning ``HostAllowlistMiddleware`` itself is disabled) disables
+    FastMCP's DNS-rebinding check too, for the same reason: an
+    all-interfaces bind can't enumerate which hosts legitimately reach it.
+
+    FastMCP does exact-string matching against the raw ``Host``/``Origin``
+    header unless a trailing ``:*`` wildcards the port, unlike
+    ``HostAllowlistMiddleware`` which strips the port before comparing —
+    so each host is added both bare (a header with no port) and as
+    ``host:*`` (any port).
+    """
+    if allowed_hosts is None:
+        return None
+    hosts = {h.strip().lower() for h in allowed_hosts if h.strip()}
+    if "*" in hosts:
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    host_patterns: list[str] = []
+    origin_patterns: list[str] = []
+    for host in hosts:
+        literal = f"[{host}]" if ":" in host else host  # bracket bare IPv6 (e.g. "::1")
+        host_patterns.append(literal)
+        host_patterns.append(f"{literal}:*")
+        origin_patterns.append(f"http://{literal}:*")
+        origin_patterns.append(f"https://{literal}:*")
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=host_patterns,
+        allowed_origins=origin_patterns,
+    )
+
+
 def build_server(
     store: FinanceStore,
     *,
     client: SimpleFinClient | None = None,
     name: str = "goetta-finance",
+    allowed_hosts: Sequence[str] | None = None,
 ) -> FastMCP:
-    mcp = FastMCP(name)
+    mcp = FastMCP(name, transport_security=_transport_security_for(allowed_hosts))
 
     @mcp.tool(
         description=(
