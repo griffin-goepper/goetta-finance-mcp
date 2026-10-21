@@ -209,6 +209,35 @@ def test_category_set_spending_unknown_category_suggests(fresh_home: Path) -> No
     assert 'Did you mean "Dining"' in result.output
 
 
+def test_category_set_color_sets_and_clears(fresh_home: Path) -> None:
+    result = runner.invoke(app, ["category", "set-color", "dining", "#d55181"])
+    assert result.exit_code == 0, result.output
+    store = DuckDBStore(fresh_home / "data.duckdb")
+    try:
+        assert {c.name: c for c in store.get_categories()}["Dining"].display_color == "#d55181"
+    finally:
+        store.close()
+    result = runner.invoke(app, ["category", "set-color", "Dining", "none"])
+    assert result.exit_code == 0, result.output
+    store = DuckDBStore(fresh_home / "data.duckdb")
+    try:
+        assert {c.name: c for c in store.get_categories()}["Dining"].display_color is None
+    finally:
+        store.close()
+
+
+def test_category_set_color_rejects_bad_color(fresh_home: Path) -> None:
+    result = runner.invoke(app, ["category", "set-color", "Dining", "pink"])
+    assert result.exit_code != 0
+    assert "#RRGGBB" in result.output
+
+
+def test_category_set_color_unknown_category_suggests(fresh_home: Path) -> None:
+    result = runner.invoke(app, ["category", "set-color", "Dinning", "#d55181"])
+    assert result.exit_code != 0
+    assert 'Did you mean "Dining"' in result.output
+
+
 def test_category_list_shows_non_spending_tag_for_defaults(fresh_home: Path) -> None:
     """Transfers and Income are seeded as non-spending; the [non-spending]
     tag must show in `category list`."""

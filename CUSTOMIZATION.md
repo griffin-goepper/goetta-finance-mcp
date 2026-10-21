@@ -49,6 +49,7 @@ goetta-finance category list                          # see all 14 defaults + yo
 goetta-finance category add --name "Pets" --color "#8e44ad"
 goetta-finance category add --name "Charity" --no-spending   # excluded from spending pie
 goetta-finance category set-spending Travel false     # flip an existing one
+goetta-finance category set-color Travel "#00b894"    # recolor one ("none" = automatic)
 ```
 
 `--no-spending` / `set-spending false` marks a category as not-consumption (like the built-in `Transfers` and `Income`): its transactions are excluded from `spending_by_category` and the dashboard pie by default.
