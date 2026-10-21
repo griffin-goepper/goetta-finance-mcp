@@ -1,0 +1,42 @@
+.git/
+.github/
+.agents/
+.claude/
+docs/
+tests/
+*.md
+!README.md
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local data / secrets — never end up in the image even if present in the
+# build context by accident.
+*.duckdb
+*.duckdb.wal
+config.json
+.env
+backups/
+
+# Security scanner outputs (see .gitignore for why these aren't committed
+# either).
+*.sarif
+bandit-output*.json
+pip-audit-output*.json
+gitleaks-report*.json
+.bandit_cache/
+
+docker-compose.yml
+Dockerfile

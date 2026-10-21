@@ -28,8 +28,14 @@ htmlcov/
 # Local data
 *.duckdb
 *.duckdb.wal
+*.wal
 config.json
 *.access_url
+backups/
+
+# Docker: real secrets/config live at $HOME/data/goetta-finance/.env on
+# the deploy host, never in the repo. See .env.example.
+.env
 
 # Security scanner outputs — narrative summaries get committed to
 # docs/SECURITY_AUDIT_*.md; raw output stays local per the audit-artifact
