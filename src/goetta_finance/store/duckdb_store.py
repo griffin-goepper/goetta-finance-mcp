@@ -1463,6 +1463,24 @@ class DuckDBStore:
                 [is_spending, name],
             )
 
+    def set_category_color(self, name: str, display_color: str | None) -> None:
+        """Set (or clear, with ``None``) an existing category's display color.
+
+        Clients use the stored color for the category everywhere it is drawn;
+        a category without one gets an automatic palette slot. Matches the
+        name case-insensitively, like ``set_category_spending``.
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM categories WHERE lower(name) = lower(?)", [name]
+            ).fetchone()
+            if row is None:
+                raise StoreError(f"category not found: {name}")
+            self.conn.execute(
+                "UPDATE categories SET display_color = ? WHERE lower(name) = lower(?)",
+                [display_color, name],
+            )
+
     def add_rule(
         self,
         category_name: str,

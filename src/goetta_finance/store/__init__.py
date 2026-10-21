@@ -84,6 +84,8 @@ class FinanceStore(Protocol):
 
     def set_category_spending(self, name: str, is_spending: bool) -> None: ...
 
+    def set_category_color(self, name: str, display_color: str | None) -> None: ...
+
     def add_rule(
         self,
         category_name: str,

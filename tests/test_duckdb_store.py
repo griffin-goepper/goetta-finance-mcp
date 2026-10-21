@@ -914,6 +914,21 @@ def test_set_category_spending_raises_on_unknown_name(store: DuckDBStore) -> Non
         store.set_category_spending("NoSuchCategory", False)
 
 
+def test_set_category_color_round_trip(store: DuckDBStore) -> None:
+    """Set a color on an existing category, then clear it back to None."""
+    store.set_category_color("Dining", "#d55181")
+    cats = {c.name: c for c in store.get_categories()}
+    assert cats["Dining"].display_color == "#d55181"
+    store.set_category_color("dining", None)
+    cats = {c.name: c for c in store.get_categories()}
+    assert cats["Dining"].display_color is None
+
+
+def test_set_category_color_raises_on_unknown_name(store: DuckDBStore) -> None:
+    with pytest.raises(StoreError, match="not found"):
+        store.set_category_color("NoSuchCategory", "#d55181")
+
+
 def test_migration_0004_applied(store: DuckDBStore) -> None:
     """Pin the migration filename so re-runs of init() stay idempotent
     and so renaming the file forces a deliberate test update."""

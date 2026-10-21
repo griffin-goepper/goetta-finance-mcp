@@ -1509,6 +1509,47 @@ def category_set_spending(
         store.close()
 
 
+@category_app.command("set-color")
+def category_set_color(
+    name: Annotated[str, typer.Argument(help="Existing category name (case-insensitive).")],
+    color: Annotated[
+        str,
+        typer.Argument(help='Hex color like #27ae60, or "none" for an automatic one.'),
+    ],
+) -> None:
+    """Change an existing category's display color.
+
+    The dashboard and any other client draw the category in this color.
+    Pass ``none`` to clear it, so the category falls back to an automatic
+    palette slot.
+    """
+    cleared = color.strip().lower() == "none"
+    if not cleared and not _HEX_COLOR_RE.match(color):
+        raise typer.BadParameter(
+            f'color must be #RRGGBB (e.g. #27ae60) or "none", got {color!r}',
+            param_hint="color",
+        )
+    try:
+        store = _open_writable_store()
+    except GoettaFinanceError as exc:
+        typer.secho(f"category set-color failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        store.set_category_color(name, None if cleared else color)
+        state = "now uses an automatic color" if cleared else f"is now {color}"
+        typer.echo(f"{name} {state}.")
+    except GoettaFinanceError as exc:
+        suffix = _suggest_category(store, name) if _is_category_not_found(exc) else ""
+        typer.secho(
+            f"category set-color failed: {exc}.{suffix}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
 @category_app.command("set-rule")
 def category_set_rule(
     category_name: Annotated[
