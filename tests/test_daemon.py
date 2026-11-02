@@ -21,8 +21,18 @@ import httpx
 import pytest
 import uvicorn
 
-from goetta_finance.daemon import _scheduler_loop, build_daemon_app
-from goetta_finance.errors import GoettaFinanceError
+from goetta_finance.daemon import (
+    SYNC_RETRY_DELAY_SECONDS,
+    _scheduler_loop,
+    build_daemon_app,
+)
+from goetta_finance.errors import (
+    BridgeAuthError,
+    BridgeRateLimitError,
+    BridgeUnavailableError,
+    GoettaFinanceError,
+    SimpleFinError,
+)
 from goetta_finance.models import SyncRun
 from goetta_finance.store.duckdb_store import DuckDBStore
 
@@ -355,6 +365,97 @@ def test_scheduler_catch_up_counts_failed_attempts(
         asyncio.run(_scheduler_loop(store, client, "23:59"))  # type: ignore[arg-type]
     assert client.fetch_count == catch_ups
     store.close()
+
+
+class _ScriptedClient:
+    """Raises each queued failure in turn, then succeeds."""
+
+    def __init__(self, *failures: Exception) -> None:
+        self.failures = list(failures)
+        self.fetch_count = 0
+
+    def fetch_chunked(self, start: Any, end: Any, chunk_days: int = 60) -> Iterator[dict[str, Any]]:
+        self.fetch_count += 1
+        if self.failures:
+            raise self.failures.pop(0)
+        yield {"accounts": [], "errors": []}
+
+
+def _run_scheduler(
+    store: DuckDBStore,
+    client: _ScriptedClient,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    sleeps_allowed: int,
+) -> list[float]:
+    """Run the scheduler with sleeps returning instantly, stopping at the
+    first sleep past ``sleeps_allowed``. Returns every sleep it asked for."""
+    sleeps: list[float] = []
+
+    class _Stop(Exception):
+        pass
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) > sleeps_allowed:
+            raise _Stop
+
+    monkeypatch.setattr("goetta_finance.daemon.asyncio.sleep", fake_sleep)
+    with pytest.raises(_Stop):
+        asyncio.run(_scheduler_loop(store, client, "23:59"))  # type: ignore[arg-type]
+    return sleeps
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [SimpleFinError("timed out"), BridgeUnavailableError("HTTP 503")],
+    ids=["network", "bridge-5xx"],
+)
+def test_scheduler_retries_a_transient_failure_only_once(
+    failure: Exception, store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _ScriptedClient(failure, failure)
+    sleeps = _run_scheduler(store, client, monkeypatch, sleeps_allowed=1)
+    assert client.fetch_count == 2
+    assert sleeps[0] == SYNC_RETRY_DELAY_SECONDS
+    assert sleeps[1] != SYNC_RETRY_DELAY_SECONDS  # on to the next tick
+
+
+def test_scheduler_retry_recovers_the_sync(
+    store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _ScriptedClient(SimpleFinError("timed out"))
+    sleeps = _run_scheduler(store, client, monkeypatch, sleeps_allowed=1)
+    assert sleeps[0] == SYNC_RETRY_DELAY_SECONDS
+    assert client.fetch_count == 2
+    assert store.last_sync_time() is not None
+
+
+def test_scheduler_retries_a_scheduled_tick_as_well_as_a_catch_up(
+    store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime.now(tz=UTC)
+    store.record_sync_run(SyncRun(started_at=now, finished_at=now))  # nothing to catch up
+    client = _ScriptedClient(SimpleFinError("timed out"))
+    sleeps = _run_scheduler(store, client, monkeypatch, sleeps_allowed=2)
+    assert client.fetch_count == 2
+    assert sleeps[1] == SYNC_RETRY_DELAY_SECONDS
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [BridgeAuthError("HTTP 401"), BridgeRateLimitError("HTTP 429"), ValueError("a bug")],
+    ids=["auth", "rate-limit", "not-simplefin"],
+)
+def test_scheduler_does_not_retry_a_failure_that_would_repeat(
+    failure: Exception, store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retrying a 401 or 429 spends SimpleFIN's request budget on an answer
+    that can't change, and going over it can get the token disabled."""
+    client = _ScriptedClient(failure)
+    sleeps = _run_scheduler(store, client, monkeypatch, sleeps_allowed=0)
+    assert client.fetch_count == 1
+    assert sleeps[0] != SYNC_RETRY_DELAY_SECONDS
 
 
 def test_daemon_shutdown_drains_scheduler_within_timeout(tmp_path: Path) -> None:

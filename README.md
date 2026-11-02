@@ -335,7 +335,7 @@ Semantics worth knowing:
 - The MCP endpoint at `http://127.0.0.1:8765/api/mcp` (streamable-HTTP transport — Claude Code and Claude Desktop both support this)
 - An internal scheduler that runs `collect()` daily at `--sync-at` local time (default `06:00`)
 
-One process means one DuckDB write handle, which is what sidesteps the Windows DuckDB-lock conflict between `serve` and `web`. If the laptop was closed past the daily tick, the scheduler detects "we slept through it" on wake and runs a catch-up sync immediately.
+One process means one DuckDB write handle, which is what sidesteps the Windows DuckDB-lock conflict between `serve` and `web`. If the laptop was closed past the daily tick, the scheduler detects "we slept through it" on wake and runs a catch-up sync immediately. If a scheduled or catch-up sync fails on a network or bridge error, the scheduler retries once 30 minutes later. A rejected access URL or a rate limit isn't retried, because trying again can't help and spends SimpleFIN's daily request budget.
 
 ```bash
 goetta-finance daemon                         # defaults: 127.0.0.1:8765, sync at 06:00 local
