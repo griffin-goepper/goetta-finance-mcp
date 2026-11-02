@@ -100,7 +100,9 @@ def test_subsequent_run_uses_overlap_window(store: DuckDBStore, demo_response: d
     assert first_start == expected_start
 
 
-def test_days_override_uses_explicit_lookback_window(store: DuckDBStore, demo_response: dict) -> None:
+def test_days_override_uses_explicit_lookback_window(
+    store: DuckDBStore, demo_response: dict
+) -> None:
     client = StubClient(demo_response)
     now1 = datetime(2026, 5, 23, tzinfo=UTC)
     collect(store, client, now=now1)
