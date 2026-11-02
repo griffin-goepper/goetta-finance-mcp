@@ -132,7 +132,20 @@ def init() -> None:
 
 
 @app.command()
-def sync() -> None:
+def sync(
+    days: Annotated[
+        int | None,
+        typer.Option(
+            "--days",
+            min=1,
+            help=(
+                "Re-pull the last N days from now instead of the default "
+                "5-day overlap. Use to backfill after a broken sync. "
+                "Note: SimpleFIN may cap history near 45 days."
+            ),
+        ),
+    ] = None,
+) -> None:
     """Pull fresh data from SimpleFIN."""
     try:
         config = load_config()
@@ -150,7 +163,7 @@ def sync() -> None:
         hint_lines: list[str] = []
         try:
             client = SimpleFinClient(config.access_url)
-            run = collect(store, client)
+            run = collect(store, client, days=days)
             # Roll linked manual balances forward BEFORE evaluating goals
             # so balance goals see the fresh numbers. Neither step may
             # make a successful sync look failed — log and move on.
