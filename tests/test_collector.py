@@ -367,3 +367,65 @@ def test_failed_sync_does_not_reconcile(store: DuckDBStore, demo_response: dict)
     ids = _txn_ids(store)
     assert "TX-3-PENDING" in ids
     assert "TX-4-PENDING-UNPOSTED" in ids
+
+
+class _AlwaysFails(SimpleFinClient):
+    def __init__(self) -> None:
+        pass
+
+    def fetch(  # type: ignore[override]
+        self, start: datetime, end: datetime
+    ) -> dict[str, Any]:
+        raise SimpleFinError("The read operation timed out")
+
+
+def test_failed_sync_does_not_advance_the_watermark(
+    store: DuckDBStore, demo_response: dict
+) -> None:
+    """The next good sync must re-pull everything the failed runs missed."""
+    good = StubClient(demo_response)
+    now1 = datetime(2026, 5, 23, tzinfo=UTC)
+    collect(store, good, now=now1)
+
+    for days in (10, 20):
+        with pytest.raises(SimpleFinError):
+            collect(store, _AlwaysFails(), now=now1 + timedelta(days=days))
+    assert store.last_sync_time() == now1
+
+    good.windows.clear()
+    collect(store, good, now=now1 + timedelta(days=21))
+    assert good.windows[0][0] == now1 - timedelta(days=5)
+
+
+def test_failed_first_sync_keeps_the_initial_lookback(
+    store: DuckDBStore, demo_response: dict
+) -> None:
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    with pytest.raises(SimpleFinError):
+        collect(store, _AlwaysFails(), now=now)
+    assert store.last_sync_time() is None
+
+    client = StubClient(demo_response)
+    later = now + timedelta(days=1)
+    collect(store, client, now=later)
+    assert client.windows[0][0] == later - timedelta(days=INITIAL_LOOKBACK_DAYS)
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_finished_at_is_the_real_finish_time(
+    fails: bool, store: DuckDBStore, demo_response: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = datetime(2026, 5, 23, 6, tzinfo=UTC)
+    finished = started + timedelta(seconds=30)
+    clock = iter([started, finished])
+    monkeypatch.setattr("goetta_finance.collector._now_utc", lambda: next(clock))
+
+    if fails:
+        with pytest.raises(SimpleFinError):
+            collect(store, _AlwaysFails())
+    else:
+        collect(store, StubClient(demo_response))
+
+    attempt = store.last_sync_attempt()
+    assert attempt is not None
+    assert (attempt.started_at, attempt.finished_at) == (started, finished)

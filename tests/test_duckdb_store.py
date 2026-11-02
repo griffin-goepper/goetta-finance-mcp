@@ -141,6 +141,32 @@ def test_record_sync_run_and_last_sync_time(store: DuckDBStore) -> None:
     assert store.last_sync_time() == finished
 
 
+def test_last_sync_time_ignores_failed_runs(store: DuckDBStore) -> None:
+    good = _utc(2026, 5, 1, 6)
+    store.record_sync_run(SyncRun(started_at=good, finished_at=good))
+    bad = good + timedelta(hours=1)
+    store.record_sync_run(SyncRun(started_at=bad, finished_at=bad, errors=["timed out"]))
+    assert store.last_sync_time() == good
+
+
+def test_last_sync_attempt_is_the_newest_run_success_or_not(store: DuckDBStore) -> None:
+    assert store.last_sync_attempt() is None
+
+    started = _utc(2026, 5, 1, 6)
+    store.record_sync_run(SyncRun(started_at=started, finished_at=started))
+    failed = SyncRun(
+        started_at=started + timedelta(hours=1),
+        finished_at=started + timedelta(hours=1, seconds=30),
+        accounts_touched=1,
+        transactions_new=2,
+        transactions_updated=3,
+        warnings=["a bank was slow"],
+        errors=["timed out"],
+    )
+    store.record_sync_run(failed)
+    assert store.last_sync_attempt() == failed
+
+
 def test_get_transactions_filters(store: DuckDBStore) -> None:
     store.upsert_accounts([_account("a1"), _account("a2")])
     txns = [

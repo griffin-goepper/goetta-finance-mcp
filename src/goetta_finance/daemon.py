@@ -149,10 +149,14 @@ async def _scheduler_loop(
     hour, minute = parse_sync_at(sync_at)
     while True:
         now = datetime.now().astimezone()
-        last = store.last_sync_time()
+        # The last attempt, not the last success: a tick that ran and failed
+        # wasn't missed, and retrying it here would fire straight after the
+        # failure and again on every daemon restart.
+        attempt = store.last_sync_attempt()
+        last = attempt.finished_at if attempt else None
         last_tick = _most_recent_past_tick(now, hour, minute)
-        # If last_sync is None or older than the most recent scheduled tick,
-        # we slept through it — catch up before sleeping again.
+        # If last is None or older than the most recent scheduled tick, we
+        # slept through it — catch up before sleeping again.
         if last is None or last < last_tick:
             logger.info(
                 "scheduler: catching up missed sync (tick was %s, last sync %s)",

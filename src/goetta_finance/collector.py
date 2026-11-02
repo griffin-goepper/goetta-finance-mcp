@@ -93,7 +93,8 @@ def collect(
 
     Re-pulls the last ``overlap_days`` of data on every run because banks
     post transactions late. On first run (no prior sync), pulls
-    ``INITIAL_LOOKBACK_DAYS`` of history.
+    ``INITIAL_LOOKBACK_DAYS`` of history. A failed run doesn't advance
+    ``last_sync_time``, so the next run re-pulls what it missed.
 
     Pass ``days`` to widen the window to at least the last ``days`` days,
     to backfill after a broken sync. It never narrows the window: the run
@@ -158,16 +159,16 @@ def collect(
     except Exception as exc:
         run.errors.append(f"{type(exc).__name__}: {exc}")
         run.accounts_touched = len(touched)
-        # Use ``end`` so callers passing ``now=`` get a deterministic
+        # Respect ``now=`` so callers passing it get a deterministic
         # finished_at — otherwise ``last_sync_time()`` returns wall-clock
         # time even when the test ran with a fixed past ``now``, breaking
         # the overlap-window calc on the next collect.
-        run.finished_at = end
+        run.finished_at = now or _now_utc()
         store.record_sync_run(run)
         raise
 
     run.accounts_touched = len(touched)
     # See comment above on respecting the ``now`` parameter.
-    run.finished_at = end
+    run.finished_at = now or _now_utc()
     store.record_sync_run(run)
     return run

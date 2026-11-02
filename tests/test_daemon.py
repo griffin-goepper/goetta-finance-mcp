@@ -8,10 +8,12 @@ task on exit (no orphan threads).
 
 from __future__ import annotations
 
+import asyncio
 import socket
 import threading
 import time
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +21,9 @@ import httpx
 import pytest
 import uvicorn
 
-from goetta_finance.daemon import build_daemon_app
+from goetta_finance.daemon import _scheduler_loop, build_daemon_app
 from goetta_finance.errors import GoettaFinanceError
+from goetta_finance.models import SyncRun
 from goetta_finance.store.duckdb_store import DuckDBStore
 
 # TestClient defaults to Host "testserver", which the Host-header allowlist
@@ -320,6 +323,38 @@ def test_daemon_scheduler_catches_up_missed_tick(tmp_path: Path) -> None:
         server.should_exit = True
         thread.join(timeout=5.0)
         store.close()
+
+
+@pytest.mark.parametrize(("failed_days_ago", "catch_ups"), [(0, 0), (2, 1)])
+def test_scheduler_catch_up_counts_failed_attempts(
+    failed_days_ago: int,
+    catch_ups: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed attempt after the tick means the tick wasn't missed, so the
+    scheduler must not retry it straight away. One from before the tick
+    still catches up."""
+    store = DuckDBStore(tmp_path / "failed_attempt.duckdb")
+    store.init()
+    now = datetime.now(tz=UTC)
+    good = now - timedelta(days=3)
+    failed = now - timedelta(days=failed_days_ago)
+    store.record_sync_run(SyncRun(started_at=good, finished_at=good))
+    store.record_sync_run(SyncRun(started_at=failed, finished_at=failed, errors=["timed out"]))
+    client = _FakeClient()
+
+    class _ReachedSleep(Exception):
+        pass
+
+    async def stop(seconds: float) -> None:
+        raise _ReachedSleep
+
+    monkeypatch.setattr("goetta_finance.daemon.asyncio.sleep", stop)
+    with pytest.raises(_ReachedSleep):
+        asyncio.run(_scheduler_loop(store, client, "23:59"))  # type: ignore[arg-type]
+    assert client.fetch_count == catch_ups
+    store.close()
 
 
 def test_daemon_shutdown_drains_scheduler_within_timeout(tmp_path: Path) -> None:
