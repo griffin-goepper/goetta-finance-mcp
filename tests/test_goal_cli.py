@@ -524,7 +524,7 @@ def test_sync_prints_goal_breach_lines(fresh_home: Path, monkeypatch: pytest.Mon
     add = runner.invoke(app, ["goal", "add-spending", "Dining", "--limit", "400"])
     assert add.exit_code == 0
 
-    def fake_collect(store: object, client: object) -> SyncRun:
+    def fake_collect(store: object, client: object, **kwargs: object) -> SyncRun:
         now = datetime.now(tz=UTC)
         return SyncRun(started_at=now, finished_at=now)
 
@@ -554,7 +554,7 @@ def test_sync_no_breach_prints_no_goal_lines(
     add = runner.invoke(app, ["goal", "add-spending", "Dining", "--limit", "400"])
     assert add.exit_code == 0
 
-    def fake_collect(store: object, client: object) -> SyncRun:
+    def fake_collect(store: object, client: object, **kwargs: object) -> SyncRun:
         now = datetime.now(tz=UTC)
         return SyncRun(started_at=now, finished_at=now)
 

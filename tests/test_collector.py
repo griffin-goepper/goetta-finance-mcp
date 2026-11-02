@@ -100,6 +100,45 @@ def test_subsequent_run_uses_overlap_window(store: DuckDBStore, demo_response: d
     assert first_start == expected_start
 
 
+def test_days_override_uses_explicit_lookback_window(
+    store: DuckDBStore, demo_response: dict
+) -> None:
+    client = StubClient(demo_response)
+    now1 = datetime(2026, 5, 23, tzinfo=UTC)
+    collect(store, client, now=now1)
+
+    # A prior sync exists, so the default would use the 5-day overlap
+    # window. Passing days=30 must override that with an explicit
+    # 30-day lookback from now, independent of last_sync_time.
+    now2 = now1 + timedelta(days=1)
+    client.windows.clear()
+    collect(store, client, now=now2, days=30)
+    assert client.windows, "expected at least one fetch"
+
+    # A 30-day window is under the 60-day chunk size, so it is one chunk
+    # spanning exactly [now - 30d, now].
+    first_start, first_end = client.windows[0]
+    assert first_start == now2 - timedelta(days=30)
+    assert first_end == now2
+
+
+def test_days_override_on_first_run(store: DuckDBStore, demo_response: dict) -> None:
+    """days= also overrides the 90-day initial lookback on a first run."""
+    client = StubClient(demo_response)
+    now = datetime(2026, 5, 23, tzinfo=UTC)
+    collect(store, client, now=now, days=14)
+
+    first_start, first_end = client.windows[0]
+    assert first_start == now - timedelta(days=14)
+    assert first_end == now
+
+
+def test_days_must_be_positive(store: DuckDBStore, demo_response: dict) -> None:
+    client = StubClient(demo_response)
+    with pytest.raises(ValueError, match="days must be positive"):
+        collect(store, client, now=datetime(2026, 5, 23, tzinfo=UTC), days=0)
+
+
 def test_snapshot_grows_when_balance_date_advances(store: DuckDBStore, demo_response: dict) -> None:
     client = StubClient(demo_response)
     collect(store, client, now=datetime(2026, 5, 23, tzinfo=UTC))

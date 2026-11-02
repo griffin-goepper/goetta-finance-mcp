@@ -82,19 +82,29 @@ def collect(
     *,
     overlap_days: int = 5,
     now: datetime | None = None,
+    days: int | None = None,
 ) -> SyncRun:
     """Pull from SimpleFIN and write to the store.
 
     Re-pulls the last ``overlap_days`` of data on every run because banks
     post transactions late. On first run (no prior sync), pulls
     ``INITIAL_LOOKBACK_DAYS`` of history.
+
+    Pass ``days`` to override the window with an explicit lookback from
+    ``now`` (e.g. ``days=30`` pulls the last 30 days regardless of the
+    last sync time). Used to backfill after a broken sync.
     """
     end = now or _now_utc()
-    last = store.last_sync_time()
-    if last is None:
-        start = end - timedelta(days=INITIAL_LOOKBACK_DAYS)
+    if days is not None:
+        if days <= 0:
+            raise ValueError("days must be positive")
+        start = end - timedelta(days=days)
     else:
-        start = last - timedelta(days=overlap_days)
+        last = store.last_sync_time()
+        if last is None:
+            start = end - timedelta(days=INITIAL_LOOKBACK_DAYS)
+        else:
+            start = last - timedelta(days=overlap_days)
 
     run = SyncRun(started_at=end)
     touched: set[str] = set()
