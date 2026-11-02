@@ -91,7 +91,11 @@ def _maybe_trigger_lazy_sync(store: FinanceStore, client: SimpleFinClient | None
     """
     if client is None:
         return
-    last = store.last_sync_time()
+    # Keyed on the last attempt, not the last success: while the bridge is
+    # down, retrying on every tool call would burn SimpleFIN's 24-a-day
+    # budget and can get the access token disabled.
+    attempt = store.last_sync_attempt()
+    last = attempt.finished_at if attempt else None
     if last is not None:
         now = datetime.now(tz=UTC)
         age_hours = (now - last).total_seconds() / 3600.0
@@ -477,17 +481,22 @@ def build_server(
 
     @mcp.tool(
         description=(
-            "Report when the SimpleFIN data was last synced. Call this when "
-            "the user asks 'is this current?', 'when was the last sync?', or "
-            "anytime the freshness of a balance/transaction matters. Returns "
-            "the absolute timestamp, the age in hours, whether a background "
-            "sync is in progress right now, and the configured staleness "
-            "threshold. Other tools automatically trigger a background sync "
-            "when data is older than that threshold."
+            "Report when the SimpleFIN data last synced successfully. Call "
+            "this when the user asks 'is this current?', 'when was the last "
+            "sync?', or anytime the freshness of a balance/transaction "
+            "matters. Returns the absolute timestamp and age in hours of the "
+            "last successful sync, whether a background sync is in progress "
+            "right now, and the configured staleness threshold. Also returns "
+            "the latest attempt's time, errors, and warnings: errors mean it "
+            "failed and the data is older than it, warnings mean it succeeded "
+            "but a bank may not have updated. Other tools automatically "
+            "trigger a background sync when the latest attempt is older than "
+            "that threshold."
         )
     )
     def sync_status() -> dict[str, Any]:
         last = store.last_sync_time()
+        attempt = store.last_sync_attempt()
         threshold = _lazy_sync_threshold_hours()
         now = datetime.now(tz=UTC)
         age_hours: float | None = (
@@ -505,6 +514,11 @@ def build_server(
             "stale": age_hours is None or age_hours >= threshold,
             "staleness_threshold_hours": threshold,
             "sync_in_progress": sync_in_progress,
+            "last_attempt_iso": (
+                attempt.finished_at.isoformat() if attempt and attempt.finished_at else None
+            ),
+            "last_attempt_errors": attempt.errors if attempt else [],
+            "last_attempt_warnings": attempt.warnings if attempt else [],
         }
 
     @mcp.tool(

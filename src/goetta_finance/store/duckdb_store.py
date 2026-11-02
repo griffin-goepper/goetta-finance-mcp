@@ -1175,13 +1175,46 @@ class DuckDBStore:
             return int(result[0])
 
     def last_sync_time(self) -> datetime | None:
+        """When the most recent successful sync finished.
+
+        This is the collector's watermark and the freshness every surface
+        reports, so a failed run must not move it: the next sync has to
+        re-pull what that run missed. Warnings alone don't make a run fail.
+        Cooldowns want ``last_sync_attempt`` instead.
+        """
         with self._lock:
             row = self.conn.execute(
-                "SELECT MAX(finished_at) FROM sync_runs WHERE finished_at IS NOT NULL"
+                "SELECT MAX(finished_at) FROM sync_runs "
+                "WHERE finished_at IS NOT NULL AND errors IS NULL"
             ).fetchone()
         if row is None or row[0] is None:
             return None
         return _from_naive_utc(row[0])
+
+    def last_sync_attempt(self) -> SyncRun | None:
+        """The most recent finished run, whether or not it succeeded."""
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT started_at, finished_at, accounts_touched, transactions_new,
+                       transactions_updated, warnings, errors
+                FROM sync_runs
+                WHERE finished_at IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        return SyncRun(
+            started_at=row[0].replace(tzinfo=UTC),
+            finished_at=_from_naive_utc(row[1]),
+            accounts_touched=row[2],
+            transactions_new=row[3],
+            transactions_updated=row[4],
+            warnings=json.loads(row[5]) if row[5] else [],
+            errors=json.loads(row[6]) if row[6] else [],
+        )
 
     def get_accounts(self, *, include_hidden: bool = False) -> list[Account]:
         """Return accounts. By default filters out hidden accounts.

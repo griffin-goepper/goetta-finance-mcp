@@ -758,6 +758,13 @@ def _seed_stale_sync(store: DuckDBStore, *, hours_ago: float) -> None:
     )
 
 
+def _seed_failed_sync(store: DuckDBStore, *, hours_ago: float) -> None:
+    failed = datetime.now(tz=UTC) - timedelta(hours=hours_ago)
+    store.record_sync_run(
+        SyncRun(started_at=failed, finished_at=failed, errors=["SimpleFinError: timed out"])
+    )
+
+
 @pytest.mark.anyio
 async def test_sync_status_reports_freshness_when_no_sync_yet(
     store: DuckDBStore,
@@ -773,6 +780,39 @@ async def test_sync_status_reports_freshness_when_no_sync_yet(
     assert payload["stale"] is True
     assert payload["sync_in_progress"] is False
     assert payload["staleness_threshold_hours"] > 0
+    assert payload["last_attempt_iso"] is None
+    assert payload["last_attempt_errors"] == []
+    assert payload["last_attempt_warnings"] == []
+
+
+@pytest.mark.anyio
+async def test_sync_status_stays_stale_through_a_failed_attempt(store: DuckDBStore) -> None:
+    _seed_stale_sync(store, hours_ago=48.0)
+    _seed_failed_sync(store, hours_ago=0.1)
+    mcp = build_server(store)
+    async with create_connected_server_and_client_session(mcp) as session:
+        await session.initialize()
+        result = await session.call_tool("sync_status", {})
+    payload = _decode(result)
+    assert payload["stale"] is True
+    assert payload["data_age_hours"] > 47
+    assert payload["last_attempt_errors"] == ["SimpleFinError: timed out"]
+    last_attempt = datetime.fromisoformat(payload["last_attempt_iso"])
+    assert last_attempt > datetime.fromisoformat(payload["last_sync_iso"])
+
+
+@pytest.mark.anyio
+async def test_sync_status_reports_warnings_on_a_good_sync(store: DuckDBStore) -> None:
+    now = datetime.now(tz=UTC)
+    store.record_sync_run(SyncRun(started_at=now, finished_at=now, warnings=["Bank needs login"]))
+    mcp = build_server(store)
+    async with create_connected_server_and_client_session(mcp) as session:
+        await session.initialize()
+        result = await session.call_tool("sync_status", {})
+    payload = _decode(result)
+    assert payload["stale"] is False
+    assert payload["last_attempt_warnings"] == ["Bank needs login"]
+    assert payload["last_attempt_errors"] == []
 
 
 @pytest.mark.anyio
@@ -814,6 +854,22 @@ async def test_lazy_sync_triggers_once_when_data_is_stale(
     assert client.fetch_started.wait(timeout=3), "background sync never started"
     assert client.fetch_finished.wait(timeout=3), "background sync never finished"
     assert client.fetch_count == 1
+
+
+@pytest.mark.anyio
+async def test_lazy_sync_waits_out_the_threshold_after_a_failed_attempt(
+    store: DuckDBStore,
+) -> None:
+    """Retrying on every tool call would burn SimpleFIN's 24-a-day budget."""
+    _seed_stale_sync(store, hours_ago=48.0)
+    _seed_failed_sync(store, hours_ago=0.5)
+    client = _FakeClient()
+    mcp = build_server(store, client=client)  # type: ignore[arg-type]
+    async with create_connected_server_and_client_session(mcp) as session:
+        await session.initialize()
+        await session.call_tool("list_accounts", {})
+    await asyncio.sleep(0.1)
+    assert client.fetch_count == 0
 
 
 @pytest.mark.anyio

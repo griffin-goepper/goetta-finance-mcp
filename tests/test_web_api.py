@@ -492,6 +492,23 @@ def test_api_sync_status_parses_warnings(client: TestClient) -> None:
     assert run["warnings"] == ["Bank XYZ only returned 30 days"]
     assert run["errors"] == []
     assert run["transactions_new"] == 4
+    assert body["last_attempt"] == body["last_sync"]
+    assert body["last_attempt_warnings"] == ["Bank XYZ only returned 30 days"]
+    assert body["last_attempt_errors"] == []
+
+
+def test_api_sync_status_keeps_last_sync_through_a_failed_attempt(
+    store: DuckDBStore, client: TestClient
+) -> None:
+    last_good = client.get("/api/v1/sync/status").json()["last_sync"]
+    store.record_sync_run(
+        SyncRun(started_at=NOW, finished_at=NOW, errors=["SimpleFinError: timed out"])
+    )
+    body = client.get("/api/v1/sync/status").json()
+    assert body["last_sync"] == last_good
+    assert body["last_attempt"] == NOW.isoformat()
+    assert body["last_attempt_errors"] == ["SimpleFinError: timed out"]
+    assert body["last_attempt_warnings"] == []
 
 
 def test_dash_mount_serves_index_html(store: DuckDBStore, tmp_path: Path) -> None:

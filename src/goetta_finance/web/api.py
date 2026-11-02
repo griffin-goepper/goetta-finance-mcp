@@ -338,9 +338,15 @@ def register_api(app: FastAPI) -> None:
     def sync_status(request: Request, limit: int = 10) -> dict[str, Any]:
         store = _store(request)
         last = store.last_sync_time()
+        attempt = store.last_sync_attempt()
         runs = recent_sync_runs(store, limit=_clamp(limit, 1, 100))
         return {
             "last_sync": last.isoformat() if last else None,
+            "last_attempt": (
+                attempt.finished_at.isoformat() if attempt and attempt.finished_at else None
+            ),
+            "last_attempt_errors": attempt.errors if attempt else [],
+            "last_attempt_warnings": attempt.warnings if attempt else [],
             "runs": [
                 {
                     "id": r["id"],

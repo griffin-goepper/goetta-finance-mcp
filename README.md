@@ -514,7 +514,7 @@ The MCP server exposes eighteen tools:
 - **`list_transfer_links`** — manual-account roll-forward links plus detected candidates (payee matching a linkless manual account's name), each with a ready-made link command
 - **`link_account_transfers`** / **`unlink_account_transfers`** — create and delete transfer links from conversation; pattern-validated identically to the CLI, applies eligible transfers immediately
 - **`sql_query`** — read-only SQL against the local DuckDB store (see security notes below). Prefer `transactions_with_category` over the bare `transactions` table when you want category info.
-- **`sync_status`** — report when the SimpleFIN data was last synced and whether it's stale
+- **`sync_status`** — report when the SimpleFIN data last synced successfully, whether it's stale, and any errors or warnings from the latest attempt
 - **`sync_now`** — trigger a fresh pull from SimpleFIN
 
 `sql_query` is the workhorse for anything the other tools don't cover: most natural-language questions collapse to a SQL query plus a Claude-rendered artifact. The MCP server intentionally has no `chart` tool — Claude renders inline charts as artifacts from the data tools return.
