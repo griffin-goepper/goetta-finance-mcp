@@ -23,7 +23,7 @@ from goetta_finance.backup import (
     restore_backup,
     verify_backup,
 )
-from goetta_finance.collector import collect
+from goetta_finance.collector import MAX_BACKFILL_DAYS, collect
 from goetta_finance.config import (
     Config,
     backup_dir,
@@ -138,10 +138,12 @@ def sync(
         typer.Option(
             "--days",
             min=1,
+            max=MAX_BACKFILL_DAYS,
             help=(
-                "Re-pull the last N days from now instead of the default "
-                "5-day overlap. Use to backfill after a broken sync. "
-                "Note: SimpleFIN may cap history near 45 days."
+                "Pull at least the last N days, to backfill after a broken "
+                "sync. Only widens the normal window, never narrows it. "
+                "Each 60 days is one SimpleFIN request, and available "
+                "history varies by institution."
             ),
         ),
     ] = None,

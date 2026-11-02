@@ -100,16 +100,14 @@ def test_subsequent_run_uses_overlap_window(store: DuckDBStore, demo_response: d
     assert first_start == expected_start
 
 
-def test_days_override_uses_explicit_lookback_window(
-    store: DuckDBStore, demo_response: dict
-) -> None:
+def test_days_widens_overlap_window(store: DuckDBStore, demo_response: dict) -> None:
     client = StubClient(demo_response)
     now1 = datetime(2026, 5, 23, tzinfo=UTC)
     collect(store, client, now=now1)
 
     # A prior sync exists, so the default would use the 5-day overlap
-    # window. Passing days=30 must override that with an explicit
-    # 30-day lookback from now, independent of last_sync_time.
+    # window. Passing days=30 must widen that to a 30-day lookback from
+    # now.
     now2 = now1 + timedelta(days=1)
     client.windows.clear()
     collect(store, client, now=now2, days=30)
@@ -122,15 +120,33 @@ def test_days_override_uses_explicit_lookback_window(
     assert first_end == now2
 
 
-def test_days_override_on_first_run(store: DuckDBStore, demo_response: dict) -> None:
-    """days= also overrides the 90-day initial lookback on a first run."""
+def test_days_never_narrows_overlap_window(store: DuckDBStore, demo_response: dict) -> None:
+    """A short days= must not strand a gap behind last_sync_time.
+
+    The run advances the watermark either way, so starting at now2 - 3d
+    here would leave the previous 17 days unreachable by any later sync.
+    """
+    client = StubClient(demo_response)
+    now1 = datetime(2026, 5, 23, tzinfo=UTC)
+    collect(store, client, now=now1)
+    prior_last_sync = store.last_sync_time()
+    assert prior_last_sync is not None
+
+    now2 = now1 + timedelta(days=20)
+    client.windows.clear()
+    collect(store, client, now=now2, days=3)
+
+    first_start, _ = client.windows[0]
+    assert first_start == prior_last_sync - timedelta(days=5)
+
+
+def test_days_never_narrows_first_run_lookback(store: DuckDBStore, demo_response: dict) -> None:
     client = StubClient(demo_response)
     now = datetime(2026, 5, 23, tzinfo=UTC)
     collect(store, client, now=now, days=14)
 
-    first_start, first_end = client.windows[0]
-    assert first_start == now - timedelta(days=14)
-    assert first_end == now
+    first_start, _ = client.windows[0]
+    assert first_start == now - timedelta(days=INITIAL_LOOKBACK_DAYS)
 
 
 def test_days_must_be_positive(store: DuckDBStore, demo_response: dict) -> None:

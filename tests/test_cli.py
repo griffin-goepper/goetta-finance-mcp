@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,9 @@ import typer
 from typer.testing import CliRunner
 
 from goetta_finance.cli import app
+from goetta_finance.collector import MAX_BACKFILL_DAYS
+from goetta_finance.config import Config, save_config
+from goetta_finance.models import SyncRun
 
 runner = CliRunner()
 
@@ -55,6 +59,33 @@ def test_sync_when_unconfigured_exits_nonzero(
     result = runner.invoke(app, ["sync"])
     assert result.exit_code == 1
     assert "init" in result.output.lower()
+
+
+def test_sync_days_reaches_collect_at_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOETTA_FINANCE_HOME", str(tmp_path))
+    save_config(Config(access_url="https://user:pass@bridge.example/simplefin"))
+    captured: dict[str, object] = {}
+
+    def fake_collect(store: object, client: object, **kwargs: object) -> SyncRun:
+        captured.update(kwargs)
+        now = datetime.now(tz=UTC)
+        return SyncRun(started_at=now, finished_at=now)
+
+    monkeypatch.setattr("goetta_finance.cli.collect", fake_collect)
+    result = runner.invoke(app, ["sync", "--days", str(MAX_BACKFILL_DAYS)])
+    assert result.exit_code == 0, result.output
+    assert captured == {"days": MAX_BACKFILL_DAYS}
+
+
+@pytest.mark.parametrize("days", [0, MAX_BACKFILL_DAYS + 1])
+def test_sync_days_out_of_range_is_refused(
+    days: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOETTA_FINANCE_HOME", str(tmp_path))
+    result = runner.invoke(app, ["sync", "--days", str(days)])
+    assert result.exit_code == 2
 
 
 def test_help_lists_commands() -> None:

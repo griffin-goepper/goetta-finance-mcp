@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 
 INITIAL_LOOKBACK_DAYS = 90
 
+# Ceiling for ``sync --days``. Every 60-day chunk is one request against
+# SimpleFIN's budget of 24 a day, and going past that can get the access
+# token disabled. 365 days costs 7 requests.
+MAX_BACKFILL_DAYS = 365
+
 # Process-global single-writer guard. Both the scheduler tick (daemon mode)
 # and the lazy-sync MCP hook acquire this before calling ``collect``. If a
 # collect is already running, callers should ``acquire(blocking=False)``,
@@ -90,21 +95,22 @@ def collect(
     post transactions late. On first run (no prior sync), pulls
     ``INITIAL_LOOKBACK_DAYS`` of history.
 
-    Pass ``days`` to override the window with an explicit lookback from
-    ``now`` (e.g. ``days=30`` pulls the last 30 days regardless of the
-    last sync time). Used to backfill after a broken sync.
+    Pass ``days`` to widen the window to at least the last ``days`` days,
+    to backfill after a broken sync. It never narrows the window: the run
+    still advances ``last_sync_time``, so a shorter window would strand a
+    gap behind it for good, and the pending reconcile would delete rows
+    the window missed, along with their overrides.
     """
     end = now or _now_utc()
+    last = store.last_sync_time()
+    if last is None:
+        start = end - timedelta(days=INITIAL_LOOKBACK_DAYS)
+    else:
+        start = last - timedelta(days=overlap_days)
     if days is not None:
         if days <= 0:
             raise ValueError("days must be positive")
-        start = end - timedelta(days=days)
-    else:
-        last = store.last_sync_time()
-        if last is None:
-            start = end - timedelta(days=INITIAL_LOOKBACK_DAYS)
-        else:
-            start = last - timedelta(days=overlap_days)
+        start = min(start, end - timedelta(days=days))
 
     run = SyncRun(started_at=end)
     touched: set[str] = set()
