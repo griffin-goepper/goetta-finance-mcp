@@ -66,7 +66,7 @@ Re-running `init` is safe — each step detects existing state and offers to ski
 | Command | What it does |
 |---|---|
 | `goetta-finance init` | Interactive setup. Re-runnable. |
-| `goetta-finance sync` | One-shot pull from SimpleFIN. Idempotent — safe to run repeatedly. |
+| `goetta-finance sync` | One-shot pull from SimpleFIN. Idempotent — safe to run repeatedly. `--days N` (max 365) pulls at least the last N days to backfill after a broken sync; it only widens the normal window. Stop the daemon first, since it holds the database. |
 | `goetta-finance status` | Show last sync, account list with balances, recent warnings/errors. |
 | `goetta-finance serve` | Start the MCP server over stdio (used by Claude Desktop). |
 | `goetta-finance web` | Start the local web dashboard. `--port 8765` and `--host 127.0.0.1` by default. |
@@ -100,7 +100,7 @@ SimpleFIN typically returns ~90 days of history when you first connect. If your 
    goetta-finance import transactions history.csv --account ACT-<id>
    ```
 
-   Rows get deterministic `IMP-` ids, so re-running the same file updates instead of duplicating. By default, rows posted on/after the account's earliest synced transaction are skipped — the live feed owns that region (`--before`/`--allow-overlap` override). Category rules apply to imported history retroactively, like everything else.
+   Rows get deterministic `IMP-` ids, so re-running the same file updates instead of duplicating. By default, rows posted on/after the account's earliest synced transaction are skipped — the live feed owns that region (`--before`/`--allow-overlap` override). Category rules apply to imported history retroactively, like everything else. Afterwards, don't point `sync --days` back past that earliest synced transaction: feed rows get their own ids, so a transaction that's also in your import would count twice.
 
 3. Optionally import end-of-day balance history (header `date,balance,source_file`; liability balances negative when owed):
 
