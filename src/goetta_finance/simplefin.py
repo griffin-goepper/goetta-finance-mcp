@@ -21,6 +21,11 @@ from goetta_finance.models import Account, Transaction
 
 logger = logging.getLogger(__name__)
 
+# The bridge has gone silent for over 30 seconds at the scheduled sync while
+# answering normally the rest of the day. Waiting longer costs nothing, but a
+# timeout spends a request from the daily budget and loses the sync.
+REQUEST_TIMEOUT_SECONDS = 120.0
+
 
 def _ts_to_utc(value: Any) -> datetime:
     return datetime.fromtimestamp(int(value), tz=UTC)
@@ -138,7 +143,7 @@ class SimpleFinClient:
     The access URL contains basic-auth credentials; we never log it.
     """
 
-    def __init__(self, access_url: str, *, timeout: float = 30.0) -> None:
+    def __init__(self, access_url: str, *, timeout: float = REQUEST_TIMEOUT_SECONDS) -> None:
         base, auth = _split_access_url(access_url)
         self._base = base
         self._auth = auth
