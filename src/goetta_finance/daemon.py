@@ -30,7 +30,12 @@ from fastapi import FastAPI
 from mcp.server.fastmcp import FastMCP
 
 from goetta_finance.collector import collect_under_lock
-from goetta_finance.errors import GoettaFinanceError
+from goetta_finance.errors import (
+    BridgeAuthError,
+    BridgeRateLimitError,
+    GoettaFinanceError,
+    SimpleFinError,
+)
 from goetta_finance.goals import goal_breach_warnings
 from goetta_finance.server import build_server
 from goetta_finance.simplefin import SimpleFinClient
@@ -47,6 +52,12 @@ from goetta_finance.web.app import build_app, trusted_hosts_for
 logger = logging.getLogger(__name__)
 
 _SYNC_AT_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]?\d)$")
+
+# One retry per scheduled sync, late enough for a network or bridge blip to
+# clear. Every attempt spends SimpleFIN's budget of 24 requests a day, and
+# going past it can get the access token disabled, so this is deliberately
+# not a loop.
+SYNC_RETRY_DELAY_SECONDS = 30 * 60
 
 
 def parse_sync_at(value: str) -> tuple[int, int]:
@@ -76,18 +87,22 @@ def _run_collect_blocking(
     client: SimpleFinClient,
     on_fatal: Callable[[], None] | None = None,
     backup_hook: Callable[[], None] | None = None,
-) -> None:
+) -> bool:
     """Worker-thread entry. Eats exceptions so the scheduler keeps running —
     except a fatal store error, which triggers ``on_fatal``: once DuckDB
     invalidates the in-process database, every later query on every surface
     fails until the process reopens the file, so staying alive just serves
     500s (the 2026-07-06 zombie-daemon incident). Exiting lets the
-    supervisor restart us into a healthy state."""
+    supervisor restart us into a healthy state.
+
+    Returns whether the sync failed in a way worth trying again. A rejected
+    token or a rate limit won't change in half an hour, and retrying either
+    spends request budget on the same answer."""
     try:
         result = collect_under_lock(store, client)
         if result is None:
             logger.info("scheduled sync skipped — another sync in flight")
-            return
+            return False
         # Roll linked manual balances forward BEFORE evaluating goals so
         # balance goals see the fresh numbers. INFO because it's routine
         # bookkeeping; lines carry account names and amounts only, never
@@ -131,6 +146,26 @@ def _run_collect_blocking(
                 "so the supervisor can restart with a fresh process"
             )
             on_fatal()
+        return isinstance(exc, SimpleFinError) and not isinstance(
+            exc, BridgeAuthError | BridgeRateLimitError
+        )
+    return False
+
+
+async def _sync_with_one_retry(
+    store: FinanceStore,
+    client: SimpleFinClient,
+    on_fatal: Callable[[], None] | None,
+    backup_hook: Callable[[], None] | None,
+) -> None:
+    retry = await asyncio.to_thread(_run_collect_blocking, store, client, on_fatal, backup_hook)
+    if not retry:
+        return
+    logger.warning(
+        "scheduler: sync failed, retrying once in %d minutes", SYNC_RETRY_DELAY_SECONDS // 60
+    )
+    await asyncio.sleep(SYNC_RETRY_DELAY_SECONDS)
+    await asyncio.to_thread(_run_collect_blocking, store, client, on_fatal, backup_hook)
 
 
 async def _scheduler_loop(
@@ -163,7 +198,7 @@ async def _scheduler_loop(
                 last_tick.isoformat(timespec="minutes"),
                 last.isoformat(timespec="minutes") if last else "never",
             )
-            await asyncio.to_thread(_run_collect_blocking, store, client, on_fatal, backup_hook)
+            await _sync_with_one_retry(store, client, on_fatal, backup_hook)
             now = datetime.now().astimezone()
         next_tick = _next_tick(now, hour, minute)
         sleep_seconds = max(0.0, (next_tick - now).total_seconds())
@@ -174,7 +209,7 @@ async def _scheduler_loop(
         )
         await asyncio.sleep(sleep_seconds)
         logger.info("scheduler: running scheduled sync")
-        await asyncio.to_thread(_run_collect_blocking, store, client, on_fatal, backup_hook)
+        await _sync_with_one_retry(store, client, on_fatal, backup_hook)
 
 
 async def _stop_file_watch_loop(
